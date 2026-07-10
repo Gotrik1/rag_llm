@@ -1,0 +1,10 @@
+/target
+ui/node_modules/
+ui/dist/
+ui/.vite/
+ui/node_modules/.tmp/
+.venv
+__pycache__/
+.ingestion_cache/
+.fastembed_cache/
+

@@ -663,7 +663,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(load_openapi_spec())
             return
         if path == "/":
-            self.send_html(INDEX_HTML)
+            self.send_json({"service": "RAG Assistant API", "docs": "/docs", "openapi": "/api/openapi.json"})
             return
         if path == "/api/workspace":
             self.send_json(get_workspace(*storage_defaults()))

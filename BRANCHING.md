@@ -1,72 +1,59 @@
 # Веточная модель и поставка
 
-## Ветки
+## Схема
 
 ```mermaid
 flowchart LR
-    F["codex/* или feature/*<br/>рабочие изменения"] -->|"Pull Request"| T["test<br/>интеграционная ветка"]
-    T -->|"CI + проверка окружения"| P["Pull Request test → main"]
-    P --> M["main<br/>стабильная ветка"]
+    F["feature/* или fix/*<br/>новая фича"] -->|"Pull Request"| D["dev<br/>разработка"]
+    D -->|"интеграционное тестирование"| T["test<br/>приемка"]
+    T -->|"release review"| P["prod<br/>предрелизная проверка"]
+    P -->|"release merge"| M["main<br/>production"]
     M -->|"Git tag v*"| R["GitHub Release artifact"]
 ```
 
-- `main` — только проверенный стабильный код. Прямые push запрещаются branch protection.
-- `test` — интеграция функциональных веток и проверка сборки целиком.
-- `codex/*`, `feature/*`, `fix/*` — короткоживущие рабочие ветки.
-- `hotfix/*` — исправления от `main`; после выпуска изменения также возвращаются в `test`.
+- `main` — production-код. Прямые push запрещены.
+- `prod` — кандидат на выпуск; после проверки сливается в `main`.
+- `test` — приемочное и интеграционное тестирование.
+- `dev` — общая ветка разработки и интеграции фич.
+- `feature/*`, `fix/*`, `hotfix/*` — короткоживущие рабочие ветки.
 
-## Правила слияния
+## Правила работы
 
-### Рабочая ветка → test
+1. Новая задача начинается от актуальной `dev`:
+   `git switch dev && git pull && git switch -c feature/<name>`.
+2. Feature-ветка сначала тестируется локально и через CI.
+3. После review открывается PR `feature/* -> dev`.
+4. Стабильное состояние `dev` продвигается PR `dev -> test`.
+5. После приемки создается PR `test -> prod` и выполняется release-проверка.
+6. После проверки `prod` создается PR `prod -> main` и тег `vX.Y.Z`.
+7. После merge рабочая feature-ветка удаляется.
 
-1. Ветка создаётся от актуальной `test`.
-2. Открывается Pull Request в `test`.
-3. Обязателен успешный workflow `CI`.
-4. Предпочтительный метод — squash merge.
-5. После слияния рабочая ветка удаляется.
+Все изменения проходят через PR. Прямые push в `dev`, `test`, `prod` и `main` не используются.
 
-### test → main
+## Branch protection
 
-1. Открывается отдельный release Pull Request.
-2. Обязателен успешный `CI`.
-3. Проверяется PostgreSQL migration smoke test и release artifact.
-4. Слияние выполняется только после ручного review.
-5. Для выпуска создаётся тег `vX.Y.Z`.
+Для `dev`, `test`, `prod` и `main` рекомендуется включить:
 
-## Рекомендуемая branch protection в GitHub
+- обязательный Pull Request;
+- обязательный успешный CI;
+- запрет force push и удаления ветки.
 
-Для `test`:
+Дополнительно для `test`, `prod` и `main`:
 
-- require pull request;
-- require status check `CI / quality`;
-- require branches to be up to date;
-- block force pushes and deletion.
+- обязательное обновление ветки перед merge;
+- ручной review;
+- для `main` — минимум один approval и обязательный PostgreSQL smoke test.
 
-Для `main`:
-
-- require pull request;
-- require минимум одного approval;
-- require status checks `CI / quality` и `CI / postgres-smoke`;
-- require conversation resolution;
-- block force pushes and deletion;
-- restrict direct pushes.
-
-Branch protection настраивается в GitHub после публикации ветки `test`; локальный Git не может принудительно применить эти серверные правила.
+Branch protection настраивается в GitHub; локальный Git не применяет эти серверные правила.
 
 ## CI/CD
 
-`.github/workflows/ci.yml` запускается для Pull Request и push в `test`/`main`:
+`.github/workflows/ci.yml` запускается для Pull Request и push в `dev`, `test`, `prod` и `main`:
 
 - Python syntax и unit/contract tests;
 - Rust `cargo check` и `cargo test`;
 - React production build;
 - PostgreSQL 16 smoke test с применением migrations.
 
-`.github/workflows/release.yml` запускается по тегу `v*`:
-
-- повторно собирает React UI;
-- формирует архив исходников и UI build;
-- публикует artifact workflow;
-- создаёт GitHub Release с архивом.
-
-Это continuous delivery артефакта. Автоматический runtime deploy не настроен, потому что в репозитории не определена целевая платформа: VM, Kubernetes, Docker host или облачный сервис.
+`.github/workflows/release.yml` запускается по тегу `v*`, созданному после merge `prod -> main`.
+Автоматический runtime deploy пока не настроен.

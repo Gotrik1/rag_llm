@@ -223,46 +223,72 @@ textarea {
 }
 
 .nav-row {
+  position: relative;
   display: flex;
+  width: 100%;
   min-width: 0;
   align-items: center;
-  gap: 2px;
+  border: 1px solid transparent;
+  border-radius: 9px;
 }
 
 .nav-row .nav-item {
   flex: 1 1 auto;
 }
 
-.nav-actions {
+.nav-hover-menu {
+  position: absolute;
+  top: calc(100% + 5px);
+  right: 0;
+  left: 0;
+  z-index: 30;
   display: none;
-  align-items: center;
-  gap: 2px;
+  gap: 3px;
+  border: 1px solid #4b4b4b;
+  border-radius: 10px;
+  background: #252525;
+  padding: 6px;
+  box-shadow: 0 12px 28px rgba(20, 20, 20, 0.28);
 }
 
-.nav-action {
-  display: grid;
-  width: 26px;
-  height: 26px;
-  place-items: center;
-  border: 0;
-  border-radius: 5px;
-  background: transparent;
-  color: #aeb5be;
-  cursor: pointer;
-}
-
-.nav-row:hover .nav-actions,
-.nav-actions:focus-within {
+.nav-menu-action {
   display: flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #f5f5f5;
+  padding: 6px 8px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
 }
 
-.nav-action:hover {
-  background: #1c1c1c;
-  color: #fff;
+.nav-menu-action:hover {
+  background: #383838;
 }
 
-.nav-action.is-pinned {
-  color: #f28a32;
+.nav-menu-action.danger {
+  color: #ffb0a8;
+}
+
+.nav-menu-action.danger:hover {
+  background: #4b2a2a;
+  color: #ffffff;
+}
+
+.nav-row > .nav-item:hover + .nav-hover-menu,
+.nav-row:hover .nav-hover-menu,
+.nav-row:focus-within .nav-hover-menu {
+  display: grid;
+}
+
+.nav-chat-group:has(.nav-move-menu) .nav-hover-menu {
+  display: none;
 }
 
 .nav-item-edit {
@@ -324,12 +350,17 @@ textarea {
 .project-chat-list {
   display: grid;
   gap: 2px;
-  margin-left: 18px;
-  padding-left: 9px;
+  margin: 0;
+  padding: 0;
+}
+
+.project-chat .nav-row {
+  width: 100%;
 }
 
 .project-chat .nav-item {
   min-height: 32px;
+  padding-left: 23px;
   padding-top: 5px;
   padding-bottom: 5px;
 }
@@ -394,8 +425,8 @@ textarea {
   align-items: center;
   gap: 9px;
   min-height: 36px;
-  border: 0;
-  border-radius: 7px;
+  border: 1px solid transparent;
+  border-radius: 8px;
   background: transparent;
   color: #f2f3f5;
   padding: 7px 4px;
@@ -434,7 +465,8 @@ textarea {
 }
 
 .nav-item:hover {
-  background: #161616;
+  background: #383838;
+  color: #ffffff;
 }
 
 .nav-item:hover .nav-pin {
@@ -442,7 +474,9 @@ textarea {
 }
 
 .nav-item.active {
-  background: #202020;
+  background: #383838;
+  border-color: #383838;
+  color: #ffffff;
 }
 
 .chat-nav-item {
@@ -1409,50 +1443,49 @@ sub {
   color: var(--sidebar-hover-text);
 }
 
-.theme-portal .nav-section-title,
+.theme-portal .nav-section-title {
+  color: #1c1c1c;
+}
+
 .theme-portal .nav-item {
-  color: #f28a32;
+  color: #1c1c1c;
 }
 
 .theme-portal .nav-item svg {
-  color: #f28a32;
+  color: currentColor;
 }
 
+.theme-portal .nav-row:hover > .nav-item,
 .theme-portal .nav-item:hover {
-  background: var(--sidebar-hover-bg);
-  box-shadow: inset 3px 0 0 var(--blue);
-  color: var(--sidebar-hover-text);
+  border-color: #383838;
+  background: #383838;
+  box-shadow: none;
+  color: #ffffff;
 }
 
+.theme-portal .nav-row:hover > .nav-item span,
+.theme-portal .nav-row:hover > .nav-item svg,
 .theme-portal .nav-item:hover span,
 .theme-portal .nav-item:hover svg {
-  color: var(--sidebar-hover-text);
+  color: #ffffff;
 }
 
 .theme-portal .nav-item.active {
-  background: transparent;
+  border-color: #383838;
+  background: #383838;
   box-shadow: none;
-  color: #d97422;
+  color: #ffffff;
 }
 
 .theme-portal .nav-item.active:hover {
-  background: var(--sidebar-hover-bg);
-  box-shadow: inset 3px 0 0 var(--blue);
-  color: var(--sidebar-hover-text);
+  background: #383838;
+  box-shadow: none;
+  color: #ffffff;
 }
 
 .theme-portal .nav-add-project,
 .theme-portal .show-more {
   color: #d96548;
-}
-
-.theme-portal .nav-action {
-  color: #f28a32;
-}
-
-.theme-portal .nav-action:hover {
-  background: var(--sidebar-hover-bg);
-  color: var(--sidebar-hover-text);
 }
 
 .theme-portal .nav-inline-action:hover {
@@ -1484,7 +1517,7 @@ sub {
 }
 
 .theme-portal .chat-nav-item {
-  color: #f28a32;
+  color: #1c1c1c;
 }
 
 .theme-portal .chat-surface {
@@ -1778,7 +1811,7 @@ sub {
   .app-shell.sidebar-collapsed .new-thread > span:not(.new-thread-icon),
   .app-shell.sidebar-collapsed .nav-section-title,
   .app-shell.sidebar-collapsed .nav-item span,
-  .app-shell.sidebar-collapsed .nav-actions,
+  .app-shell.sidebar-collapsed .nav-hover-menu,
   .app-shell.sidebar-collapsed .show-more,
   .app-shell.sidebar-collapsed .sidebar-empty {
     display: none;

@@ -154,7 +154,19 @@ def update_project(project_id: str, payload: dict) -> dict | None:
 
 
 def delete_project(project_id: str) -> bool:
-    return _soft_delete("projects", project_id)
+    conn = db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE chats SET project_id = NULL, updated_at = now() WHERE project_id = %s AND deleted_at IS NULL",
+            (project_id,),
+        )
+        cur.execute(
+            "UPDATE projects SET deleted_at = now(), updated_at = now() WHERE id = %s AND deleted_at IS NULL RETURNING id",
+            (project_id,),
+        )
+        deleted = cur.fetchone() is not None
+    conn.commit()
+    return deleted
 
 
 def list_chats(project_id: str | None = None) -> list[dict]:

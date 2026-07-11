@@ -36,12 +36,13 @@ import {
   Sigma,
   Sparkles,
   TestTube2,
+  Trash2,
   UploadCloud,
   User,
   X
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { getJson, patchJson, postFormData, postJson } from "./api";
+import { deleteJson, getJson, patchJson, postFormData, postJson } from "./api";
 
 type Role = "user" | "assistant";
 
@@ -547,6 +548,38 @@ export function App() {
     }
   }, [chats]);
 
+  const deleteChat = useCallback(async (chatId: string) => {
+    const chat = chats.find((item) => item.id === chatId);
+    if (!chat || !window.confirm(`Удалить чат «${chat.title}»?`)) return;
+    try {
+      await deleteJson<{ deleted: boolean }>(`/api/chats/${chatId}`, API_TIMEOUT_MS);
+      setChats((current) => current.filter((item) => item.id !== chatId));
+      if (activeChatId === chatId) {
+        setActiveChatId("");
+        resetThreadState();
+        await syncWorkspace(null, "");
+      }
+    } catch (error) {
+      setWorkspaceError(error instanceof Error ? error.message : "Не удалось удалить чат");
+    }
+  }, [activeChatId, chats, resetThreadState, syncWorkspace]);
+
+  const deleteProject = useCallback(async (projectId: string) => {
+    const project = projects.find((item) => item.id === projectId);
+    if (!project || !window.confirm(`Удалить проект «${project.name}»? Его чаты станут свободными.`)) return;
+    try {
+      await deleteJson<{ deleted: boolean }>(`/api/projects/${projectId}`, API_TIMEOUT_MS);
+      setProjects((current) => current.filter((item) => item.id !== projectId));
+      setChats((current) => current.map((item) => item.projectId === projectId ? { ...item, projectId: null } : item));
+      if (activeProjectId === projectId) {
+        setActiveProjectId("");
+        await syncWorkspace(null, activeChatId);
+      }
+    } catch (error) {
+      setWorkspaceError(error instanceof Error ? error.message : "Не удалось удалить проект");
+    }
+  }, [activeChatId, activeProjectId, projects, syncWorkspace]);
+
   const moveChat = useCallback(async (chatId: string, projectId: string): Promise<boolean> => {
     const chat = chats.find((item) => item.id === chatId);
     if (!chat) return false;
@@ -763,11 +796,13 @@ export function App() {
             projects={projects}
             onChatChange={(chat) => void openChat(chat)}
             onChatMove={moveChat}
+            onChatDelete={(chatId) => void deleteChat(chatId)}
             onChatPin={(chatId) => void updatePinnedItems("chat", chatId)}
             onChatRename={(chatId, title) => void renameChat(chatId, title)}
             onProjectChange={(projectId) => void selectProject(projectId)}
             onProjectChatCreate={(projectId) => void createChat(projectId)}
             onProjectCreate={() => void createProject()}
+            onProjectDelete={(projectId) => void deleteProject(projectId)}
             onProjectPin={(projectId) => void updatePinnedItems("project", projectId)}
             onProjectRename={(projectId, name) => void renameProject(projectId, name)}
           />
@@ -820,12 +855,14 @@ function NavigationSidebar({
   pinnedProjectIds,
   projects,
   onChatChange,
+  onChatDelete,
   onChatMove,
   onChatPin,
   onChatRename,
   onProjectChange,
   onProjectChatCreate,
   onProjectCreate,
+  onProjectDelete,
   onProjectPin,
   onProjectRename
 }: {
@@ -835,12 +872,14 @@ function NavigationSidebar({
   pinnedProjectIds: string[];
   projects: Project[];
   onChatChange: (chat: ChatSummary) => void;
+  onChatDelete: (chatId: string) => void;
   onChatMove: (chatId: string, projectId: string) => Promise<boolean>;
   onChatPin: (chatId: string) => void;
   onChatRename: (chatId: string, title: string) => void;
   onProjectChange: (projectId: string) => void;
   onProjectChatCreate: (projectId: string) => void;
   onProjectCreate: () => void;
+  onProjectDelete: (projectId: string) => void;
   onProjectPin: (projectId: string) => void;
   onProjectRename: (projectId: string, name: string) => void;
 }) {
@@ -876,6 +915,7 @@ function NavigationSidebar({
       <NavigationItem
         chat
         label={chat.title}
+        onDelete={() => onChatDelete(chat.id)}
         onMove={() => setMovingChatId((current) => current === chat.id ? null : chat.id)}
         onOpen={() => onChatChange(chat)}
         onPin={() => onChatPin(chat.id)}
@@ -915,8 +955,11 @@ function NavigationSidebar({
               icon={<Folder size={17} />}
               key={project.id}
               label={project.name}
+              onCreateChat={() => onProjectChatCreate(project.id)}
               onOpen={() => onProjectChange(project.id)}
+              onDelete={() => onProjectDelete(project.id)}
               onPin={() => onProjectPin(project.id)}
+              onRename={() => setEditing({ kind: "project", id: project.id, value: project.name })}
               pinned
             />
           ))}
@@ -926,8 +969,11 @@ function NavigationSidebar({
               detail={chat.projectId ? projectNames.get(chat.projectId) : undefined}
               key={chat.id}
               label={chat.title}
+              onDelete={() => onChatDelete(chat.id)}
+              onMove={() => setMovingChatId((current) => current === chat.id ? null : chat.id)}
               onOpen={() => onChatChange(chat)}
               onPin={() => onChatPin(chat.id)}
+              onRename={() => setEditing({ kind: "chat", id: chat.id, value: chat.title })}
               pinned
             />
           ))}
@@ -947,6 +993,7 @@ function NavigationSidebar({
                 icon={<Folder size={17} />}
                 label={project.name}
                 onCreateChat={() => onProjectChatCreate(project.id)}
+                onDelete={() => onProjectDelete(project.id)}
                 onOpen={() => onProjectChange(project.id)}
                 onPin={() => onProjectPin(project.id)}
                 pinned={pinnedProjectIds.includes(project.id)}
@@ -982,6 +1029,7 @@ function NavigationItem({
   icon,
   label,
   onCreateChat,
+  onDelete,
   onEditCancel,
   onEditChange,
   onEditSave,
@@ -999,6 +1047,7 @@ function NavigationItem({
   icon?: ReactNode;
   label: string;
   onCreateChat?: () => void;
+  onDelete?: () => void;
   onEditCancel?: () => void;
   onEditChange?: (value: string) => void;
   onEditSave?: () => void;
@@ -1034,11 +1083,13 @@ function NavigationItem({
           {detail ? <span className="nav-item-copy"><span>{label}</span><small>{detail}</small></span> : <span>{label}</span>}
         </button>
       )}
-      {!editing && (onCreateChat || onMove || onPin || onRename) ? <div className="nav-actions">
-        {onCreateChat ? <button className="nav-action" onClick={onCreateChat} title="Новый чат в проекте" type="button"><Plus size={14} /></button> : null}
-        {onMove ? <button className="nav-action" onClick={onMove} title="Перенести в проект" type="button"><FolderInput size={14} /></button> : null}
-        {onPin ? <button className={`nav-action ${pinned ? "is-pinned" : ""}`} onClick={onPin} title={pinned ? "Открепить" : "Закрепить"} type="button"><Pin size={14} /></button> : null}
-        {onRename ? <button className="nav-action" onClick={onRename} title="Переименовать" type="button"><Pencil size={14} /></button> : null}
+      {!editing && (onCreateChat || onMove || onPin || onRename || onDelete) ? <div className="nav-hover-menu" role="menu">
+        <button className="nav-menu-action" onClick={onOpen} type="button"><Settings2 size={14} /><span>Редактировать</span></button>
+        {onCreateChat ? <button className="nav-menu-action" onClick={onCreateChat} type="button"><Plus size={14} /><span>Новый чат</span></button> : null}
+        {onMove ? <button className="nav-menu-action" onClick={onMove} type="button"><FolderInput size={14} /><span>Перенести в проект</span></button> : null}
+        {onPin ? <button className="nav-menu-action" onClick={onPin} type="button"><Pin size={14} /><span>{pinned ? "Открепить" : "Закрепить"}</span></button> : null}
+        {onRename ? <button className="nav-menu-action" onClick={onRename} type="button"><Pencil size={14} /><span>Переименовать</span></button> : null}
+        {onDelete ? <button className="nav-menu-action danger" onClick={onDelete} type="button"><Trash2 size={14} /><span>Удалить</span></button> : null}
       </div> : null}
     </div>
   );

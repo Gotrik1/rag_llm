@@ -175,6 +175,29 @@ class WorkspacePersistenceIntegrationTests(unittest.TestCase):
             if project_id:
                 self.request_json("DELETE", f"/api/projects/{project_id}")
 
+    def test_deleting_project_releases_its_chats(self) -> None:
+        suffix = uuid.uuid4().hex
+        chat_id = project_id = None
+        try:
+            _, project = self.request_json("POST", "/api/projects", {"name": f"release-project-{suffix}"})
+            project_id = project["id"]
+            _, chat = self.request_json("POST", f"/api/projects/{project_id}/chats", {"title": f"release-chat-{suffix}"})
+            chat_id = chat["id"]
+
+            status, deleted = self.request_json("DELETE", f"/api/projects/{project_id}")
+            self.assertEqual(status, 200)
+            self.assertTrue(deleted["deleted"])
+            project_id = None
+
+            _, chats = self.request_json("GET", "/api/chats")
+            released = next(item for item in chats["items"] if item["id"] == chat_id)
+            self.assertIsNone(released["project_id"])
+        finally:
+            if chat_id:
+                self.request_json("DELETE", f"/api/chats/{chat_id}")
+            if project_id:
+                self.request_json("DELETE", f"/api/projects/{project_id}")
+
     def test_project_conversation_isolated_and_moves_with_chat(self) -> None:
         project_ids: list[str] = []
         chat_ids: list[str] = []

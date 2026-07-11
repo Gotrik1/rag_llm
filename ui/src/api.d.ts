@@ -2,3 +2,4 @@ export declare function postJson<T>(path: string, body: unknown, timeoutMs: numb
 export declare function postFormData<T>(path: string, body: FormData, timeoutMs: number): Promise<T>;
 export declare function getJson<T>(path: string, timeoutMs: number): Promise<T>;
 export declare function patchJson<T>(path: string, body: unknown, timeoutMs: number): Promise<T>;
+export declare function deleteJson<T>(path: string, timeoutMs: number): Promise<T>;

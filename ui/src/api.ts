@@ -75,3 +75,12 @@ export function patchJson<T>(path: string, body: unknown, timeoutMs: number): Pr
     "Backend не ответил вовремя. Запрос можно повторить."
   );
 }
+
+export function deleteJson<T>(path: string, timeoutMs: number): Promise<T> {
+  return request<T>(
+    path,
+    { method: "DELETE" },
+    timeoutMs,
+    "Backend не ответил вовремя. Запрос можно повторить."
+  );
+}

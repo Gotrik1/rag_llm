@@ -42,3 +42,6 @@ export function patchJson(path, body, timeoutMs) {
         body: JSON.stringify(body)
     }, timeoutMs, "Backend не ответил вовремя. Запрос можно повторить.");
 }
+export function deleteJson(path, timeoutMs) {
+    return request(path, { method: "DELETE" }, timeoutMs, "Backend не ответил вовремя. Запрос можно повторить.");
+}

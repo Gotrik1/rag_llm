@@ -146,6 +146,35 @@ class WorkspacePersistenceIntegrationTests(unittest.TestCase):
                 self.assertIsNotNone(deleted)
                 self.assertIsNotNone(deleted["deleted_at"])
 
+    def test_free_chat_can_be_created_and_moved_into_project(self) -> None:
+        suffix = uuid.uuid4().hex
+        chat_id = project_id = None
+        try:
+            status, chat = self.request_json("POST", "/api/chats", {"title": f"free-chat-{suffix}"})
+            self.assertEqual(status, 201)
+            self.assertIsNone(chat["project_id"])
+            chat_id = chat["id"]
+
+            status, chats = self.request_json("GET", "/api/chats")
+            self.assertEqual(status, 200)
+            self.assertIn(chat_id, [item["id"] for item in chats["items"] if item["project_id"] is None])
+
+            status, project = self.request_json("POST", "/api/projects", {"name": f"move-target-{suffix}"})
+            self.assertEqual(status, 201)
+            project_id = project["id"]
+
+            status, moved = self.request_json("PATCH", f"/api/chats/{chat_id}", {"project_id": project_id})
+            self.assertEqual(status, 200)
+            self.assertEqual(moved["project_id"], project_id)
+
+            _, project_chats = self.request_json("GET", f"/api/projects/{project_id}/chats")
+            self.assertIn(chat_id, [item["id"] for item in project_chats["items"]])
+        finally:
+            if chat_id:
+                self.request_json("DELETE", f"/api/chats/{chat_id}")
+            if project_id:
+                self.request_json("DELETE", f"/api/projects/{project_id}")
+
     def test_project_conversation_isolated_and_moves_with_chat(self) -> None:
         project_ids: list[str] = []
         chat_ids: list[str] = []

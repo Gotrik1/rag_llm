@@ -169,14 +169,17 @@ def list_chats(project_id: str | None = None) -> list[dict]:
         return [dict(row) for row in cur.fetchall()]
 
 
-def create_chat(project_id: str, payload: dict, default_mode: str, default_provider: str, default_model: str) -> dict:
+def create_chat(project_id: str | None, payload: dict, default_mode: str, default_provider: str, default_model: str) -> dict:
+    normalized_project_id = str(project_id or "").strip() or None
+    if normalized_project_id is not None and get_project(normalized_project_id) is None:
+        raise ValueError("project not found")
     conn = db()
     with conn.cursor() as cur:
         cur.execute(
             """INSERT INTO chats (project_id, title, mode, provider, model_name, metadata)
                VALUES (%s, %s, %s, %s, %s, %s) RETURNING *""",
             (
-                project_id,
+                normalized_project_id,
                 str(payload.get("title", "")).strip() or "Новый чат",
                 str(payload.get("mode", default_mode)).strip() or default_mode,
                 str(payload.get("provider", default_provider)).strip() or default_provider,
@@ -220,22 +223,35 @@ def list_messages(chat_id: str) -> list[dict]:
 
 
 def get_project_conversation(chat_id: str, limit: int = 40) -> dict | None:
-    """Return bounded message history from the active chat's project only."""
+    """Return project history, or only the active chat history for a free chat."""
     with db().cursor() as cur:
         cur.execute(
             """
             SELECT c.project_id, p.name AS project_name, p.memory
             FROM chats c
-            JOIN projects p ON p.id = c.project_id
-            WHERE c.id = %s AND c.deleted_at IS NULL AND p.deleted_at IS NULL
+            LEFT JOIN projects p ON p.id = c.project_id AND p.deleted_at IS NULL
+            WHERE c.id = %s AND c.deleted_at IS NULL
             """,
             (chat_id,),
         )
         scope = cur.fetchone()
         if scope is None:
             return None
-        cur.execute(
-            """
+        if scope["project_id"] is None:
+            cur.execute(
+                """
+                SELECT c.id AS chat_id, c.title AS chat_title, m.role, m.content, m.created_at
+                FROM messages m
+                JOIN chats c ON c.id = m.chat_id
+                WHERE c.id = %s AND c.deleted_at IS NULL
+                  AND m.deleted_at IS NULL AND m.status = 'complete'
+                ORDER BY m.created_at DESC LIMIT %s
+                """,
+                (chat_id, max(1, min(limit, 100))),
+            )
+        else:
+            cur.execute(
+                """
             SELECT c.id AS chat_id, c.title AS chat_title, m.role, m.content, m.created_at
             FROM messages m
             JOIN chats c ON c.id = m.chat_id
@@ -245,9 +261,9 @@ def get_project_conversation(chat_id: str, limit: int = 40) -> dict | None:
               AND m.status = 'complete'
             ORDER BY m.created_at DESC
             LIMIT %s
-            """,
-            (scope["project_id"], max(1, min(limit, 100))),
-        )
+                """,
+                (scope["project_id"], max(1, min(limit, 100))),
+            )
         messages = [dict(row) for row in reversed(cur.fetchall())]
     return {**dict(scope), "messages": messages}
 

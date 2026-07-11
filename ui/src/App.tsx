@@ -165,7 +165,7 @@ type ProjectRecord = {
 
 type ChatRecord = {
   id: string;
-  project_id: string;
+  project_id: string | null;
   title: string;
 };
 
@@ -187,7 +187,7 @@ type Project = {
 
 type ChatSummary = {
   id: string;
-  projectId: string;
+  projectId: string | null;
   title: string;
   messages: ChatEntry[];
 };
@@ -196,6 +196,12 @@ const DEFAULT_PROJECT: Project = {
   id: "regulations",
   name: "Регламенты",
   memory: "Точный поиск по пунктам регламентов. Формулы и источники показывать явно."
+};
+
+const FREE_CHAT_WORKSPACE: Project = {
+  id: "",
+  name: "Свободный чат",
+  memory: "Контекст ограничен текущим чатом."
 };
 
 const THEME_KEY = "rag-assistant-theme";
@@ -357,7 +363,9 @@ export function App() {
   const [theme, setTheme] = useState<AppTheme>(() => window.localStorage.getItem(THEME_KEY) === "portal" ? "portal" : "default");
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => readStored(SIDEBAR_COLLAPSED_KEY, false));
 
-  const activeProject = projects.find((project) => project.id === activeProjectId) ?? DEFAULT_PROJECT;
+  const activeProject = activeProjectId
+    ? projects.find((project) => project.id === activeProjectId) ?? DEFAULT_PROJECT
+    : FREE_CHAT_WORKSPACE;
 
   useEffect(() => {
     window.localStorage.setItem(THEME_KEY, theme);
@@ -381,7 +389,7 @@ export function App() {
     setMessages(data.items.map(messageFromRecord));
   }, []);
 
-  const syncWorkspace = useCallback(async (projectId: string, chatId: string) => {
+  const syncWorkspace = useCallback(async (projectId: string | null, chatId: string) => {
     const workspace = await postJson<WorkspaceState>("/api/settings", {
       active_project_id: projectId,
       active_chat_id: chatId,
@@ -393,14 +401,15 @@ export function App() {
   const loadWorkspace = useCallback(async () => {
     setWorkspaceError("");
     try {
-      const [workspace, projectData] = await Promise.all([
+      const [workspace, projectData, chatData] = await Promise.all([
         getJson<WorkspaceState>("/api/workspace", API_TIMEOUT_MS),
-        getJson<{ items: ProjectRecord[] }>("/api/projects", API_TIMEOUT_MS)
+        getJson<{ items: ProjectRecord[] }>("/api/projects", API_TIMEOUT_MS),
+        getJson<{ items: ChatRecord[] }>("/api/chats", API_TIMEOUT_MS)
       ]);
       const nextProjects = projectData.items.map(projectFromRecord);
-      const nextChats = projectData.items.flatMap((project) => (project.chats ?? []).map(chatFromRecord));
+      const nextChats = chatData.items.map(chatFromRecord);
       const nextProjectId = workspace.active_project_id || nextProjects[0]?.id || "";
-      const nextChatId = workspace.active_chat_id || nextChats.find((chat) => chat.projectId === nextProjectId)?.id || "";
+      const nextChatId = workspace.active_chat_id || nextChats.find((chat) => chat.projectId === null)?.id || nextChats[0]?.id || "";
 
       setWorkspaceSettings(workspace.settings ?? {});
       setProjects(nextProjects);
@@ -458,8 +467,19 @@ export function App() {
     return chat;
   }, [resetThreadState, syncWorkspace]);
 
+  const createFreeChat = useCallback(async () => {
+    const record = await postJson<ChatRecord>("/api/chats", { title: "Новый чат" }, API_TIMEOUT_MS);
+    const chat = chatFromRecord(record);
+    setChats((current) => [...current, chat]);
+    setActiveProjectId("");
+    setActiveChatId(chat.id);
+    await syncWorkspace(null, chat.id);
+    resetThreadState();
+    return chat;
+  }, [resetThreadState, syncWorkspace]);
+
   const openChat = useCallback(async (chat: ChatSummary) => {
-    setActiveProjectId(chat.projectId);
+    setActiveProjectId(chat.projectId ?? "");
     setActiveChatId(chat.id);
     await syncWorkspace(chat.projectId, chat.id);
     await loadMessages(chat.id);
@@ -673,13 +693,12 @@ export function App() {
   const runtime = useExternalStoreRuntime(adapter);
 
   const clearThread = useCallback(async () => {
-    if (!activeProjectId) return;
     try {
-      await createChat(activeProjectId);
+      await createFreeChat();
     } catch (error) {
       setWorkspaceError(error instanceof Error ? error.message : "Не удалось создать чат");
     }
-  }, [activeProjectId, createChat]);
+  }, [createFreeChat]);
 
   const runDebug = useCallback(async () => {
     if (!lastQuestion || isRunning || isDebugging) return;
@@ -831,6 +850,7 @@ function NavigationSidebar({
   const visibleProjects = showAllProjects ? projects : projects.slice(0, 5);
   const pinnedProjects = projects.filter((project) => pinnedProjectIds.includes(project.id));
   const pinnedChats = chats.filter((chat) => pinnedChatIds.includes(chat.id));
+  const freeChats = chats.filter((chat) => chat.projectId === null);
   const projectNames = new Map(projects.map((project) => [project.id, project.name]));
 
   const saveEdit = () => {
@@ -851,6 +871,39 @@ function NavigationSidebar({
     onRename: () => setEditing({ kind, id, value })
   });
 
+  const renderChat = (chat: ChatSummary, nested = false) => (
+    <div className={`nav-chat-group ${nested ? "project-chat" : ""}`} key={chat.id}>
+      <NavigationItem
+        chat
+        label={chat.title}
+        onMove={() => setMovingChatId((current) => current === chat.id ? null : chat.id)}
+        onOpen={() => onChatChange(chat)}
+        onPin={() => onChatPin(chat.id)}
+        pinned={pinnedChatIds.includes(chat.id)}
+        {...editProps("chat", chat.id, chat.title)}
+      />
+      {movingChatId === chat.id ? (
+        <div className="nav-move-menu">
+          <div className="nav-move-title">Перенести в проект</div>
+          {projects.map((project) => (
+            <button
+              className={project.id === chat.projectId ? "nav-move-current" : undefined}
+              key={project.id}
+              onClick={() => void onChatMove(chat.id, project.id).then((moved) => {
+                if (moved) setMovingChatId(null);
+              })}
+              type="button"
+            >
+              <Folder size={14} />
+              <span>{project.name}</span>
+              {project.id === chat.projectId ? <small>Текущий проект</small> : null}
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+
   return (
     <nav className="navigation-sidebar" aria-label="Проекты и чаты">
       <section className="nav-section">
@@ -870,7 +923,7 @@ function NavigationSidebar({
           {pinnedChats.map((chat) => (
             <NavigationItem
               chat
-              detail={projectNames.get(chat.projectId)}
+              detail={chat.projectId ? projectNames.get(chat.projectId) : undefined}
               key={chat.id}
               label={chat.title}
               onOpen={() => onChatChange(chat)}
@@ -888,17 +941,21 @@ function NavigationSidebar({
         </div>
         <div className="project-list">
           {visibleProjects.map((project) => (
-            <NavigationItem
-              active={project.id === activeProjectId}
-              icon={<Folder size={17} />}
-              key={project.id}
-              label={project.name}
-              onCreateChat={() => onProjectChatCreate(project.id)}
-              onOpen={() => onProjectChange(project.id)}
-              onPin={() => onProjectPin(project.id)}
-              pinned={pinnedProjectIds.includes(project.id)}
-              {...editProps("project", project.id, project.name)}
-            />
+            <div className="project-tree" key={project.id}>
+              <NavigationItem
+                active={project.id === activeProjectId}
+                icon={<Folder size={17} />}
+                label={project.name}
+                onCreateChat={() => onProjectChatCreate(project.id)}
+                onOpen={() => onProjectChange(project.id)}
+                onPin={() => onProjectPin(project.id)}
+                pinned={pinnedProjectIds.includes(project.id)}
+                {...editProps("project", project.id, project.name)}
+              />
+              <div className="project-chat-list">
+                {chats.filter((chat) => chat.projectId === project.id).map((chat) => renderChat(chat, true))}
+              </div>
+            </div>
           ))}
         </div>
         {projects.length > 5 ? (
@@ -911,39 +968,7 @@ function NavigationSidebar({
       <section className="nav-section chats-section">
         <div className="nav-section-title">Чаты</div>
         <div className="sidebar-chat-list">
-          {chats.length ? chats.map((chat) => (
-            <div className="nav-chat-group" key={chat.id}>
-              <NavigationItem
-                chat
-                detail={projectNames.get(chat.projectId)}
-                label={chat.title}
-                onMove={() => setMovingChatId((current) => current === chat.id ? null : chat.id)}
-                onOpen={() => onChatChange(chat)}
-                onPin={() => onChatPin(chat.id)}
-                pinned={pinnedChatIds.includes(chat.id)}
-                {...editProps("chat", chat.id, chat.title)}
-              />
-              {movingChatId === chat.id ? (
-                <div className="nav-move-menu">
-                  <div className="nav-move-title">Перенести в проект</div>
-                      {projects.map((project) => (
-                        <button
-                          className={project.id === chat.projectId ? "nav-move-current" : undefined}
-                          key={project.id}
-                          onClick={() => void onChatMove(chat.id, project.id).then((moved) => {
-                            if (moved) setMovingChatId(null);
-                      })}
-                      type="button"
-                    >
-                          <Folder size={14} />
-                          <span>{project.name}</span>
-                          {project.id === chat.projectId ? <small>Текущий проект</small> : null}
-                        </button>
-                      ))}
-                </div>
-              ) : null}
-            </div>
-          )) : <div className="sidebar-empty">История появится после первого вопроса.</div>}
+          {freeChats.length ? freeChats.map((chat) => renderChat(chat)) : <div className="sidebar-empty">Свободных чатов пока нет.</div>}
         </div>
       </section>
     </nav>

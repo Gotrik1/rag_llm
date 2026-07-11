@@ -795,7 +795,7 @@ class Handler(BaseHTTPRequestHandler):
                 project_id = path.split("/")[3]
                 self.send_json(create_chat(project_id, body, *storage_defaults()), 201)
             elif path == "/api/chats":
-                self.send_json(create_chat(str(body.get("project_id", "")).strip(), body, *storage_defaults()), 201)
+                self.send_json(create_chat(body.get("project_id"), body, *storage_defaults()), 201)
             elif path.startswith("/api/chats/") and path.count("/") == 3:
                 self.send_json({"error": "use PATCH or DELETE for this resource"}, 405)
             elif path.startswith("/api/chats/") and path.endswith("/messages"):

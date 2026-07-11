@@ -170,14 +170,15 @@ export function App() {
     const loadWorkspace = useCallback(async () => {
         setWorkspaceError("");
         try {
-            const [workspace, projectData] = await Promise.all([
+            const [workspace, projectData, chatData] = await Promise.all([
                 getJson("/api/workspace", API_TIMEOUT_MS),
-                getJson("/api/projects", API_TIMEOUT_MS)
+                getJson("/api/projects", API_TIMEOUT_MS),
+                getJson("/api/chats", API_TIMEOUT_MS)
             ]);
             const nextProjects = projectData.items.map(projectFromRecord);
-            const nextChats = projectData.items.flatMap((project) => (project.chats ?? []).map(chatFromRecord));
+            const nextChats = chatData.items.map(chatFromRecord);
             const nextProjectId = workspace.active_project_id || nextProjects[0]?.id || "";
-            const nextChatId = workspace.active_chat_id || nextChats.find((chat) => chat.projectId === nextProjectId)?.id || "";
+            const nextChatId = workspace.active_chat_id || nextChats.find((chat) => chat.projectId === null)?.id || nextChats[0]?.id || "";
             setWorkspaceSettings(workspace.settings ?? {});
             setProjects(nextProjects);
             setChats(nextChats);
@@ -237,8 +238,18 @@ export function App() {
         resetThreadState();
         return chat;
     }, [resetThreadState, syncWorkspace]);
+    const createFreeChat = useCallback(async () => {
+        const record = await postJson("/api/chats", { title: "Новый чат" }, API_TIMEOUT_MS);
+        const chat = chatFromRecord(record);
+        setChats((current) => [...current, chat]);
+        setActiveProjectId("");
+        setActiveChatId(chat.id);
+        await syncWorkspace(null, chat.id);
+        resetThreadState();
+        return chat;
+    }, [resetThreadState, syncWorkspace]);
     const openChat = useCallback(async (chat) => {
-        setActiveProjectId(chat.projectId);
+        setActiveProjectId(chat.projectId ?? "");
         setActiveChatId(chat.id);
         await syncWorkspace(chat.projectId, chat.id);
         await loadMessages(chat.id);
@@ -434,15 +445,13 @@ export function App() {
     }), [messages, isRunning, onNew]);
     const runtime = useExternalStoreRuntime(adapter);
     const clearThread = useCallback(async () => {
-        if (!activeProjectId)
-            return;
         try {
-            await createChat(activeProjectId);
+            await createFreeChat();
         }
         catch (error) {
             setWorkspaceError(error instanceof Error ? error.message : "Не удалось создать чат");
         }
-    }, [activeProjectId, createChat]);
+    }, [createFreeChat]);
     const runDebug = useCallback(async () => {
         if (!lastQuestion || isRunning || isDebugging)
             return;
@@ -489,6 +498,7 @@ function NavigationSidebar({ activeProjectId, chats, pinnedChatIds, pinnedProjec
     const visibleProjects = showAllProjects ? projects : projects.slice(0, 5);
     const pinnedProjects = projects.filter((project) => pinnedProjectIds.includes(project.id));
     const pinnedChats = chats.filter((chat) => pinnedChatIds.includes(chat.id));
+    const freeChats = chats.filter((chat) => chat.projectId === null);
     const projectNames = new Map(projects.map((project) => [project.id, project.name]));
     const saveEdit = () => {
         if (!editing)
@@ -510,10 +520,11 @@ function NavigationSidebar({ activeProjectId, chats, pinnedChatIds, pinnedProjec
         onEditSave: saveEdit,
         onRename: () => setEditing({ kind, id, value })
     });
-    return (_jsxs("nav", { className: "navigation-sidebar", "aria-label": "\u041F\u0440\u043E\u0435\u043A\u0442\u044B \u0438 \u0447\u0430\u0442\u044B", children: [_jsxs("section", { className: "nav-section", children: [_jsx("div", { className: "nav-section-title", children: "\u0417\u0430\u043A\u0440\u0435\u043F\u043B\u0451\u043D\u043D\u044B\u0435" }), _jsxs("div", { className: "project-list pinned-list", children: [pinnedProjects.map((project) => (_jsx(NavigationItem, { active: project.id === activeProjectId, icon: _jsx(Folder, { size: 17 }), label: project.name, onOpen: () => onProjectChange(project.id), onPin: () => onProjectPin(project.id), pinned: true }, project.id))), pinnedChats.map((chat) => (_jsx(NavigationItem, { chat: true, detail: projectNames.get(chat.projectId), label: chat.title, onOpen: () => onChatChange(chat), onPin: () => onChatPin(chat.id), pinned: true }, chat.id)))] })] }), _jsxs("section", { className: "nav-section", children: [_jsxs("div", { className: "nav-section-header", children: [_jsx("div", { className: "nav-section-title", children: "\u041F\u0440\u043E\u0435\u043A\u0442\u044B" }), _jsx("button", { className: "nav-add-project", onClick: onProjectCreate, title: "\u041D\u043E\u0432\u044B\u0439 \u043F\u0440\u043E\u0435\u043A\u0442", type: "button", children: _jsx(Plus, { size: 15 }) })] }), _jsx("div", { className: "project-list", children: visibleProjects.map((project) => (_jsx(NavigationItem, { active: project.id === activeProjectId, icon: _jsx(Folder, { size: 17 }), label: project.name, onCreateChat: () => onProjectChatCreate(project.id), onOpen: () => onProjectChange(project.id), onPin: () => onProjectPin(project.id), pinned: pinnedProjectIds.includes(project.id), ...editProps("project", project.id, project.name) }, project.id))) }), projects.length > 5 ? (_jsx("button", { className: "show-more", onClick: () => setShowAllProjects((value) => !value), type: "button", children: showAllProjects ? "Скрыть" : "Показать еще" })) : null] }), _jsxs("section", { className: "nav-section chats-section", children: [_jsx("div", { className: "nav-section-title", children: "\u0427\u0430\u0442\u044B" }), _jsx("div", { className: "sidebar-chat-list", children: chats.length ? chats.map((chat) => (_jsxs("div", { className: "nav-chat-group", children: [_jsx(NavigationItem, { chat: true, detail: projectNames.get(chat.projectId), label: chat.title, onMove: () => setMovingChatId((current) => current === chat.id ? null : chat.id), onOpen: () => onChatChange(chat), onPin: () => onChatPin(chat.id), pinned: pinnedChatIds.includes(chat.id), ...editProps("chat", chat.id, chat.title) }), movingChatId === chat.id ? (_jsxs("div", { className: "nav-move-menu", children: [_jsx("div", { className: "nav-move-title", children: "\u041F\u0435\u0440\u0435\u043D\u0435\u0441\u0442\u0438 \u0432 \u043F\u0440\u043E\u0435\u043A\u0442" }), projects.map((project) => (_jsxs("button", { className: project.id === chat.projectId ? "nav-move-current" : undefined, onClick: () => void onChatMove(chat.id, project.id).then((moved) => {
-                                                if (moved)
-                                                    setMovingChatId(null);
-                                            }), type: "button", children: [_jsx(Folder, { size: 14 }), _jsx("span", { children: project.name }), project.id === chat.projectId ? _jsx("small", { children: "\u0422\u0435\u043A\u0443\u0449\u0438\u0439 \u043F\u0440\u043E\u0435\u043A\u0442" }) : null] }, project.id)))] })) : null] }, chat.id))) : _jsx("div", { className: "sidebar-empty", children: "\u0418\u0441\u0442\u043E\u0440\u0438\u044F \u043F\u043E\u044F\u0432\u0438\u0442\u0441\u044F \u043F\u043E\u0441\u043B\u0435 \u043F\u0435\u0440\u0432\u043E\u0433\u043E \u0432\u043E\u043F\u0440\u043E\u0441\u0430." }) })] })] }));
+    const renderChat = (chat, nested = false) => (_jsxs("div", { className: `nav-chat-group ${nested ? "project-chat" : ""}`, children: [_jsx(NavigationItem, { chat: true, label: chat.title, onMove: () => setMovingChatId((current) => current === chat.id ? null : chat.id), onOpen: () => onChatChange(chat), onPin: () => onChatPin(chat.id), pinned: pinnedChatIds.includes(chat.id), ...editProps("chat", chat.id, chat.title) }), movingChatId === chat.id ? (_jsxs("div", { className: "nav-move-menu", children: [_jsx("div", { className: "nav-move-title", children: "\u041F\u0435\u0440\u0435\u043D\u0435\u0441\u0442\u0438 \u0432 \u043F\u0440\u043E\u0435\u043A\u0442" }), projects.map((project) => (_jsxs("button", { className: project.id === chat.projectId ? "nav-move-current" : undefined, onClick: () => void onChatMove(chat.id, project.id).then((moved) => {
+                            if (moved)
+                                setMovingChatId(null);
+                        }), type: "button", children: [_jsx(Folder, { size: 14 }), _jsx("span", { children: project.name }), project.id === chat.projectId ? _jsx("small", { children: "\u0422\u0435\u043A\u0443\u0449\u0438\u0439 \u043F\u0440\u043E\u0435\u043A\u0442" }) : null] }, project.id)))] })) : null] }, chat.id));
+    return (_jsxs("nav", { className: "navigation-sidebar", "aria-label": "\u041F\u0440\u043E\u0435\u043A\u0442\u044B \u0438 \u0447\u0430\u0442\u044B", children: [_jsxs("section", { className: "nav-section", children: [_jsx("div", { className: "nav-section-title", children: "\u0417\u0430\u043A\u0440\u0435\u043F\u043B\u0451\u043D\u043D\u044B\u0435" }), _jsxs("div", { className: "project-list pinned-list", children: [pinnedProjects.map((project) => (_jsx(NavigationItem, { active: project.id === activeProjectId, icon: _jsx(Folder, { size: 17 }), label: project.name, onOpen: () => onProjectChange(project.id), onPin: () => onProjectPin(project.id), pinned: true }, project.id))), pinnedChats.map((chat) => (_jsx(NavigationItem, { chat: true, detail: chat.projectId ? projectNames.get(chat.projectId) : undefined, label: chat.title, onOpen: () => onChatChange(chat), onPin: () => onChatPin(chat.id), pinned: true }, chat.id)))] })] }), _jsxs("section", { className: "nav-section", children: [_jsxs("div", { className: "nav-section-header", children: [_jsx("div", { className: "nav-section-title", children: "\u041F\u0440\u043E\u0435\u043A\u0442\u044B" }), _jsx("button", { className: "nav-add-project", onClick: onProjectCreate, title: "\u041D\u043E\u0432\u044B\u0439 \u043F\u0440\u043E\u0435\u043A\u0442", type: "button", children: _jsx(Plus, { size: 15 }) })] }), _jsx("div", { className: "project-list", children: visibleProjects.map((project) => (_jsxs("div", { className: "project-tree", children: [_jsx(NavigationItem, { active: project.id === activeProjectId, icon: _jsx(Folder, { size: 17 }), label: project.name, onCreateChat: () => onProjectChatCreate(project.id), onOpen: () => onProjectChange(project.id), onPin: () => onProjectPin(project.id), pinned: pinnedProjectIds.includes(project.id), ...editProps("project", project.id, project.name) }), _jsx("div", { className: "project-chat-list", children: chats.filter((chat) => chat.projectId === project.id).map((chat) => renderChat(chat, true)) })] }, project.id))) }), projects.length > 5 ? (_jsx("button", { className: "show-more", onClick: () => setShowAllProjects((value) => !value), type: "button", children: showAllProjects ? "Скрыть" : "Показать еще" })) : null] }), _jsxs("section", { className: "nav-section chats-section", children: [_jsx("div", { className: "nav-section-title", children: "\u0427\u0430\u0442\u044B" }), _jsx("div", { className: "sidebar-chat-list", children: freeChats.length ? freeChats.map((chat) => renderChat(chat)) : _jsx("div", { className: "sidebar-empty", children: "\u0421\u0432\u043E\u0431\u043E\u0434\u043D\u044B\u0445 \u0447\u0430\u0442\u043E\u0432 \u043F\u043E\u043A\u0430 \u043D\u0435\u0442." }) })] })] }));
 }
 function NavigationItem({ active = false, chat = false, detail, icon, label, onCreateChat, onEditCancel, onEditChange, onEditSave, onMove, onOpen, onPin, onRename, pinned = false, editing = false, editValue = "" }) {
     return (_jsxs("div", { className: "nav-row", children: [editing ? (_jsxs("div", { className: `nav-item nav-item-edit ${chat ? "chat-nav-item" : ""} ${active ? "active" : ""}`, children: [icon, _jsx("input", { "aria-label": "\u041D\u043E\u0432\u043E\u0435 \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u0435", autoFocus: true, onChange: (event) => onEditChange?.(event.target.value), onKeyDown: (event) => {

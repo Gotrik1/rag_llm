@@ -317,6 +317,23 @@ textarea {
   min-width: 0;
 }
 
+.project-tree + .project-tree {
+  margin-top: 2px;
+}
+
+.project-chat-list {
+  display: grid;
+  gap: 2px;
+  margin-left: 18px;
+  padding-left: 9px;
+}
+
+.project-chat .nav-item {
+  min-height: 32px;
+  padding-top: 5px;
+  padding-bottom: 5px;
+}
+
 .nav-move-title {
   padding: 0 4px 4px;
   color: #aeb5be;

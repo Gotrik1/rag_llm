@@ -529,7 +529,7 @@ export function App() {
 
   const moveChat = useCallback(async (chatId: string, projectId: string): Promise<boolean> => {
     const chat = chats.find((item) => item.id === chatId);
-    if (!chat || chat.projectId === projectId) return false;
+    if (!chat) return false;
     try {
       const record = await patchJson<ChatRecord>(`/api/chats/${chatId}`, { project_id: projectId }, API_TIMEOUT_MS);
       setChats((current) => current.map((item) => item.id === chatId ? chatFromRecord(record) : item));
@@ -926,24 +926,20 @@ function NavigationSidebar({
               {movingChatId === chat.id ? (
                 <div className="nav-move-menu">
                   <div className="nav-move-title">Перенести в проект</div>
-                  {projects.map((project) => project.id === chat.projectId ? (
-                    <div className="nav-move-current" key={project.id}>
-                      <Folder size={14} />
-                      <span>{project.name}</span>
-                      <small>Текущий проект</small>
-                    </div>
-                  ) : (
-                    <button
-                      key={project.id}
-                      onClick={() => void onChatMove(chat.id, project.id).then((moved) => {
-                        if (moved) setMovingChatId(null);
+                      {projects.map((project) => (
+                        <button
+                          className={project.id === chat.projectId ? "nav-move-current" : undefined}
+                          key={project.id}
+                          onClick={() => void onChatMove(chat.id, project.id).then((moved) => {
+                            if (moved) setMovingChatId(null);
                       })}
                       type="button"
                     >
-                      <Folder size={14} />
-                      <span>{project.name}</span>
-                    </button>
-                  ))}
+                          <Folder size={14} />
+                          <span>{project.name}</span>
+                          {project.id === chat.projectId ? <small>Текущий проект</small> : null}
+                        </button>
+                      ))}
                 </div>
               ) : null}
             </div>

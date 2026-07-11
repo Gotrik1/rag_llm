@@ -42,6 +42,7 @@ import {
   X
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { deleteJson, getJson, patchJson, postFormData, postJson } from "./api";
 
 type Role = "user" | "assistant";
@@ -1059,8 +1060,56 @@ function NavigationItem({
   editing?: boolean;
   editValue?: string;
 }) {
+  const [menuAnchor, setMenuAnchor] = useState<{ top: number; left: number } | null>(null);
+  const closeMenuTimer = useRef<number | null>(null);
+  const hasActionMenu = Boolean(onCreateChat || onMove || onPin || onRename || onDelete);
+
+  const clearMenuCloseTimer = () => {
+    if (closeMenuTimer.current !== null) {
+      window.clearTimeout(closeMenuTimer.current);
+      closeMenuTimer.current = null;
+    }
+  };
+
+  const openActionMenu = (element: HTMLDivElement) => {
+    clearMenuCloseTimer();
+    const rect = element.getBoundingClientRect();
+    setMenuAnchor({ top: rect.top, left: rect.right + 8 });
+  };
+
+  const scheduleActionMenuClose = () => {
+    clearMenuCloseTimer();
+    closeMenuTimer.current = window.setTimeout(() => setMenuAnchor(null), 140);
+  };
+
+  useEffect(() => () => clearMenuCloseTimer(), []);
+
+  const actionMenu = !editing && hasActionMenu && menuAnchor && typeof document !== "undefined"
+    ? createPortal(
+      <div
+        className="nav-hover-menu"
+        onMouseEnter={clearMenuCloseTimer}
+        onMouseLeave={scheduleActionMenuClose}
+        role="menu"
+        style={{ left: menuAnchor.left, top: menuAnchor.top }}
+      >
+        <button className="nav-menu-action" onClick={onOpen} type="button"><Settings2 size={14} /><span>Редактировать</span></button>
+        {onCreateChat ? <button className="nav-menu-action" onClick={onCreateChat} type="button"><Plus size={14} /><span>Новый чат</span></button> : null}
+        {onMove ? <button className="nav-menu-action" onClick={onMove} type="button"><FolderInput size={14} /><span>Перенести в проект</span></button> : null}
+        {onPin ? <button className="nav-menu-action" onClick={onPin} type="button"><Pin size={14} /><span>{pinned ? "Открепить" : "Закрепить"}</span></button> : null}
+        {onRename ? <button className="nav-menu-action" onClick={onRename} type="button"><Pencil size={14} /><span>Переименовать</span></button> : null}
+        {onDelete ? <button className="nav-menu-action danger" onClick={onDelete} type="button"><Trash2 size={14} /><span>Удалить</span></button> : null}
+      </div>,
+      document.body
+    )
+    : null;
+
   return (
-    <div className="nav-row">
+    <div
+      className="nav-row"
+      onMouseEnter={(event) => hasActionMenu && openActionMenu(event.currentTarget)}
+      onMouseLeave={scheduleActionMenuClose}
+    >
       {editing ? (
         <div className={`nav-item nav-item-edit ${chat ? "chat-nav-item" : ""} ${active ? "active" : ""}`}>
           {icon}
@@ -1083,14 +1132,7 @@ function NavigationItem({
           {detail ? <span className="nav-item-copy"><span>{label}</span><small>{detail}</small></span> : <span>{label}</span>}
         </button>
       )}
-      {!editing && (onCreateChat || onMove || onPin || onRename || onDelete) ? <div className="nav-hover-menu" role="menu">
-        <button className="nav-menu-action" onClick={onOpen} type="button"><Settings2 size={14} /><span>Редактировать</span></button>
-        {onCreateChat ? <button className="nav-menu-action" onClick={onCreateChat} type="button"><Plus size={14} /><span>Новый чат</span></button> : null}
-        {onMove ? <button className="nav-menu-action" onClick={onMove} type="button"><FolderInput size={14} /><span>Перенести в проект</span></button> : null}
-        {onPin ? <button className="nav-menu-action" onClick={onPin} type="button"><Pin size={14} /><span>{pinned ? "Открепить" : "Закрепить"}</span></button> : null}
-        {onRename ? <button className="nav-menu-action" onClick={onRename} type="button"><Pencil size={14} /><span>Переименовать</span></button> : null}
-        {onDelete ? <button className="nav-menu-action danger" onClick={onDelete} type="button"><Trash2 size={14} /><span>Удалить</span></button> : null}
-      </div> : null}
+      {actionMenu}
     </div>
   );
 }

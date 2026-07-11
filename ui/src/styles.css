@@ -237,13 +237,11 @@ textarea {
 }
 
 .nav-hover-menu {
-  position: absolute;
-  top: calc(100% + 5px);
-  right: 0;
-  left: 0;
-  z-index: 30;
-  display: none;
+  position: fixed;
+  z-index: 100;
+  display: grid;
   gap: 3px;
+  width: 210px;
   border: 1px solid #4b4b4b;
   border-radius: 10px;
   background: #252525;
@@ -279,16 +277,6 @@ textarea {
 .nav-menu-action.danger:hover {
   background: #4b2a2a;
   color: #ffffff;
-}
-
-.nav-row > .nav-item:hover + .nav-hover-menu,
-.nav-row:hover .nav-hover-menu,
-.nav-row:focus-within .nav-hover-menu {
-  display: grid;
-}
-
-.nav-chat-group:has(.nav-move-menu) .nav-hover-menu {
-  display: none;
 }
 
 .nav-item-edit {

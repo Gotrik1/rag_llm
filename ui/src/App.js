@@ -570,28 +570,20 @@ function NavigationSidebar({ activeProjectId, chats, pinnedChatIds, pinnedProjec
 }
 function NavigationItem({ active = false, chat = false, detail, icon, label, onCreateChat, onDelete, onEditCancel, onEditChange, onEditSave, onMove, onOpen, onPin, onRename, pinned = false, editing = false, editValue = "" }) {
     const [menuAnchor, setMenuAnchor] = useState(null);
-    const closeMenuTimer = useRef(null);
     const hasActionMenu = Boolean(onCreateChat || onMove || onPin || onRename || onDelete);
-    const clearMenuCloseTimer = () => {
-        if (closeMenuTimer.current !== null) {
-            window.clearTimeout(closeMenuTimer.current);
-            closeMenuTimer.current = null;
-        }
-    };
     const openActionMenu = (element) => {
-        clearMenuCloseTimer();
         const rect = element.getBoundingClientRect();
         setMenuAnchor({ top: rect.top, left: rect.right + 8 });
     };
-    const scheduleActionMenuClose = () => {
-        clearMenuCloseTimer();
-        closeMenuTimer.current = window.setTimeout(() => setMenuAnchor(null), 140);
+    const closeActionMenu = (relatedTarget) => {
+        if (relatedTarget instanceof Element && relatedTarget.closest(".nav-hover-menu"))
+            return;
+        setMenuAnchor(null);
     };
-    useEffect(() => () => clearMenuCloseTimer(), []);
     const actionMenu = !editing && hasActionMenu && menuAnchor && typeof document !== "undefined"
-        ? createPortal(_jsxs("div", { className: "nav-hover-menu", onMouseEnter: clearMenuCloseTimer, onMouseLeave: scheduleActionMenuClose, role: "menu", style: { left: menuAnchor.left, top: menuAnchor.top }, children: [_jsxs("button", { className: "nav-menu-action", onClick: onOpen, type: "button", children: [_jsx(Settings2, { size: 14 }), _jsx("span", { children: "\u0420\u0435\u0434\u0430\u043A\u0442\u0438\u0440\u043E\u0432\u0430\u0442\u044C" })] }), onCreateChat ? _jsxs("button", { className: "nav-menu-action", onClick: onCreateChat, type: "button", children: [_jsx(Plus, { size: 14 }), _jsx("span", { children: "\u041D\u043E\u0432\u044B\u0439 \u0447\u0430\u0442" })] }) : null, onMove ? _jsxs("button", { className: "nav-menu-action", onClick: onMove, type: "button", children: [_jsx(FolderInput, { size: 14 }), _jsx("span", { children: "\u041F\u0435\u0440\u0435\u043D\u0435\u0441\u0442\u0438 \u0432 \u043F\u0440\u043E\u0435\u043A\u0442" })] }) : null, onPin ? _jsxs("button", { className: "nav-menu-action", onClick: onPin, type: "button", children: [_jsx(Pin, { size: 14 }), _jsx("span", { children: pinned ? "Открепить" : "Закрепить" })] }) : null, onRename ? _jsxs("button", { className: "nav-menu-action", onClick: onRename, type: "button", children: [_jsx(Pencil, { size: 14 }), _jsx("span", { children: "\u041F\u0435\u0440\u0435\u0438\u043C\u0435\u043D\u043E\u0432\u0430\u0442\u044C" })] }) : null, onDelete ? _jsxs("button", { className: "nav-menu-action danger", onClick: onDelete, type: "button", children: [_jsx(Trash2, { size: 14 }), _jsx("span", { children: "\u0423\u0434\u0430\u043B\u0438\u0442\u044C" })] }) : null] }), document.body)
+        ? createPortal(_jsxs("div", { className: "nav-hover-menu", onMouseLeave: () => setMenuAnchor(null), role: "menu", style: { left: menuAnchor.left, top: menuAnchor.top }, children: [_jsxs("button", { className: "nav-menu-action", onClick: onOpen, type: "button", children: [_jsx(Settings2, { size: 14 }), _jsx("span", { children: "\u0420\u0435\u0434\u0430\u043A\u0442\u0438\u0440\u043E\u0432\u0430\u0442\u044C" })] }), onCreateChat ? _jsxs("button", { className: "nav-menu-action", onClick: onCreateChat, type: "button", children: [_jsx(Plus, { size: 14 }), _jsx("span", { children: "\u041D\u043E\u0432\u044B\u0439 \u0447\u0430\u0442" })] }) : null, onMove ? _jsxs("button", { className: "nav-menu-action", onClick: onMove, type: "button", children: [_jsx(FolderInput, { size: 14 }), _jsx("span", { children: "\u041F\u0435\u0440\u0435\u043D\u0435\u0441\u0442\u0438 \u0432 \u043F\u0440\u043E\u0435\u043A\u0442" })] }) : null, onPin ? _jsxs("button", { className: "nav-menu-action", onClick: onPin, type: "button", children: [_jsx(Pin, { size: 14 }), _jsx("span", { children: pinned ? "Открепить" : "Закрепить" })] }) : null, onRename ? _jsxs("button", { className: "nav-menu-action", onClick: onRename, type: "button", children: [_jsx(Pencil, { size: 14 }), _jsx("span", { children: "\u041F\u0435\u0440\u0435\u0438\u043C\u0435\u043D\u043E\u0432\u0430\u0442\u044C" })] }) : null, onDelete ? _jsxs("button", { className: "nav-menu-action danger", onClick: onDelete, type: "button", children: [_jsx(Trash2, { size: 14 }), _jsx("span", { children: "\u0423\u0434\u0430\u043B\u0438\u0442\u044C" })] }) : null] }), document.body)
         : null;
-    return (_jsxs("div", { className: "nav-row", onMouseEnter: (event) => hasActionMenu && openActionMenu(event.currentTarget), onMouseLeave: scheduleActionMenuClose, children: [editing ? (_jsxs("div", { className: `nav-item nav-item-edit ${chat ? "chat-nav-item" : ""} ${active ? "active" : ""}`, children: [icon, _jsx("input", { "aria-label": "\u041D\u043E\u0432\u043E\u0435 \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u0435", autoFocus: true, onChange: (event) => onEditChange?.(event.target.value), onKeyDown: (event) => {
+    return (_jsxs("div", { className: "nav-row", onMouseEnter: (event) => hasActionMenu && openActionMenu(event.currentTarget), onMouseLeave: (event) => closeActionMenu(event.relatedTarget), children: [editing ? (_jsxs("div", { className: `nav-item nav-item-edit ${chat ? "chat-nav-item" : ""} ${active ? "active" : ""}`, children: [icon, _jsx("input", { "aria-label": "\u041D\u043E\u0432\u043E\u0435 \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u0435", autoFocus: true, onChange: (event) => onEditChange?.(event.target.value), onKeyDown: (event) => {
                             if (event.key === "Enter")
                                 onEditSave?.();
                             if (event.key === "Escape")

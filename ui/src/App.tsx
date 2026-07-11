@@ -1061,35 +1061,23 @@ function NavigationItem({
   editValue?: string;
 }) {
   const [menuAnchor, setMenuAnchor] = useState<{ top: number; left: number } | null>(null);
-  const closeMenuTimer = useRef<number | null>(null);
   const hasActionMenu = Boolean(onCreateChat || onMove || onPin || onRename || onDelete);
 
-  const clearMenuCloseTimer = () => {
-    if (closeMenuTimer.current !== null) {
-      window.clearTimeout(closeMenuTimer.current);
-      closeMenuTimer.current = null;
-    }
-  };
-
   const openActionMenu = (element: HTMLDivElement) => {
-    clearMenuCloseTimer();
     const rect = element.getBoundingClientRect();
     setMenuAnchor({ top: rect.top, left: rect.right + 8 });
   };
 
-  const scheduleActionMenuClose = () => {
-    clearMenuCloseTimer();
-    closeMenuTimer.current = window.setTimeout(() => setMenuAnchor(null), 140);
+  const closeActionMenu = (relatedTarget: EventTarget | null) => {
+    if (relatedTarget instanceof Element && relatedTarget.closest(".nav-hover-menu")) return;
+    setMenuAnchor(null);
   };
-
-  useEffect(() => () => clearMenuCloseTimer(), []);
 
   const actionMenu = !editing && hasActionMenu && menuAnchor && typeof document !== "undefined"
     ? createPortal(
       <div
         className="nav-hover-menu"
-        onMouseEnter={clearMenuCloseTimer}
-        onMouseLeave={scheduleActionMenuClose}
+        onMouseLeave={() => setMenuAnchor(null)}
         role="menu"
         style={{ left: menuAnchor.left, top: menuAnchor.top }}
       >
@@ -1108,7 +1096,7 @@ function NavigationItem({
     <div
       className="nav-row"
       onMouseEnter={(event) => hasActionMenu && openActionMenu(event.currentTarget)}
-      onMouseLeave={scheduleActionMenuClose}
+      onMouseLeave={(event) => closeActionMenu(event.relatedTarget)}
     >
       {editing ? (
         <div className={`nav-item nav-item-edit ${chat ? "chat-nav-item" : ""} ${active ? "active" : ""}`}>

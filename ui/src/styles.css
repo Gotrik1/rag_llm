@@ -242,11 +242,11 @@ textarea {
   display: grid;
   gap: 3px;
   width: 210px;
-  border: 1px solid #4b4b4b;
+  border: 1px solid #898995;
   border-radius: 10px;
-  background: #252525;
+  background: #898995;
   padding: 6px;
-  box-shadow: 0 12px 28px rgba(20, 20, 20, 0.28);
+  box-shadow: 0 12px 28px rgba(47, 47, 55, 0.24);
 }
 
 .nav-menu-action {
@@ -267,7 +267,7 @@ textarea {
 }
 
 .nav-menu-action:hover {
-  background: #383838;
+  background: #72727f;
 }
 
 .nav-menu-action.danger {
@@ -1445,8 +1445,8 @@ sub {
 
 .theme-portal .nav-row:hover > .nav-item,
 .theme-portal .nav-item:hover {
-  border-color: #383838;
-  background: #383838;
+  border-color: #898995;
+  background: #898995;
   box-shadow: none;
   color: #ffffff;
 }
@@ -1459,14 +1459,14 @@ sub {
 }
 
 .theme-portal .nav-item.active {
-  border-color: #383838;
-  background: #383838;
+  border-color: #898995;
+  background: #898995;
   box-shadow: none;
   color: #ffffff;
 }
 
 .theme-portal .nav-item.active:hover {
-  background: #383838;
+  background: #898995;
   box-shadow: none;
   color: #ffffff;
 }

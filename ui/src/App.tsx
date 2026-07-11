@@ -25,6 +25,8 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Paintbrush,
+  Pin,
+  Plus,
   RefreshCw,
   Save,
   Send,
@@ -34,7 +36,8 @@ import {
   MessageSquare,
   TestTube2,
   UploadCloud,
-  User
+  User,
+  X
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -47,42 +50,6 @@ type ChatEntry = {
   html?: string;
   modelLabel?: string;
   status?: "running" | "complete" | "error";
-};
-
-type WorkspaceState = {
-  id: string;
-  active_project_id?: string | null;
-  active_chat_id?: string | null;
-  settings?: Record<string, unknown>;
-};
-
-type ProjectRecord = {
-  id: string;
-  name: string;
-  description: string;
-  settings?: Record<string, unknown>;
-  memory?: Record<string, unknown>;
-  chats?: ChatRecord[];
-};
-
-type ChatRecord = {
-  id: string;
-  project_id: string;
-  title: string;
-  mode: FlowMode;
-  provider: ProviderName;
-  model_name: string;
-  metadata?: Record<string, unknown>;
-};
-
-type MessageRecord = {
-  id: string;
-  chat_id: string;
-  role: Role;
-  content: string;
-  content_html?: string;
-  status?: string;
-  metadata?: Record<string, unknown>;
 };
 
 type ApiSource = {
@@ -181,10 +148,34 @@ type FlowMode = "python" | "rust" | "hybrid";
 type PanelTab = "system" | "evidence" | "sources" | "debug";
 type AppTheme = "default" | "portal";
 
+type Project = {
+  id: string;
+  name: string;
+  memory: string;
+};
+
+type ChatSummary = {
+  id: string;
+  projectId: string;
+  title: string;
+  updatedAt: number;
+  messages: ChatEntry[];
+};
+
+const DEFAULT_PROJECT: Project = {
+  id: "regulations",
+  name: "Регламенты",
+  memory: "Точный поиск по пунктам регламентов. Формулы и источники показывать явно."
+};
+
+const PROJECTS_KEY = "rag-assistant-projects";
+const CHATS_KEY = "rag-assistant-chats";
+const THEME_KEY = "rag-assistant-theme";
+const SIDEBAR_COLLAPSED_KEY = "rag-assistant-sidebar-collapsed";
+
 const ASK_TIMEOUT_MS = 180_000;
 const DEBUG_TIMEOUT_MS = 60_000;
 const UPLOAD_TIMEOUT_MS = 300_000;
-const API_TIMEOUT_MS = 60_000;
 
 declare global {
   interface Window {
@@ -201,6 +192,15 @@ declare global {
 }
 
 const createId = () => crypto.randomUUID();
+
+function readStored<T>(key: string, fallback: T): T {
+  try {
+    const value = window.localStorage.getItem(key);
+    return value ? (JSON.parse(value) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 async function postJson<T>(path: string, body: unknown, timeoutMs: number): Promise<T> {
   const controller = new AbortController();
@@ -251,26 +251,6 @@ async function postFormData<T>(path: string, body: FormData, timeoutMs: number):
   } finally {
     window.clearTimeout(timeoutId);
   }
-}
-
-async function fetchJson<T>(path: string): Promise<T> {
-  const response = await fetch(path, { cache: "no-store" });
-  const data = (await response.json()) as T & { error?: string };
-  if (!response.ok) {
-    throw new Error(data.error || response.statusText);
-  }
-  return data;
-}
-
-async function patchJson<T>(path: string, body: unknown): Promise<T> {
-  const response = await fetch(path, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
-  const data = (await response.json()) as T & { error?: string };
-  if (!response.ok) throw new Error(data.error || response.statusText);
-  return data;
 }
 
 const extractText = (message: AppendMessage) => {
@@ -358,8 +338,10 @@ export function App() {
   const [debugError, setDebugError] = useState("");
   const [isDebugging, setIsDebugging] = useState(false);
   const [activeTab, setActiveTab] = useState<PanelTab>("system");
-  const [theme, setTheme] = useState<AppTheme>("portal");
-  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [projects, setProjects] = useState<Project[]>(() => readStored(PROJECTS_KEY, [DEFAULT_PROJECT]));
+  const [activeProjectId, setActiveProjectId] = useState(DEFAULT_PROJECT.id);
+  const [chats, setChats] = useState<ChatSummary[]>(() => readStored(CHATS_KEY, []));
+  const [activeChatId, setActiveChatId] = useState<string>(() => createId());
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [uploadResult, setUploadResult] = useState<UploadResponse | null>(null);
   const [uploadError, setUploadError] = useState("");
@@ -370,98 +352,50 @@ export function App() {
   const [isLoadingModels, setIsLoadingModels] = useState(true);
   const [isChangingModel, setIsChangingModel] = useState(false);
   const [activeProvider, setActiveProvider] = useState<ProviderName>("ollama");
-  const [workspace, setWorkspace] = useState<WorkspaceState | null>(null);
-  const [projects, setProjects] = useState<ProjectRecord[]>([]);
-  const [activeProjectId, setActiveProjectId] = useState("");
-  const [activeChatId, setActiveChatId] = useState("");
-  const [workspaceError, setWorkspaceError] = useState("");
-  const [isWorkspaceLoading, setIsWorkspaceLoading] = useState(true);
+  const [theme, setTheme] = useState<AppTheme>(() => window.localStorage.getItem(THEME_KEY) === "portal" ? "portal" : "default");
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => readStored(SIDEBAR_COLLAPSED_KEY, false));
 
-  const activeProject = projects.find((project) => project.id === activeProjectId) ?? projects[0] ?? null;
-  const activeChats = activeProject?.chats ?? [];
-  const activeChat = activeChats.find((chat) => chat.id === activeChatId) ?? activeChats[0] ?? null;
-
-  const loadWorkspace = useCallback(async () => {
-    setIsWorkspaceLoading(true);
-    setWorkspaceError("");
-    try {
-      const [workspaceData, projectData] = await Promise.all([
-        fetchJson<WorkspaceState>("/api/workspace"),
-        fetchJson<{ items: ProjectRecord[] }>("/api/projects")
-      ]);
-      setWorkspace(workspaceData);
-      setProjects(projectData.items);
-      const nextProjectId = workspaceData.active_project_id || projectData.items[0]?.id || "";
-      const nextProject = projectData.items.find((item) => item.id === nextProjectId) ?? projectData.items[0];
-      const nextChatId = workspaceData.active_chat_id || nextProject?.chats?.[0]?.id || "";
-      setActiveProjectId(nextProject?.id || "");
-      setActiveChatId(nextChatId);
-    } catch (error) {
-      setWorkspaceError(error instanceof Error ? error.message : "Не удалось загрузить workspace");
-    } finally {
-      setIsWorkspaceLoading(false);
-    }
-  }, []);
-
-  const refreshChats = useCallback(async (projectId?: string) => {
-    const targetProjectId = projectId || activeProjectId;
-    if (!targetProjectId) return;
-    const data = await fetchJson<{ items: ChatRecord[] }>(`/api/projects/${targetProjectId}/chats`);
-    setProjects((current) =>
-      current.map((project) => (project.id === targetProjectId ? { ...project, chats: data.items } : project))
-    );
-  }, [activeProjectId]);
-
-  const loadMessages = useCallback(async (chatId?: string) => {
-    const targetChatId = chatId || activeChatId;
-    if (!targetChatId) return;
-    const data = await fetchJson<{ items: MessageRecord[] }>(`/api/chats/${targetChatId}/messages`);
-    setMessages(
-      data.items.map((item) => ({
-        id: item.id,
-        role: item.role,
-        text: item.content,
-        html: item.content_html || undefined,
-        status: item.role === "assistant" ? (item.status === "running" ? "running" : item.status === "error" ? "error" : "complete") : "complete",
-        modelLabel: item.metadata?.model_label ? String(item.metadata.model_label) : undefined
-      }))
-    );
-  }, [activeChatId]);
-
-  const syncWorkspace = useCallback(async (nextProjectId: string, nextChatId: string) => {
-    const updated = await postJson<WorkspaceState>("/api/settings", {
-      active_project_id: nextProjectId,
-      active_chat_id: nextChatId,
-      settings: workspace?.settings ?? {}
-    }, API_TIMEOUT_MS);
-    setWorkspace(updated);
-  }, [workspace?.settings]);
-
-  const persistMessage = useCallback(async (chatId: string, payload: {
-    role: Role;
-    content: string;
-    content_html?: string;
-    status?: string;
-    metadata?: Record<string, unknown>;
-  }) => {
-    await postJson<MessageRecord>(`/api/chats/${chatId}/messages`, payload, API_TIMEOUT_MS);
-  }, []);
+  const activeProject = projects.find((project) => project.id === activeProjectId) ?? DEFAULT_PROJECT;
 
   useEffect(() => {
-    if (!activeChatId) return;
-    void loadMessages(activeChatId);
-  }, [activeChatId, loadMessages]);
+    window.localStorage.setItem(PROJECTS_KEY, JSON.stringify(projects));
+  }, [projects]);
 
   useEffect(() => {
-    if (!activeProjectId) return;
-    void refreshChats(activeProjectId);
-  }, [activeProjectId, refreshChats]);
+    window.localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
+
+  useEffect(() => {
+    window.localStorage.setItem(SIDEBAR_COLLAPSED_KEY, JSON.stringify(isSidebarCollapsed));
+  }, [isSidebarCollapsed]);
+
+  useEffect(() => {
+    if (!messages.length) return;
+    setChats((current) => {
+      const existing = current.find((chat) => chat.id === activeChatId);
+      const firstQuestion = messages.find((message) => message.role === "user")?.text;
+      const nextChat: ChatSummary = {
+        id: activeChatId,
+        projectId: activeProjectId,
+        title: existing?.title && existing.title !== "Новый диалог"
+          ? existing.title
+          : (firstQuestion?.slice(0, 48) || "Новый диалог"),
+        updatedAt: Date.now(),
+        messages
+      };
+      const next = [nextChat, ...current.filter((chat) => chat.id !== activeChatId)].slice(0, 30);
+      window.localStorage.setItem(CHATS_KEY, JSON.stringify(next));
+      return next;
+    });
+  }, [activeChatId, activeProjectId, messages]);
 
   const loadModels = useCallback(async () => {
     setIsLoadingModels(true);
     setModelError("");
     try {
-      const data = await fetchJson<ModelsResponse>("/api/models");
+      const response = await fetch("/api/models", { cache: "no-store" });
+      const data = (await response.json()) as ModelsResponse & { error?: string };
+      if (!response.ok) throw new Error(data.error || response.statusText);
       setModels(data.models);
       setSelectedModel(data.selected);
     } catch (error) {
@@ -473,8 +407,7 @@ export function App() {
 
   useEffect(() => {
     void loadModels();
-    void loadWorkspace();
-  }, [loadModels, loadWorkspace]);
+  }, [loadModels]);
 
   const changeModel = useCallback(async (model: string) => {
     if (!model || model === selectedModel || isChangingModel || isRunning) return;
@@ -490,58 +423,9 @@ export function App() {
     }
   }, [isChangingModel, isRunning, selectedModel]);
 
-  const switchProject = useCallback(async (projectId: string) => {
-    const project = projects.find((item) => item.id === projectId);
-    if (!project) return;
-    const chatId = project.chats?.[0]?.id || "";
-    setActiveProjectId(projectId);
-    setActiveChatId(chatId);
-    await syncWorkspace(projectId, chatId);
-    if (chatId) {
-      await loadMessages(chatId);
-    } else {
-      setMessages([]);
-    }
-  }, [loadMessages, projects, syncWorkspace]);
-
-  const switchChat = useCallback(async (chatId: string) => {
-    if (!chatId) return;
-    setActiveChatId(chatId);
-    await syncWorkspace(activeProjectId, chatId);
-    await loadMessages(chatId);
-  }, [activeProjectId, loadMessages, syncWorkspace]);
-
-  const createProjectRecord = useCallback(async () => {
-    const created = await postJson<ProjectRecord>("/api/projects", { name: "Новый проект" }, API_TIMEOUT_MS);
-    const refreshed = await fetchJson<{ items: ProjectRecord[] }>("/api/projects");
-    setProjects(refreshed.items);
-    setActiveProjectId(created.id);
-    const chat = await postJson<ChatRecord>(`/api/projects/${created.id}/chats`, { title: "Новый чат" }, API_TIMEOUT_MS);
-    await refreshChats(created.id);
-    setActiveChatId(chat.id);
-    await syncWorkspace(created.id, chat.id);
-    setMessages([]);
-  }, [refreshChats, syncWorkspace]);
-
-  const createChatRecord = useCallback(async () => {
-    if (!activeProjectId) return;
-    const chat = await postJson<ChatRecord>(`/api/projects/${activeProjectId}/chats`, { title: "Новый чат" }, API_TIMEOUT_MS);
-    await refreshChats(activeProjectId);
-    setActiveChatId(chat.id);
-    await syncWorkspace(activeProjectId, chat.id);
-    setMessages([]);
-  }, [activeProjectId, refreshChats, syncWorkspace]);
-
-  const updateProjectMemory = useCallback(async (memory: string) => {
-    if (!activeProject) return;
-    const updated = await patchJson<ProjectRecord>(`/api/projects/${activeProject.id}`, { memory: { text: memory } });
-    setProjects((current) => current.map((project) => project.id === updated.id ? { ...project, ...updated } : project));
-  }, [activeProject]);
-
   const onNew = useCallback(async (message: AppendMessage) => {
     const question = extractText(message);
     if (!question) return;
-    if (!activeChatId) return;
 
     const userMessage: ChatEntry = {
       id: createId(),
@@ -563,18 +447,10 @@ export function App() {
     setLastQuestion(question);
     setDebugResult(null);
     setDebugError("");
-    setActiveTab("evidence");
+    setActiveTab("system");
 
     try {
-      await persistMessage(activeChatId, { role: "user", content: question });
       const data = await postJson<AskResponse>("/api/ask", { question }, ASK_TIMEOUT_MS);
-      await persistMessage(activeChatId, {
-        role: "assistant",
-        content: data.answer || "Пустой ответ.",
-        content_html: data.html_answer || "",
-        status: "complete",
-        metadata: { llm: data.llm, sources: data.sources, usage: data.usage }
-      });
 
       setLastResult(data);
       setMessages((current) =>
@@ -592,7 +468,6 @@ export function App() {
       );
     } catch (error) {
       const text = error instanceof Error ? error.message : "Ошибка запроса";
-      void persistMessage(activeChatId, { role: "assistant", content: text, status: "error" });
       setMessages((current) =>
         current.map((item) =>
           item.id === assistantId
@@ -607,7 +482,7 @@ export function App() {
     } finally {
       setIsRunning(false);
     }
-  }, [activeChatId, persistMessage]);
+  }, []);
 
   const adapter = useMemo<ExternalStoreAdapter<ChatEntry>>(
     () => ({
@@ -622,13 +497,34 @@ export function App() {
 
   const runtime = useExternalStoreRuntime(adapter);
 
-  const clearThread = async () => {
-    await createChatRecord();
+  const clearThread = () => {
+    setActiveChatId(createId());
     setMessages([]);
     setLastResult(null);
     setLastQuestion("");
     setDebugResult(null);
     setDebugError("");
+    setActiveTab("system");
+  };
+
+  const openChat = (chat: ChatSummary) => {
+    setActiveChatId(chat.id);
+    setActiveProjectId(chat.projectId);
+    setMessages(chat.messages);
+    setLastResult(null);
+    setLastQuestion(chat.messages.filter((message) => message.role === "user").slice(-1)[0]?.text ?? "");
+    setDebugResult(null);
+    setDebugError("");
+    setActiveTab("system");
+  };
+
+  const createProject = () => {
+    const name = window.prompt("Название проекта", "Новый проект")?.trim();
+    if (!name) return;
+    const project = { id: createId(), name, memory: "Память проекта пока пуста." };
+    setProjects((current) => [...current, project]);
+    setActiveProjectId(project.id);
+    clearThread();
   };
 
   const runDebug = useCallback(async () => {
@@ -673,24 +569,27 @@ export function App() {
         <aside className="sidebar">
           <div className="sidebar-topbar">
             <div className="sidebar-title">AI ИАС Энергобаланс</div>
-            <button className="sidebar-collapse" onClick={() => setIsSidebarCollapsed((value) => !value)} type="button">
+            <button
+              className="sidebar-collapse"
+              onClick={() => setIsSidebarCollapsed((value) => !value)}
+              title={isSidebarCollapsed ? "Развернуть левый сайдбар" : "Свернуть левый сайдбар"}
+              type="button"
+            >
               {isSidebarCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
             </button>
           </div>
-          <button className="new-thread" onClick={() => void clearThread()} type="button">
-            <Sparkles size={16} /> <span>Новый диалог</span>
+          <button className="new-thread" onClick={clearThread} type="button">
+            <span className="new-thread-icon"><Plus size={16} /></span>
+            <span>Новый диалог</span>
           </button>
           <NavigationSidebar
-            activeChatId={activeChatId}
             activeProjectId={activeProjectId}
-            chats={activeChats}
-            isLoading={isWorkspaceLoading}
+            chats={chats}
             projects={projects}
-            onChatChange={(chatId) => void switchChat(chatId)}
-            onProjectChange={(projectId) => void switchProject(projectId)}
-            onProjectCreate={() => void createProjectRecord()}
+            onChatChange={openChat}
+            onProjectChange={(projectId) => { setActiveProjectId(projectId); clearThread(); }}
+            onProjectCreate={createProject}
           />
-          {workspaceError ? <div className="sidebar-note">{workspaceError}</div> : null}
         </aside>
 
         <section className="chat-surface">
@@ -701,27 +600,27 @@ export function App() {
           activeTab={activeTab}
           activeProject={activeProject}
           activeProvider={activeProvider}
+          theme={theme}
           debugError={debugError}
           debugResult={debugResult}
           isDebugging={isDebugging}
+          isChangingModel={isChangingModel}
+          isLoadingModels={isLoadingModels}
           isRunning={isRunning}
           lastQuestion={lastQuestion}
+          modelError={modelError}
+          models={models}
           result={lastResult}
+          selectedModel={selectedModel}
+          onChangeModel={changeModel}
           onDebug={runDebug}
+          error={uploadError}
+          isUploading={isUploading}
+          onProviderSettingsChange={setActiveProvider}
+          onProjectMemoryChange={(memory) => setProjects((current) => current.map((project) => project.id === activeProject.id ? { ...project, memory } : project))}
+          onRefreshModels={loadModels}
           onTabChange={setActiveTab}
           onThemeChange={setTheme}
-          onProjectMemoryChange={updateProjectMemory}
-          theme={theme}
-          models={models}
-          selectedModel={selectedModel}
-          modelError={modelError}
-          isLoadingModels={isLoadingModels}
-          isChangingModel={isChangingModel}
-          onChangeModel={changeModel}
-          onRefreshModels={loadModels}
-          onProviderSettingsChange={setActiveProvider}
-          uploadError={uploadError}
-          isUploading={isUploading}
           selectedFiles={selectedFiles}
           uploadResult={uploadResult}
           onFilesChange={setSelectedFiles}
@@ -729,6 +628,87 @@ export function App() {
         />
       </main>
     </AssistantRuntimeProvider>
+  );
+}
+
+function NavigationSidebar({
+  activeProjectId,
+  chats,
+  projects,
+  onChatChange,
+  onProjectChange,
+  onProjectCreate
+}: {
+  activeProjectId: string;
+  chats: ChatSummary[];
+  projects: Project[];
+  onChatChange: (chat: ChatSummary) => void;
+  onProjectChange: (projectId: string) => void;
+  onProjectCreate: () => void;
+}) {
+  const [showAllProjects, setShowAllProjects] = useState(false);
+  const visibleProjects = showAllProjects ? projects : projects.slice(0, 5);
+  const pinnedProjects = projects.slice(0, 2);
+
+  return (
+    <nav className="navigation-sidebar" aria-label="Проекты и чаты">
+      <section className="nav-section">
+        <div className="nav-section-title">Закреплённые</div>
+        <div className="project-list pinned-list">
+          {pinnedProjects.map((project) => (
+            <button
+              className={`nav-item ${project.id === activeProjectId ? "active" : ""}`}
+              key={project.id}
+              onClick={() => onProjectChange(project.id)}
+              type="button"
+            >
+              <Folder size={17} />
+              <span>{project.name}</span>
+              <span className="nav-pin" title="Закрепить"><Pin size={15} /></span>
+            </button>
+          ))}
+        </div>
+      </section>
+
+      <section className="nav-section">
+        <div className="nav-section-header">
+          <div className="nav-section-title">Проекты</div>
+          <button className="nav-add-project" onClick={onProjectCreate} title="Новый проект" type="button"><Plus size={15} /></button>
+        </div>
+        <div className="project-list">
+          {visibleProjects.map((project) => (
+            <button
+              className={`nav-item ${project.id === activeProjectId ? "active" : ""}`}
+              key={project.id}
+              onClick={() => onProjectChange(project.id)}
+              type="button"
+            >
+              <Folder size={17} />
+              <span>{project.name}</span>
+              <span className="nav-pin" title="Закрепить"><Pin size={15} /></span>
+            </button>
+          ))}
+        </div>
+        {projects.length > 5 ? (
+          <button className="show-more" onClick={() => setShowAllProjects((value) => !value)} type="button">
+            {showAllProjects ? "Скрыть" : "Показать еще"}
+          </button>
+        ) : null}
+      </section>
+
+      <section className="nav-section chats-section">
+        <div className="nav-section-title">Чаты</div>
+        <div className="sidebar-chat-list">
+          {chats.length ? chats.map((chat) => (
+            <button className="nav-item chat-nav-item" key={chat.id} onClick={() => onChatChange(chat)} type="button">
+              <MessageSquare size={16} />
+              <span>{chat.title}</span>
+              <span className="nav-pin" title="Закрепить"><Pin size={15} /></span>
+            </button>
+          )) : <div className="sidebar-empty">История появится после первого вопроса.</div>}
+        </div>
+      </section>
+    </nav>
   );
 }
 
@@ -1123,76 +1103,30 @@ function Composer() {
   );
 }
 
-function NavigationSidebar({
-  activeChatId,
-  activeProjectId,
-  chats,
-  isLoading,
-  projects,
-  onChatChange,
-  onProjectChange,
-  onProjectCreate
-}: {
-  activeChatId: string;
-  activeProjectId: string;
-  chats: ChatRecord[];
-  isLoading: boolean;
-  projects: ProjectRecord[];
-  onChatChange: (chatId: string) => void;
-  onProjectChange: (projectId: string) => void;
-  onProjectCreate: () => void;
-}) {
-  return (
-    <nav className="navigation-sidebar" aria-label="Проекты и чаты">
-      <div className="nav-section-header">
-        <div className="nav-section-title">Проекты</div>
-        <button className="nav-add-project" onClick={onProjectCreate} title="Новый проект" type="button"><Sparkles size={15} /></button>
-      </div>
-      <div className="project-list">
-        {projects.map((project) => (
-          <button className={`nav-item ${project.id === activeProjectId ? "active" : ""}`} key={project.id} onClick={() => onProjectChange(project.id)} type="button">
-            <Folder size={16} /><span>{project.name}</span>
-          </button>
-        ))}
-      </div>
-      <div className="nav-section chats-section">
-        <div className="nav-section-title">Чаты</div>
-        <div className="sidebar-chat-list">
-          {isLoading ? <div className="sidebar-empty">Загрузка...</div> : chats.length ? chats.map((chat) => (
-            <button className={`nav-item chat-nav-item ${chat.id === activeChatId ? "active" : ""}`} key={chat.id} onClick={() => onChatChange(chat.id)} type="button">
-              <MessageSquare size={15} /><span>{chat.title}</span>
-            </button>
-          )) : <div className="sidebar-empty">Создайте первый диалог.</div>}
-        </div>
-      </div>
-    </nav>
-  );
-}
-
 function EvidencePanel({
   activeTab,
   activeProject,
   activeProvider,
+  theme,
   debugError,
   debugResult,
   isDebugging,
+  isChangingModel,
+  isLoadingModels,
   isRunning,
   lastQuestion,
+  modelError,
+  models,
   result,
+  selectedModel,
+  onChangeModel,
   onDebug,
+  onProviderSettingsChange,
+  onProjectMemoryChange,
+  onRefreshModels,
   onTabChange,
   onThemeChange,
-  onProjectMemoryChange,
-  theme,
-  models,
-  selectedModel,
-  modelError,
-  isLoadingModels,
-  isChangingModel,
-  onChangeModel,
-  onRefreshModels,
-  onProviderSettingsChange,
-  uploadError,
+  error,
   isUploading,
   selectedFiles,
   uploadResult,
@@ -1200,43 +1134,57 @@ function EvidencePanel({
   onUpload
 }: {
   activeTab: PanelTab;
-  activeProject: ProjectRecord | null;
+  activeProject: Project;
   activeProvider: ProviderName;
+  theme: AppTheme;
   debugError: string;
   debugResult: DebugResponse | null;
   isDebugging: boolean;
+  isChangingModel: boolean;
+  isLoadingModels: boolean;
   isRunning: boolean;
   lastQuestion: string;
+  modelError: string;
+  models: string[];
   result: AskResponse | null;
+  selectedModel: string;
+  onChangeModel: (model: string) => void;
   onDebug: () => void;
+  onProviderSettingsChange: (provider: ProviderName) => void;
+  onProjectMemoryChange: (memory: string) => void;
+  onRefreshModels: () => void;
   onTabChange: (tab: PanelTab) => void;
   onThemeChange: (theme: AppTheme) => void;
-  onProjectMemoryChange: (memory: string) => void;
-  theme: AppTheme;
-  models: string[];
-  selectedModel: string;
-  modelError: string;
-  isLoadingModels: boolean;
-  isChangingModel: boolean;
-  onChangeModel: (model: string) => void;
-  onRefreshModels: () => void;
-  onProviderSettingsChange: (provider: ProviderName) => void;
-  uploadError: string;
+  error: string;
   isUploading: boolean;
   selectedFiles: File[];
   uploadResult: UploadResponse | null;
   onFilesChange: (files: File[]) => void;
   onUpload: () => void;
 }) {
+  const [isThemeModalOpen, setIsThemeModalOpen] = useState(false);
+
   return (
     <aside className="evidence-panel">
-      <div className="panel-heading">
-        <PanelRight size={17} />
-        <span>Техническая панель</span>
+      <div className="workspace-heading">
+        <div className="panel-heading">
+          <PanelRight size={17} />
+          <span>Техническая панель</span>
+        </div>
+        <button className="icon-button panel-settings" onClick={() => setIsThemeModalOpen(true)} title="Настройки рабочей области" type="button">
+          <Settings2 size={16} />
+        </button>
       </div>
 
       <div className="panel-tabs" role="tablist" aria-label="Evidence panels">
-        <button className={activeTab === "system" ? "active" : ""} onClick={() => onTabChange("system")} type="button"><Settings2 size={14} />Система</button>
+        <button
+          className={activeTab === "system" ? "active" : ""}
+          onClick={() => onTabChange("system")}
+          type="button"
+        >
+          <Settings2 size={14} />
+          Система
+        </button>
         <button
           className={activeTab === "evidence" ? "active" : ""}
           onClick={() => onTabChange("evidence")}
@@ -1265,17 +1213,41 @@ function EvidencePanel({
 
       {activeTab === "system" ? (
         <div className="system-panel">
-          <div className="system-intro"><div className="system-kicker">Рабочие настройки</div><h2>Система</h2><p>Настройки применяются к следующим запросам.</p></div>
+          <div className="system-intro">
+            <div className="system-kicker">Рабочие настройки</div>
+            <h2>Система</h2>
+            <p>Параметры ниже применяются к следующим запросам.</p>
+          </div>
           <section className="project-memory-panel">
-            <div className="project-memory-heading"><Folder size={14} />{activeProject?.name ?? "Проект"}</div>
-            <label>Память проекта<textarea value={String(activeProject?.memory?.text ?? "")} onChange={(event) => onProjectMemoryChange(event.target.value)} /></label>
+            <div className="project-memory-heading"><Folder size={14} /><span>{activeProject.name}</span></div>
+            <label>
+              <span>Память проекта</span>
+              <textarea value={activeProject.memory} onChange={(event) => onProjectMemoryChange(event.target.value)} />
+            </label>
           </section>
-          <section className="theme-selector"><div className="theme-selector-title"><Paintbrush size={14} />Внешний вид</div><select value={theme} onChange={(event) => onThemeChange(event.target.value as AppTheme)}><option value="portal">Корпоративный портал</option><option value="default">Базовая тема</option></select></section>
           <ProviderSettings models={models} onProviderChange={onProviderSettingsChange} />
           <FlowModeSelector isRunning={isRunning} />
           <SystemPromptSelector isRunning={isRunning} />
-          {activeProvider === "ollama" ? <ModelSelector error={modelError} isChanging={isChangingModel} isLoading={isLoadingModels} isRunning={isRunning} models={models} selectedModel={selectedModel} onChange={onChangeModel} onRefresh={onRefreshModels} /> : null}
-          <KnowledgeLoader error={uploadError} isUploading={isUploading} result={uploadResult} selectedFiles={selectedFiles} onFilesChange={onFilesChange} onUpload={onUpload} />
+          {activeProvider === "ollama" ? (
+            <ModelSelector
+              error={modelError}
+              isChanging={isChangingModel}
+              isLoading={isLoadingModels}
+              isRunning={isRunning}
+              models={models}
+              selectedModel={selectedModel}
+              onChange={onChangeModel}
+              onRefresh={onRefreshModels}
+            />
+          ) : null}
+          <KnowledgeLoader
+            error={error}
+            isUploading={isUploading}
+            result={uploadResult}
+            selectedFiles={selectedFiles}
+            onFilesChange={onFilesChange}
+            onUpload={onUpload}
+          />
         </div>
       ) : !result ? (
         <div className="panel-empty">Здесь появятся источники последнего ответа.</div>
@@ -1293,7 +1265,37 @@ function EvidencePanel({
           onDebug={onDebug}
         />
       )}
+
+      {isThemeModalOpen ? (
+        <div className="theme-modal-backdrop" role="presentation" onMouseDown={() => setIsThemeModalOpen(false)}>
+          <section className="theme-modal" role="dialog" aria-modal="true" aria-labelledby="theme-modal-title" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="theme-modal-heading">
+              <div>
+                <div className="system-kicker">Настройки интерфейса</div>
+                <h2 id="theme-modal-title">Тема</h2>
+              </div>
+              <button className="icon-button" onClick={() => setIsThemeModalOpen(false)} title="Закрыть" type="button"><X size={17} /></button>
+            </div>
+            <ThemeSelector theme={theme} onChange={onThemeChange} />
+          </section>
+        </div>
+      ) : null}
     </aside>
+  );
+}
+
+function ThemeSelector({ theme, onChange }: { theme: AppTheme; onChange: (theme: AppTheme) => void }) {
+  return (
+    <section className="theme-selector" aria-label="Тема интерфейса">
+      <div className="theme-selector-title"><Paintbrush size={14} /> Тема интерфейса</div>
+      <select value={theme} onChange={(event) => onChange(event.target.value as AppTheme)}>
+        <option value="default">Базовая</option>
+        <option value="portal">Корпоративная</option>
+      </select>
+      <div className="theme-selector-description">
+        {theme === "portal" ? "Контрастная палитра для встраивания в корпоративный портал." : "Нейтральная тема RAG Assistant."}
+      </div>
+    </section>
   );
 }
 

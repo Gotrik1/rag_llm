@@ -1421,10 +1421,12 @@ sub {
   color: #1c1c1c;
 }
 
-.theme-portal .new-thread:hover {
-  border-color: transparent;
+.theme-portal .new-thread:hover,
+.theme-portal .new-thread:focus-visible {
+  border-color: #898995;
   background: #898995;
   color: #ffffff;
+  outline: 0;
 }
 
 .theme-portal .sidebar-title {

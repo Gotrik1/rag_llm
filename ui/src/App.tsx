@@ -35,7 +35,6 @@ import {
   Settings2,
   Sigma,
   Sparkles,
-  MessageSquare,
   TestTube2,
   UploadCloud,
   User,
@@ -504,10 +503,9 @@ export function App() {
     }
   }, [activeProjectId, projects]);
 
-  const renameProject = useCallback(async (projectId: string) => {
+  const renameProject = useCallback(async (projectId: string, name: string) => {
     const project = projects.find((item) => item.id === projectId);
     if (!project) return;
-    const name = window.prompt("Название проекта", project.name)?.trim();
     if (!name || name === project.name) return;
     try {
       const record = await patchJson<ProjectRecord>(`/api/projects/${projectId}`, { name }, API_TIMEOUT_MS);
@@ -517,10 +515,9 @@ export function App() {
     }
   }, [projects]);
 
-  const renameChat = useCallback(async (chatId: string) => {
+  const renameChat = useCallback(async (chatId: string, title: string) => {
     const chat = chats.find((item) => item.id === chatId);
     if (!chat) return;
-    const title = window.prompt("Название чата", chat.title)?.trim();
     if (!title || title === chat.title) return;
     try {
       const record = await patchJson<ChatRecord>(`/api/chats/${chatId}`, { title }, API_TIMEOUT_MS);
@@ -530,9 +527,9 @@ export function App() {
     }
   }, [chats]);
 
-  const moveChat = useCallback(async (chatId: string, projectId: string) => {
+  const moveChat = useCallback(async (chatId: string, projectId: string): Promise<boolean> => {
     const chat = chats.find((item) => item.id === chatId);
-    if (!chat || chat.projectId === projectId) return;
+    if (!chat || chat.projectId === projectId) return false;
     try {
       const record = await patchJson<ChatRecord>(`/api/chats/${chatId}`, { project_id: projectId }, API_TIMEOUT_MS);
       setChats((current) => current.map((item) => item.id === chatId ? chatFromRecord(record) : item));
@@ -540,10 +537,46 @@ export function App() {
         setActiveProjectId(projectId);
         await syncWorkspace(projectId, chatId);
       }
+      return true;
     } catch (error) {
       setWorkspaceError(error instanceof Error ? error.message : "Не удалось перенести чат в проект");
+      return false;
     }
   }, [activeChatId, chats, syncWorkspace]);
+
+  const updatePinnedItems = useCallback(async (kind: "project" | "chat", itemId: string) => {
+    const settingKey = kind === "project" ? "pinned_project_ids" : "pinned_chat_ids";
+    const current = Array.isArray(workspaceSettings[settingKey])
+      ? workspaceSettings[settingKey].filter((value): value is string => typeof value === "string")
+      : [];
+    const nextIds = current.includes(itemId)
+      ? current.filter((id) => id !== itemId)
+      : [...current, itemId];
+    const nextSettings = { ...workspaceSettings, [settingKey]: nextIds };
+    try {
+      const workspace = await postJson<WorkspaceState>("/api/settings", {
+        active_project_id: activeProjectId || null,
+        active_chat_id: activeChatId || null,
+        settings: nextSettings
+      }, API_TIMEOUT_MS);
+      setWorkspaceSettings(workspace.settings ?? nextSettings);
+    } catch (error) {
+      setWorkspaceError(error instanceof Error ? error.message : "Не удалось обновить закреплённые элементы");
+    }
+  }, [activeChatId, activeProjectId, workspaceSettings]);
+
+  const pinnedProjectIds = useMemo(
+    () => Array.isArray(workspaceSettings.pinned_project_ids)
+      ? workspaceSettings.pinned_project_ids.filter((value): value is string => typeof value === "string")
+      : [],
+    [workspaceSettings]
+  );
+  const pinnedChatIds = useMemo(
+    () => Array.isArray(workspaceSettings.pinned_chat_ids)
+      ? workspaceSettings.pinned_chat_ids.filter((value): value is string => typeof value === "string")
+      : [],
+    [workspaceSettings]
+  );
 
   const onNew = useCallback(async (message: AppendMessage) => {
     const question = extractText(message);
@@ -706,14 +739,18 @@ export function App() {
           <NavigationSidebar
             activeProjectId={activeProjectId}
             chats={chats}
+            pinnedChatIds={pinnedChatIds}
+            pinnedProjectIds={pinnedProjectIds}
             projects={projects}
             onChatChange={(chat) => void openChat(chat)}
-            onChatMove={(chatId, projectId) => void moveChat(chatId, projectId)}
-            onChatRename={(chatId) => void renameChat(chatId)}
+            onChatMove={moveChat}
+            onChatPin={(chatId) => void updatePinnedItems("chat", chatId)}
+            onChatRename={(chatId, title) => void renameChat(chatId, title)}
             onProjectChange={(projectId) => void selectProject(projectId)}
             onProjectChatCreate={(projectId) => void createChat(projectId)}
             onProjectCreate={() => void createProject()}
-            onProjectRename={(projectId) => void renameProject(projectId)}
+            onProjectPin={(projectId) => void updatePinnedItems("project", projectId)}
+            onProjectRename={(projectId, name) => void renameProject(projectId, name)}
           />
           {workspaceError && <div className="sidebar-note">{workspaceError}</div>}
         </aside>
@@ -760,30 +797,59 @@ export function App() {
 function NavigationSidebar({
   activeProjectId,
   chats,
+  pinnedChatIds,
+  pinnedProjectIds,
   projects,
   onChatChange,
   onChatMove,
+  onChatPin,
   onChatRename,
   onProjectChange,
   onProjectChatCreate,
   onProjectCreate,
+  onProjectPin,
   onProjectRename
 }: {
   activeProjectId: string;
   chats: ChatSummary[];
+  pinnedChatIds: string[];
+  pinnedProjectIds: string[];
   projects: Project[];
   onChatChange: (chat: ChatSummary) => void;
-  onChatMove: (chatId: string, projectId: string) => void;
-  onChatRename: (chatId: string) => void;
+  onChatMove: (chatId: string, projectId: string) => Promise<boolean>;
+  onChatPin: (chatId: string) => void;
+  onChatRename: (chatId: string, title: string) => void;
   onProjectChange: (projectId: string) => void;
   onProjectChatCreate: (projectId: string) => void;
   onProjectCreate: () => void;
-  onProjectRename: (projectId: string) => void;
+  onProjectPin: (projectId: string) => void;
+  onProjectRename: (projectId: string, name: string) => void;
 }) {
   const [showAllProjects, setShowAllProjects] = useState(false);
   const [movingChatId, setMovingChatId] = useState<string | null>(null);
+  const [editing, setEditing] = useState<{ kind: "project" | "chat"; id: string; value: string } | null>(null);
   const visibleProjects = showAllProjects ? projects : projects.slice(0, 5);
-  const pinnedProjects = projects.slice(0, 2);
+  const pinnedProjects = projects.filter((project) => pinnedProjectIds.includes(project.id));
+  const pinnedChats = chats.filter((chat) => pinnedChatIds.includes(chat.id));
+  const projectNames = new Map(projects.map((project) => [project.id, project.name]));
+
+  const saveEdit = () => {
+    if (!editing) return;
+    const value = editing.value.trim();
+    if (!value) return;
+    if (editing.kind === "project") onProjectRename(editing.id, value);
+    else onChatRename(editing.id, value);
+    setEditing(null);
+  };
+
+  const editProps = (kind: "project" | "chat", id: string, value: string) => ({
+    editing: editing?.kind === kind && editing.id === id,
+    editValue: editing?.kind === kind && editing.id === id ? editing.value : value,
+    onEditChange: (next: string) => setEditing((current) => current ? { ...current, value: next } : current),
+    onEditCancel: () => setEditing(null),
+    onEditSave: saveEdit,
+    onRename: () => setEditing({ kind, id, value })
+  });
 
   return (
     <nav className="navigation-sidebar" aria-label="Проекты и чаты">
@@ -796,9 +862,20 @@ function NavigationSidebar({
               icon={<Folder size={17} />}
               key={project.id}
               label={project.name}
-              onCreateChat={() => onProjectChatCreate(project.id)}
               onOpen={() => onProjectChange(project.id)}
-              onRename={() => onProjectRename(project.id)}
+              onPin={() => onProjectPin(project.id)}
+              pinned
+            />
+          ))}
+          {pinnedChats.map((chat) => (
+            <NavigationItem
+              chat
+              detail={projectNames.get(chat.projectId)}
+              key={chat.id}
+              label={chat.title}
+              onOpen={() => onChatChange(chat)}
+              onPin={() => onChatPin(chat.id)}
+              pinned
             />
           ))}
         </div>
@@ -818,7 +895,9 @@ function NavigationSidebar({
               label={project.name}
               onCreateChat={() => onProjectChatCreate(project.id)}
               onOpen={() => onProjectChange(project.id)}
-              onRename={() => onProjectRename(project.id)}
+              onPin={() => onProjectPin(project.id)}
+              pinned={pinnedProjectIds.includes(project.id)}
+              {...editProps("project", project.id, project.name)}
             />
           ))}
         </div>
@@ -836,23 +915,29 @@ function NavigationSidebar({
             <div className="nav-chat-group" key={chat.id}>
               <NavigationItem
                 chat
-                icon={<MessageSquare size={16} />}
+                detail={projectNames.get(chat.projectId)}
                 label={chat.title}
                 onMove={() => setMovingChatId((current) => current === chat.id ? null : chat.id)}
                 onOpen={() => onChatChange(chat)}
-                onRename={() => onChatRename(chat.id)}
+                onPin={() => onChatPin(chat.id)}
+                pinned={pinnedChatIds.includes(chat.id)}
+                {...editProps("chat", chat.id, chat.title)}
               />
               {movingChatId === chat.id ? (
                 <div className="nav-move-menu">
                   <div className="nav-move-title">Перенести в проект</div>
-                  {projects.map((project) => (
+                  {projects.map((project) => project.id === chat.projectId ? (
+                    <div className="nav-move-current" key={project.id}>
+                      <Folder size={14} />
+                      <span>{project.name}</span>
+                      <small>Текущий проект</small>
+                    </div>
+                  ) : (
                     <button
-                      disabled={project.id === chat.projectId}
                       key={project.id}
-                      onClick={() => {
-                        onChatMove(chat.id, project.id);
-                        setMovingChatId(null);
-                      }}
+                      onClick={() => void onChatMove(chat.id, project.id).then((moved) => {
+                        if (moved) setMovingChatId(null);
+                      })}
                       type="button"
                     >
                       <Folder size={14} />
@@ -872,34 +957,68 @@ function NavigationSidebar({
 function NavigationItem({
   active = false,
   chat = false,
+  detail,
   icon,
   label,
   onCreateChat,
+  onEditCancel,
+  onEditChange,
+  onEditSave,
   onMove,
   onOpen,
-  onRename
+  onPin,
+  onRename,
+  pinned = false,
+  editing = false,
+  editValue = ""
 }: {
   active?: boolean;
   chat?: boolean;
-  icon: ReactNode;
+  detail?: string;
+  icon?: ReactNode;
   label: string;
   onCreateChat?: () => void;
+  onEditCancel?: () => void;
+  onEditChange?: (value: string) => void;
+  onEditSave?: () => void;
   onMove?: () => void;
   onOpen: () => void;
-  onRename: () => void;
+  onPin?: () => void;
+  onRename?: () => void;
+  pinned?: boolean;
+  editing?: boolean;
+  editValue?: string;
 }) {
   return (
     <div className="nav-row">
-      <button className={`nav-item ${chat ? "chat-nav-item" : ""} ${active ? "active" : ""}`} onClick={onOpen} type="button">
-        {icon}
-        <span>{label}</span>
-        <span className="nav-pin" title="Закрепить"><Pin size={15} /></span>
-      </button>
-      <div className="nav-actions">
+      {editing ? (
+        <div className={`nav-item nav-item-edit ${chat ? "chat-nav-item" : ""} ${active ? "active" : ""}`}>
+          {icon}
+          <input
+            aria-label="Новое название"
+            autoFocus
+            onChange={(event) => onEditChange?.(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") onEditSave?.();
+              if (event.key === "Escape") onEditCancel?.();
+            }}
+            value={editValue}
+          />
+          <button className="nav-inline-action" onClick={onEditSave} title="Сохранить" type="button"><CheckCircle2 size={14} /></button>
+          <button className="nav-inline-action" onClick={onEditCancel} title="Отменить" type="button"><X size={14} /></button>
+        </div>
+      ) : (
+        <button className={`nav-item ${chat ? "chat-nav-item" : ""} ${active ? "active" : ""}`} onClick={onOpen} type="button">
+          {icon}
+          {detail ? <span className="nav-item-copy"><span>{label}</span><small>{detail}</small></span> : <span>{label}</span>}
+        </button>
+      )}
+      {!editing && (onCreateChat || onMove || onPin || onRename) ? <div className="nav-actions">
         {onCreateChat ? <button className="nav-action" onClick={onCreateChat} title="Новый чат в проекте" type="button"><Plus size={14} /></button> : null}
         {onMove ? <button className="nav-action" onClick={onMove} title="Перенести в проект" type="button"><FolderInput size={14} /></button> : null}
-        <button className="nav-action" onClick={onRename} title="Переименовать" type="button"><Pencil size={14} /></button>
-      </div>
+        {onPin ? <button className={`nav-action ${pinned ? "is-pinned" : ""}`} onClick={onPin} title={pinned ? "Открепить" : "Закрепить"} type="button"><Pin size={14} /></button> : null}
+        {onRename ? <button className="nav-action" onClick={onRename} title="Переименовать" type="button"><Pencil size={14} /></button> : null}
+      </div> : null}
     </div>
   );
 }
@@ -1230,10 +1349,10 @@ function Thread() {
 
         <ThreadPrimitive.Messages components={{ Message }} />
 
-        <ThreadPrimitive.ViewportFooter className="thread-footer">
-          <Composer />
-        </ThreadPrimitive.ViewportFooter>
       </ThreadPrimitive.Viewport>
+      <ThreadPrimitive.ViewportFooter className="thread-footer">
+        <Composer />
+      </ThreadPrimitive.ViewportFooter>
     </ThreadPrimitive.Root>
   );
 }

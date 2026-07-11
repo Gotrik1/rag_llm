@@ -1,6 +1,6 @@
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
 import { ActionBarPrimitive, AssistantRuntimeProvider, ComposerPrimitive, MessagePrimitive, ThreadPrimitive, useExternalStoreRuntime, useMessage } from "@assistant-ui/react";
-import { AlertTriangle, Bot, Bug, CheckCircle2, Copy, Database, Cpu, FileText, Files, Folder, FolderInput, PanelRight, PanelLeftClose, PanelLeftOpen, Paintbrush, Pencil, Pin, Plus, RefreshCw, Save, Send, Settings2, Sigma, Sparkles, MessageSquare, TestTube2, UploadCloud, User, X } from "lucide-react";
+import { AlertTriangle, Bot, Bug, CheckCircle2, Copy, Database, Cpu, FileText, Files, Folder, FolderInput, PanelRight, PanelLeftClose, PanelLeftOpen, Paintbrush, Pencil, Pin, Plus, RefreshCw, Save, Send, Settings2, Sigma, Sparkles, TestTube2, UploadCloud, User, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getJson, patchJson, postFormData, postJson } from "./api";
 const DEFAULT_PROJECT = {
@@ -282,11 +282,10 @@ export function App() {
             setWorkspaceError(error instanceof Error ? error.message : "Не удалось сохранить память проекта");
         }
     }, [activeProjectId, projects]);
-    const renameProject = useCallback(async (projectId) => {
+    const renameProject = useCallback(async (projectId, name) => {
         const project = projects.find((item) => item.id === projectId);
         if (!project)
             return;
-        const name = window.prompt("Название проекта", project.name)?.trim();
         if (!name || name === project.name)
             return;
         try {
@@ -297,11 +296,10 @@ export function App() {
             setWorkspaceError(error instanceof Error ? error.message : "Не удалось переименовать проект");
         }
     }, [projects]);
-    const renameChat = useCallback(async (chatId) => {
+    const renameChat = useCallback(async (chatId, title) => {
         const chat = chats.find((item) => item.id === chatId);
         if (!chat)
             return;
-        const title = window.prompt("Название чата", chat.title)?.trim();
         if (!title || title === chat.title)
             return;
         try {
@@ -315,7 +313,7 @@ export function App() {
     const moveChat = useCallback(async (chatId, projectId) => {
         const chat = chats.find((item) => item.id === chatId);
         if (!chat || chat.projectId === projectId)
-            return;
+            return false;
         try {
             const record = await patchJson(`/api/chats/${chatId}`, { project_id: projectId }, API_TIMEOUT_MS);
             setChats((current) => current.map((item) => item.id === chatId ? chatFromRecord(record) : item));
@@ -323,11 +321,40 @@ export function App() {
                 setActiveProjectId(projectId);
                 await syncWorkspace(projectId, chatId);
             }
+            return true;
         }
         catch (error) {
             setWorkspaceError(error instanceof Error ? error.message : "Не удалось перенести чат в проект");
+            return false;
         }
     }, [activeChatId, chats, syncWorkspace]);
+    const updatePinnedItems = useCallback(async (kind, itemId) => {
+        const settingKey = kind === "project" ? "pinned_project_ids" : "pinned_chat_ids";
+        const current = Array.isArray(workspaceSettings[settingKey])
+            ? workspaceSettings[settingKey].filter((value) => typeof value === "string")
+            : [];
+        const nextIds = current.includes(itemId)
+            ? current.filter((id) => id !== itemId)
+            : [...current, itemId];
+        const nextSettings = { ...workspaceSettings, [settingKey]: nextIds };
+        try {
+            const workspace = await postJson("/api/settings", {
+                active_project_id: activeProjectId || null,
+                active_chat_id: activeChatId || null,
+                settings: nextSettings
+            }, API_TIMEOUT_MS);
+            setWorkspaceSettings(workspace.settings ?? nextSettings);
+        }
+        catch (error) {
+            setWorkspaceError(error instanceof Error ? error.message : "Не удалось обновить закреплённые элементы");
+        }
+    }, [activeChatId, activeProjectId, workspaceSettings]);
+    const pinnedProjectIds = useMemo(() => Array.isArray(workspaceSettings.pinned_project_ids)
+        ? workspaceSettings.pinned_project_ids.filter((value) => typeof value === "string")
+        : [], [workspaceSettings]);
+    const pinnedChatIds = useMemo(() => Array.isArray(workspaceSettings.pinned_chat_ids)
+        ? workspaceSettings.pinned_chat_ids.filter((value) => typeof value === "string")
+        : [], [workspaceSettings]);
     const onNew = useCallback(async (message) => {
         const question = extractText(message);
         if (!question || !activeChatId)
@@ -453,20 +480,48 @@ export function App() {
             setIsUploading(false);
         }
     }, [isUploading, selectedFiles]);
-    return (_jsx(AssistantRuntimeProvider, { runtime: runtime, children: _jsxs("main", { className: `app-shell theme-${theme} ${isSidebarCollapsed ? "sidebar-collapsed" : ""}`, children: [_jsxs("aside", { className: "sidebar", children: [_jsxs("div", { className: "sidebar-topbar", children: [_jsx("div", { className: "sidebar-title", children: "AI \u0418\u0410\u0421 \u042D\u043D\u0435\u0440\u0433\u043E\u0431\u0430\u043B\u0430\u043D\u0441" }), _jsx("button", { className: "sidebar-collapse", onClick: () => setIsSidebarCollapsed((value) => !value), title: isSidebarCollapsed ? "Развернуть левый сайдбар" : "Свернуть левый сайдбар", type: "button", children: isSidebarCollapsed ? _jsx(PanelLeftOpen, { size: 17 }) : _jsx(PanelLeftClose, { size: 17 }) })] }), _jsxs("button", { className: "new-thread", onClick: () => void clearThread(), type: "button", children: [_jsx("span", { className: "new-thread-icon", children: _jsx(Plus, { size: 16 }) }), _jsx("span", { children: "\u041D\u043E\u0432\u044B\u0439 \u0434\u0438\u0430\u043B\u043E\u0433" })] }), _jsx(NavigationSidebar, { activeProjectId: activeProjectId, chats: chats, projects: projects, onChatChange: (chat) => void openChat(chat), onChatMove: (chatId, projectId) => void moveChat(chatId, projectId), onChatRename: (chatId) => void renameChat(chatId), onProjectChange: (projectId) => void selectProject(projectId), onProjectChatCreate: (projectId) => void createChat(projectId), onProjectCreate: () => void createProject(), onProjectRename: (projectId) => void renameProject(projectId) }), workspaceError && _jsx("div", { className: "sidebar-note", children: workspaceError })] }), _jsx("section", { className: "chat-surface", children: _jsx(Thread, {}) }), _jsx(EvidencePanel, { activeTab: activeTab, activeProject: activeProject, activeProvider: activeProvider, theme: theme, debugError: debugError, debugResult: debugResult, isDebugging: isDebugging, isChangingModel: isChangingModel, isLoadingModels: isLoadingModels, isRunning: isRunning, lastQuestion: lastQuestion, modelError: modelError, models: models, result: lastResult, selectedModel: selectedModel, onChangeModel: changeModel, onDebug: runDebug, error: uploadError, isUploading: isUploading, onProviderSettingsChange: setActiveProvider, onProjectMemoryChange: (memory) => void updateProjectMemory(memory), onRefreshModels: loadModels, onTabChange: setActiveTab, onThemeChange: setTheme, selectedFiles: selectedFiles, uploadResult: uploadResult, onFilesChange: setSelectedFiles, onUpload: uploadFiles })] }) }));
+    return (_jsx(AssistantRuntimeProvider, { runtime: runtime, children: _jsxs("main", { className: `app-shell theme-${theme} ${isSidebarCollapsed ? "sidebar-collapsed" : ""}`, children: [_jsxs("aside", { className: "sidebar", children: [_jsxs("div", { className: "sidebar-topbar", children: [_jsx("div", { className: "sidebar-title", children: "AI \u0418\u0410\u0421 \u042D\u043D\u0435\u0440\u0433\u043E\u0431\u0430\u043B\u0430\u043D\u0441" }), _jsx("button", { className: "sidebar-collapse", onClick: () => setIsSidebarCollapsed((value) => !value), title: isSidebarCollapsed ? "Развернуть левый сайдбар" : "Свернуть левый сайдбар", type: "button", children: isSidebarCollapsed ? _jsx(PanelLeftOpen, { size: 17 }) : _jsx(PanelLeftClose, { size: 17 }) })] }), _jsxs("button", { className: "new-thread", onClick: () => void clearThread(), type: "button", children: [_jsx("span", { className: "new-thread-icon", children: _jsx(Plus, { size: 16 }) }), _jsx("span", { children: "\u041D\u043E\u0432\u044B\u0439 \u0434\u0438\u0430\u043B\u043E\u0433" })] }), _jsx(NavigationSidebar, { activeProjectId: activeProjectId, chats: chats, pinnedChatIds: pinnedChatIds, pinnedProjectIds: pinnedProjectIds, projects: projects, onChatChange: (chat) => void openChat(chat), onChatMove: moveChat, onChatPin: (chatId) => void updatePinnedItems("chat", chatId), onChatRename: (chatId, title) => void renameChat(chatId, title), onProjectChange: (projectId) => void selectProject(projectId), onProjectChatCreate: (projectId) => void createChat(projectId), onProjectCreate: () => void createProject(), onProjectPin: (projectId) => void updatePinnedItems("project", projectId), onProjectRename: (projectId, name) => void renameProject(projectId, name) }), workspaceError && _jsx("div", { className: "sidebar-note", children: workspaceError })] }), _jsx("section", { className: "chat-surface", children: _jsx(Thread, {}) }), _jsx(EvidencePanel, { activeTab: activeTab, activeProject: activeProject, activeProvider: activeProvider, theme: theme, debugError: debugError, debugResult: debugResult, isDebugging: isDebugging, isChangingModel: isChangingModel, isLoadingModels: isLoadingModels, isRunning: isRunning, lastQuestion: lastQuestion, modelError: modelError, models: models, result: lastResult, selectedModel: selectedModel, onChangeModel: changeModel, onDebug: runDebug, error: uploadError, isUploading: isUploading, onProviderSettingsChange: setActiveProvider, onProjectMemoryChange: (memory) => void updateProjectMemory(memory), onRefreshModels: loadModels, onTabChange: setActiveTab, onThemeChange: setTheme, selectedFiles: selectedFiles, uploadResult: uploadResult, onFilesChange: setSelectedFiles, onUpload: uploadFiles })] }) }));
 }
-function NavigationSidebar({ activeProjectId, chats, projects, onChatChange, onChatMove, onChatRename, onProjectChange, onProjectChatCreate, onProjectCreate, onProjectRename }) {
+function NavigationSidebar({ activeProjectId, chats, pinnedChatIds, pinnedProjectIds, projects, onChatChange, onChatMove, onChatPin, onChatRename, onProjectChange, onProjectChatCreate, onProjectCreate, onProjectPin, onProjectRename }) {
     const [showAllProjects, setShowAllProjects] = useState(false);
     const [movingChatId, setMovingChatId] = useState(null);
+    const [editing, setEditing] = useState(null);
     const visibleProjects = showAllProjects ? projects : projects.slice(0, 5);
-    const pinnedProjects = projects.slice(0, 2);
-    return (_jsxs("nav", { className: "navigation-sidebar", "aria-label": "\u041F\u0440\u043E\u0435\u043A\u0442\u044B \u0438 \u0447\u0430\u0442\u044B", children: [_jsxs("section", { className: "nav-section", children: [_jsx("div", { className: "nav-section-title", children: "\u0417\u0430\u043A\u0440\u0435\u043F\u043B\u0451\u043D\u043D\u044B\u0435" }), _jsx("div", { className: "project-list pinned-list", children: pinnedProjects.map((project) => (_jsx(NavigationItem, { active: project.id === activeProjectId, icon: _jsx(Folder, { size: 17 }), label: project.name, onCreateChat: () => onProjectChatCreate(project.id), onOpen: () => onProjectChange(project.id), onRename: () => onProjectRename(project.id) }, project.id))) })] }), _jsxs("section", { className: "nav-section", children: [_jsxs("div", { className: "nav-section-header", children: [_jsx("div", { className: "nav-section-title", children: "\u041F\u0440\u043E\u0435\u043A\u0442\u044B" }), _jsx("button", { className: "nav-add-project", onClick: onProjectCreate, title: "\u041D\u043E\u0432\u044B\u0439 \u043F\u0440\u043E\u0435\u043A\u0442", type: "button", children: _jsx(Plus, { size: 15 }) })] }), _jsx("div", { className: "project-list", children: visibleProjects.map((project) => (_jsx(NavigationItem, { active: project.id === activeProjectId, icon: _jsx(Folder, { size: 17 }), label: project.name, onCreateChat: () => onProjectChatCreate(project.id), onOpen: () => onProjectChange(project.id), onRename: () => onProjectRename(project.id) }, project.id))) }), projects.length > 5 ? (_jsx("button", { className: "show-more", onClick: () => setShowAllProjects((value) => !value), type: "button", children: showAllProjects ? "Скрыть" : "Показать еще" })) : null] }), _jsxs("section", { className: "nav-section chats-section", children: [_jsx("div", { className: "nav-section-title", children: "\u0427\u0430\u0442\u044B" }), _jsx("div", { className: "sidebar-chat-list", children: chats.length ? chats.map((chat) => (_jsxs("div", { className: "nav-chat-group", children: [_jsx(NavigationItem, { chat: true, icon: _jsx(MessageSquare, { size: 16 }), label: chat.title, onMove: () => setMovingChatId((current) => current === chat.id ? null : chat.id), onOpen: () => onChatChange(chat), onRename: () => onChatRename(chat.id) }), movingChatId === chat.id ? (_jsxs("div", { className: "nav-move-menu", children: [_jsx("div", { className: "nav-move-title", children: "\u041F\u0435\u0440\u0435\u043D\u0435\u0441\u0442\u0438 \u0432 \u043F\u0440\u043E\u0435\u043A\u0442" }), projects.map((project) => (_jsxs("button", { disabled: project.id === chat.projectId, onClick: () => {
-                                                onChatMove(chat.id, project.id);
-                                                setMovingChatId(null);
-                                            }, type: "button", children: [_jsx(Folder, { size: 14 }), _jsx("span", { children: project.name })] }, project.id)))] })) : null] }, chat.id))) : _jsx("div", { className: "sidebar-empty", children: "\u0418\u0441\u0442\u043E\u0440\u0438\u044F \u043F\u043E\u044F\u0432\u0438\u0442\u0441\u044F \u043F\u043E\u0441\u043B\u0435 \u043F\u0435\u0440\u0432\u043E\u0433\u043E \u0432\u043E\u043F\u0440\u043E\u0441\u0430." }) })] })] }));
+    const pinnedProjects = projects.filter((project) => pinnedProjectIds.includes(project.id));
+    const pinnedChats = chats.filter((chat) => pinnedChatIds.includes(chat.id));
+    const projectNames = new Map(projects.map((project) => [project.id, project.name]));
+    const saveEdit = () => {
+        if (!editing)
+            return;
+        const value = editing.value.trim();
+        if (!value)
+            return;
+        if (editing.kind === "project")
+            onProjectRename(editing.id, value);
+        else
+            onChatRename(editing.id, value);
+        setEditing(null);
+    };
+    const editProps = (kind, id, value) => ({
+        editing: editing?.kind === kind && editing.id === id,
+        editValue: editing?.kind === kind && editing.id === id ? editing.value : value,
+        onEditChange: (next) => setEditing((current) => current ? { ...current, value: next } : current),
+        onEditCancel: () => setEditing(null),
+        onEditSave: saveEdit,
+        onRename: () => setEditing({ kind, id, value })
+    });
+    return (_jsxs("nav", { className: "navigation-sidebar", "aria-label": "\u041F\u0440\u043E\u0435\u043A\u0442\u044B \u0438 \u0447\u0430\u0442\u044B", children: [_jsxs("section", { className: "nav-section", children: [_jsx("div", { className: "nav-section-title", children: "\u0417\u0430\u043A\u0440\u0435\u043F\u043B\u0451\u043D\u043D\u044B\u0435" }), _jsxs("div", { className: "project-list pinned-list", children: [pinnedProjects.map((project) => (_jsx(NavigationItem, { active: project.id === activeProjectId, icon: _jsx(Folder, { size: 17 }), label: project.name, onOpen: () => onProjectChange(project.id), onPin: () => onProjectPin(project.id), pinned: true }, project.id))), pinnedChats.map((chat) => (_jsx(NavigationItem, { chat: true, detail: projectNames.get(chat.projectId), label: chat.title, onOpen: () => onChatChange(chat), onPin: () => onChatPin(chat.id), pinned: true }, chat.id)))] })] }), _jsxs("section", { className: "nav-section", children: [_jsxs("div", { className: "nav-section-header", children: [_jsx("div", { className: "nav-section-title", children: "\u041F\u0440\u043E\u0435\u043A\u0442\u044B" }), _jsx("button", { className: "nav-add-project", onClick: onProjectCreate, title: "\u041D\u043E\u0432\u044B\u0439 \u043F\u0440\u043E\u0435\u043A\u0442", type: "button", children: _jsx(Plus, { size: 15 }) })] }), _jsx("div", { className: "project-list", children: visibleProjects.map((project) => (_jsx(NavigationItem, { active: project.id === activeProjectId, icon: _jsx(Folder, { size: 17 }), label: project.name, onCreateChat: () => onProjectChatCreate(project.id), onOpen: () => onProjectChange(project.id), onPin: () => onProjectPin(project.id), pinned: pinnedProjectIds.includes(project.id), ...editProps("project", project.id, project.name) }, project.id))) }), projects.length > 5 ? (_jsx("button", { className: "show-more", onClick: () => setShowAllProjects((value) => !value), type: "button", children: showAllProjects ? "Скрыть" : "Показать еще" })) : null] }), _jsxs("section", { className: "nav-section chats-section", children: [_jsx("div", { className: "nav-section-title", children: "\u0427\u0430\u0442\u044B" }), _jsx("div", { className: "sidebar-chat-list", children: chats.length ? chats.map((chat) => (_jsxs("div", { className: "nav-chat-group", children: [_jsx(NavigationItem, { chat: true, detail: projectNames.get(chat.projectId), label: chat.title, onMove: () => setMovingChatId((current) => current === chat.id ? null : chat.id), onOpen: () => onChatChange(chat), onPin: () => onChatPin(chat.id), pinned: pinnedChatIds.includes(chat.id), ...editProps("chat", chat.id, chat.title) }), movingChatId === chat.id ? (_jsxs("div", { className: "nav-move-menu", children: [_jsx("div", { className: "nav-move-title", children: "\u041F\u0435\u0440\u0435\u043D\u0435\u0441\u0442\u0438 \u0432 \u043F\u0440\u043E\u0435\u043A\u0442" }), projects.map((project) => project.id === chat.projectId ? (_jsxs("div", { className: "nav-move-current", children: [_jsx(Folder, { size: 14 }), _jsx("span", { children: project.name }), _jsx("small", { children: "\u0422\u0435\u043A\u0443\u0449\u0438\u0439 \u043F\u0440\u043E\u0435\u043A\u0442" })] }, project.id)) : (_jsxs("button", { onClick: () => void onChatMove(chat.id, project.id).then((moved) => {
+                                                if (moved)
+                                                    setMovingChatId(null);
+                                            }), type: "button", children: [_jsx(Folder, { size: 14 }), _jsx("span", { children: project.name })] }, project.id)))] })) : null] }, chat.id))) : _jsx("div", { className: "sidebar-empty", children: "\u0418\u0441\u0442\u043E\u0440\u0438\u044F \u043F\u043E\u044F\u0432\u0438\u0442\u0441\u044F \u043F\u043E\u0441\u043B\u0435 \u043F\u0435\u0440\u0432\u043E\u0433\u043E \u0432\u043E\u043F\u0440\u043E\u0441\u0430." }) })] })] }));
 }
-function NavigationItem({ active = false, chat = false, icon, label, onCreateChat, onMove, onOpen, onRename }) {
-    return (_jsxs("div", { className: "nav-row", children: [_jsxs("button", { className: `nav-item ${chat ? "chat-nav-item" : ""} ${active ? "active" : ""}`, onClick: onOpen, type: "button", children: [icon, _jsx("span", { children: label }), _jsx("span", { className: "nav-pin", title: "\u0417\u0430\u043A\u0440\u0435\u043F\u0438\u0442\u044C", children: _jsx(Pin, { size: 15 }) })] }), _jsxs("div", { className: "nav-actions", children: [onCreateChat ? _jsx("button", { className: "nav-action", onClick: onCreateChat, title: "\u041D\u043E\u0432\u044B\u0439 \u0447\u0430\u0442 \u0432 \u043F\u0440\u043E\u0435\u043A\u0442\u0435", type: "button", children: _jsx(Plus, { size: 14 }) }) : null, onMove ? _jsx("button", { className: "nav-action", onClick: onMove, title: "\u041F\u0435\u0440\u0435\u043D\u0435\u0441\u0442\u0438 \u0432 \u043F\u0440\u043E\u0435\u043A\u0442", type: "button", children: _jsx(FolderInput, { size: 14 }) }) : null, _jsx("button", { className: "nav-action", onClick: onRename, title: "\u041F\u0435\u0440\u0435\u0438\u043C\u0435\u043D\u043E\u0432\u0430\u0442\u044C", type: "button", children: _jsx(Pencil, { size: 14 }) })] })] }));
+function NavigationItem({ active = false, chat = false, detail, icon, label, onCreateChat, onEditCancel, onEditChange, onEditSave, onMove, onOpen, onPin, onRename, pinned = false, editing = false, editValue = "" }) {
+    return (_jsxs("div", { className: "nav-row", children: [editing ? (_jsxs("div", { className: `nav-item nav-item-edit ${chat ? "chat-nav-item" : ""} ${active ? "active" : ""}`, children: [icon, _jsx("input", { "aria-label": "\u041D\u043E\u0432\u043E\u0435 \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u0435", autoFocus: true, onChange: (event) => onEditChange?.(event.target.value), onKeyDown: (event) => {
+                            if (event.key === "Enter")
+                                onEditSave?.();
+                            if (event.key === "Escape")
+                                onEditCancel?.();
+                        }, value: editValue }), _jsx("button", { className: "nav-inline-action", onClick: onEditSave, title: "\u0421\u043E\u0445\u0440\u0430\u043D\u0438\u0442\u044C", type: "button", children: _jsx(CheckCircle2, { size: 14 }) }), _jsx("button", { className: "nav-inline-action", onClick: onEditCancel, title: "\u041E\u0442\u043C\u0435\u043D\u0438\u0442\u044C", type: "button", children: _jsx(X, { size: 14 }) })] })) : (_jsxs("button", { className: `nav-item ${chat ? "chat-nav-item" : ""} ${active ? "active" : ""}`, onClick: onOpen, type: "button", children: [icon, detail ? _jsxs("span", { className: "nav-item-copy", children: [_jsx("span", { children: label }), _jsx("small", { children: detail })] }) : _jsx("span", { children: label })] })), !editing && (onCreateChat || onMove || onPin || onRename) ? _jsxs("div", { className: "nav-actions", children: [onCreateChat ? _jsx("button", { className: "nav-action", onClick: onCreateChat, title: "\u041D\u043E\u0432\u044B\u0439 \u0447\u0430\u0442 \u0432 \u043F\u0440\u043E\u0435\u043A\u0442\u0435", type: "button", children: _jsx(Plus, { size: 14 }) }) : null, onMove ? _jsx("button", { className: "nav-action", onClick: onMove, title: "\u041F\u0435\u0440\u0435\u043D\u0435\u0441\u0442\u0438 \u0432 \u043F\u0440\u043E\u0435\u043A\u0442", type: "button", children: _jsx(FolderInput, { size: 14 }) }) : null, onPin ? _jsx("button", { className: `nav-action ${pinned ? "is-pinned" : ""}`, onClick: onPin, title: pinned ? "Открепить" : "Закрепить", type: "button", children: _jsx(Pin, { size: 14 }) }) : null, onRename ? _jsx("button", { className: "nav-action", onClick: onRename, title: "\u041F\u0435\u0440\u0435\u0438\u043C\u0435\u043D\u043E\u0432\u0430\u0442\u044C", type: "button", children: _jsx(Pencil, { size: 14 }) }) : null] }) : null] }));
 }
 function FlowModeSelector({ isRunning }) {
     const [mode, setMode] = useState("python");
@@ -601,7 +656,7 @@ function KnowledgeLoader({ error, isUploading, result, selectedFiles, onFilesCha
     return (_jsxs("section", { className: "knowledge-loader", "aria-label": "\u0417\u0430\u0433\u0440\u0443\u0437\u043A\u0430 \u0432 \u0431\u0430\u0437\u0443 \u0437\u043D\u0430\u043D\u0438\u0439", children: [_jsxs("div", { className: "loader-title", children: [_jsx(Database, { size: 15 }), _jsx("span", { children: "\u0411\u0430\u0437\u0430 \u0437\u043D\u0430\u043D\u0438\u0439" })] }), _jsxs("label", { className: "file-picker", htmlFor: inputId, children: [_jsx(UploadCloud, { size: 17 }), _jsx("span", { children: selectedFiles.length ? `Выбрано: ${selectedFiles.length}` : "Выбрать файлы" })] }), _jsx("input", { accept: ".docx,.pdf,.md,.txt", className: "file-input", id: inputId, multiple: true, onChange: (event) => onFilesChange(Array.from(event.currentTarget.files ?? [])), type: "file" }), selectedFiles.length ? (_jsxs("div", { className: "selected-files", children: [selectedFiles.slice(0, 4).map((file) => (_jsxs("div", { className: "selected-file", children: [_jsx(FileText, { size: 13 }), _jsx("span", { children: file.name })] }, `${file.name}-${file.size}`))), selectedFiles.length > 4 ? _jsxs("div", { className: "loader-muted", children: ["\u0438 \u0435\u0449\u0435 ", selectedFiles.length - 4] }) : null] })) : null, _jsxs("button", { className: "upload-button", disabled: !selectedFiles.length || isUploading, onClick: onUpload, type: "button", children: [_jsx(UploadCloud, { size: 15 }), isUploading ? "Загрузка..." : "Загрузить"] }), result ? (_jsxs("div", { className: "upload-status success", children: [_jsx(CheckCircle2, { size: 14 }), _jsxs("span", { children: [result.files.length, " \u0444\u0430\u0439\u043B(\u043E\u0432), ", result.chunks, " \u0447\u0430\u043D\u043A\u043E\u0432"] })] })) : null, error ? (_jsxs("div", { className: "upload-status error", children: [_jsx(AlertTriangle, { size: 14 }), _jsx("span", { children: error })] })) : null] }));
 }
 function Thread() {
-    return (_jsx(ThreadPrimitive.Root, { className: "thread-root", children: _jsxs(ThreadPrimitive.Viewport, { className: "thread-viewport", children: [_jsx(ThreadPrimitive.Empty, { children: _jsxs("div", { className: "empty-state", children: [_jsx("div", { className: "empty-icon", children: _jsx(Bot, { size: 24 }) }), _jsx("h1", { children: "\u0417\u0430\u0434\u0430\u0439 \u0432\u043E\u043F\u0440\u043E\u0441 \u043F\u043E \u0440\u0435\u0433\u043B\u0430\u043C\u0435\u043D\u0442\u0430\u043C" }), _jsx("p", { children: "\u041C\u043E\u0436\u043D\u043E \u0441\u043F\u0440\u0430\u0448\u0438\u0432\u0430\u0442\u044C \u043F\u043E \u043D\u043E\u043C\u0435\u0440\u0443 \u043F\u0443\u043D\u043A\u0442\u0430, \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u044E \u0440\u0430\u0437\u0434\u0435\u043B\u0430 \u0438\u043B\u0438 \u0442\u0435\u0440\u043C\u0438\u043D\u0430\u043C \u0432\u0440\u043E\u0434\u0435 \u0418\u04120, \u0418\u04121, \u0418\u0421." })] }) }), _jsx(ThreadPrimitive.Messages, { components: { Message } }), _jsx(ThreadPrimitive.ViewportFooter, { className: "thread-footer", children: _jsx(Composer, {}) })] }) }));
+    return (_jsxs(ThreadPrimitive.Root, { className: "thread-root", children: [_jsxs(ThreadPrimitive.Viewport, { className: "thread-viewport", children: [_jsx(ThreadPrimitive.Empty, { children: _jsxs("div", { className: "empty-state", children: [_jsx("div", { className: "empty-icon", children: _jsx(Bot, { size: 24 }) }), _jsx("h1", { children: "\u0417\u0430\u0434\u0430\u0439 \u0432\u043E\u043F\u0440\u043E\u0441 \u043F\u043E \u0440\u0435\u0433\u043B\u0430\u043C\u0435\u043D\u0442\u0430\u043C" }), _jsx("p", { children: "\u041C\u043E\u0436\u043D\u043E \u0441\u043F\u0440\u0430\u0448\u0438\u0432\u0430\u0442\u044C \u043F\u043E \u043D\u043E\u043C\u0435\u0440\u0443 \u043F\u0443\u043D\u043A\u0442\u0430, \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u044E \u0440\u0430\u0437\u0434\u0435\u043B\u0430 \u0438\u043B\u0438 \u0442\u0435\u0440\u043C\u0438\u043D\u0430\u043C \u0432\u0440\u043E\u0434\u0435 \u0418\u04120, \u0418\u04121, \u0418\u0421." })] }) }), _jsx(ThreadPrimitive.Messages, { components: { Message } })] }), _jsx(ThreadPrimitive.ViewportFooter, { className: "thread-footer", children: _jsx(Composer, {}) })] }));
 }
 function Message() {
     const role = useMessage((state) => state.role);

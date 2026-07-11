@@ -1,0 +1,8 @@
+{
+  "embedding_model": "nomic-embed-text",
+  "embedding_provider": "ollama",
+  "dimension": 768,
+  "chunks": 63,
+  "duration_s": 6.061,
+  "metric": "inner_product_on_normalized_vectors"
+}

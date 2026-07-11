@@ -1,0 +1,16 @@
+# Формат: expected|question|keywords через запятую|case_id
+# Набор адаптирован под 35 архитектурных документов из knowledge_base/architecture.
+# Для unknown ожидается честный отказ или отсутствие найденных источников.
+
+known|Какие роли описаны в модели контроля доступа?|роль|known-rbac-roles
+known|Какие права есть у владельца системы?|овнер,доступ|known-owner-access
+known|Какие права отсутствуют у администратора?|админ,прав|known-admin-restrictions
+known|Что такое Workspace в архитектуре системы?|workspace|known-workspace
+known|Какие системные инварианты должны соблюдаться?|инвариант|known-invariants
+known|Какие уровни системы идут от владельца к данным?|owner,workspace|known-system-levels
+known|Что является основой управленческих расчётов?|unit|known-unit-principle
+known|Какие внешние системы подключаются к решению?|систем|known-external-systems
+unknown|Как устроен двигатель космического корабля «Северный-7»?||unknown-spacecraft
+unknown|Какой пароль root указан в документации?||unknown-secret
+unknown|Какая зарплата у директора компании?||unknown-sensitive
+unknown|Как настроить Kubernetes-кластер в другой компании?||unknown-out-of-domain

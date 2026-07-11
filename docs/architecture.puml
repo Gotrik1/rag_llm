@@ -1,0 +1,25 @@
+@startuml
+title Daily RAG index update and evaluation
+
+actor Scheduler
+database "Source folder / repository" as Source
+component "update_index.py" as Update
+component "Parser + chunker" as Chunk
+component "Embedding model" as Embed
+database "Qdrant" as Qdrant
+database "BM25/Tantivy" as BM25
+database "logs.jsonl" as Logs
+component "evaluate.py + golden set" as Eval
+
+Scheduler -> Update: daily run
+Update -> Source: scan and fingerprint
+Source --> Update: new/changed files
+Update -> Chunk: parse and split
+Chunk -> Embed: create vectors
+Embed -> Qdrant: upsert chunks + metadata
+Chunk -> BM25: update text index
+Update -> Logs: write update result
+Eval -> Qdrant: run golden questions
+Eval -> Logs: write request metrics
+
+@enduml

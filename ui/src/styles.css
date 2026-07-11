@@ -294,12 +294,22 @@ textarea {
 }
 
 .nav-move-menu {
+  position: absolute;
+  top: calc(100% + 2px);
+  right: 4px;
+  left: 24px;
+  z-index: 20;
   display: grid;
   gap: 2px;
-  margin: 2px 0 5px 24px;
+  margin: 0;
   padding: 7px;
   border-radius: 6px;
   background: #1c1c1c;
+}
+
+.nav-chat-group {
+  position: relative;
+  min-width: 0;
 }
 
 .nav-move-title {

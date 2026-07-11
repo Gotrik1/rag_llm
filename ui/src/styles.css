@@ -462,9 +462,8 @@ textarea {
 }
 
 .nav-item.active {
-  background: #383838;
-  border-color: #383838;
-  color: #ffffff;
+  background: transparent;
+  border-color: transparent;
 }
 
 .chat-nav-item {
@@ -1409,7 +1408,7 @@ sub {
 .theme-portal .new-thread {
   border-color: transparent;
   background: transparent;
-  color: #f28a32;
+  color: #1c1c1c;
 }
 
 .theme-portal .new-thread:hover {
@@ -1423,7 +1422,7 @@ sub {
 }
 
 .theme-portal .sidebar-collapse {
-  color: #f28a32;
+  color: #1c1c1c;
 }
 
 .theme-portal .sidebar-collapse:hover {
@@ -1459,14 +1458,15 @@ sub {
 }
 
 .theme-portal .nav-item.active {
-  border-color: #898995;
-  background: #898995;
+  border-color: transparent;
+  background: transparent;
   box-shadow: none;
-  color: #ffffff;
+  color: #1c1c1c;
 }
 
 .theme-portal .nav-item.active:hover {
   background: #898995;
+  border-color: #898995;
   box-shadow: none;
   color: #ffffff;
 }

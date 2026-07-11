@@ -885,6 +885,7 @@ function NavigationSidebar({
   onProjectRename: (projectId: string, name: string) => void;
 }) {
   const [showAllProjects, setShowAllProjects] = useState(false);
+  const [collapsedProjectIds, setCollapsedProjectIds] = useState<string[]>([]);
   const [movingChatId, setMovingChatId] = useState<string | null>(null);
   const [editing, setEditing] = useState<{ kind: "project" | "chat"; id: string; value: string } | null>(null);
   const visibleProjects = showAllProjects ? projects : projects.slice(0, 5);
@@ -988,21 +989,28 @@ function NavigationSidebar({
         </div>
         <div className="project-list">
           {visibleProjects.map((project) => (
-            <div className="project-tree" key={project.id}>
+            <div className={`project-tree ${collapsedProjectIds.includes(project.id) ? "is-collapsed" : ""}`} key={project.id}>
               <NavigationItem
                 active={project.id === activeProjectId}
                 icon={<Folder size={17} />}
                 label={project.name}
                 onCreateChat={() => onProjectChatCreate(project.id)}
                 onDelete={() => onProjectDelete(project.id)}
-                onOpen={() => onProjectChange(project.id)}
+                onOpen={() => {
+                  setCollapsedProjectIds((current) => current.includes(project.id)
+                    ? current.filter((id) => id !== project.id)
+                    : [...current, project.id]);
+                  onProjectChange(project.id);
+                }}
                 onPin={() => onProjectPin(project.id)}
                 pinned={pinnedProjectIds.includes(project.id)}
                 {...editProps("project", project.id, project.name)}
               />
-              <div className="project-chat-list">
-                {chats.filter((chat) => chat.projectId === project.id).map((chat) => renderChat(chat, true))}
-              </div>
+              {!collapsedProjectIds.includes(project.id) ? (
+                <div className="project-chat-list">
+                  {chats.filter((chat) => chat.projectId === project.id).map((chat) => renderChat(chat, true))}
+                </div>
+              ) : null}
             </div>
           ))}
         </div>

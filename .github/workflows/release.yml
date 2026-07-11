@@ -33,7 +33,7 @@ jobs:
           cp -R ui/dist release/ui/dist
           cp -R src migrations release/
           cp web_ui.py db_store.py rag_agent.py document_ingestion.py docx_parser.py llm_providers.py system_prompts.py openapi.json release/
-          cp requirements.txt Cargo.toml Cargo.lock docker-compose.yml Dockerfile.backend Dockerfile.rust-cli .env.example architecture.md BRANCHING.md DEPLOYMENT.md release/
+          cp requirements.txt requirements.docker.txt Cargo.toml Cargo.lock docker-compose.yml Dockerfile.backend Dockerfile.rust-cli .env.example architecture.md BRANCHING.md DEPLOYMENT.md release/
           mkdir -p release/ui
           cp ui/Dockerfile ui/nginx.conf release/ui/
           tar -czf rag-llm-${GITHUB_REF_NAME}.tar.gz release

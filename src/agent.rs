@@ -2,6 +2,8 @@ use anyhow::Result;
 use sha2::{Digest, Sha256};
 use rusqlite::Connection;
 use serde::Serialize;
+use std::env;
+use std::path::PathBuf;
 
 use crate::bm25::Bm25Index;
 use crate::embed::Embedder;
@@ -46,11 +48,14 @@ pub struct Agent {
 
 impl Agent {
     pub async fn new() -> Result<Self> {
+        let data_dir = PathBuf::from(env::var("RUST_DATA_DIR").unwrap_or_else(|_| ".".to_string()));
+        std::fs::create_dir_all(&data_dir)?;
+        let data_dir_string = data_dir.to_string_lossy().into_owned();
         let embedder = Embedder::new()?;
         let store = VectorStore::new().await?;
-        let bm25 = Bm25Index::open_or_create(".")?;
+        let bm25 = Bm25Index::open_or_create(&data_dir_string)?;
         let llm = OllamaClient::new();
-        let cache = Connection::open("cache.db")?;
+        let cache = Connection::open(data_dir.join("cache.db"))?;
 
         cache.execute_batch(
             "CREATE TABLE IF NOT EXISTS answer_cache (

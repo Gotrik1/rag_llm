@@ -16,23 +16,80 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 from urllib.error import URLError
 
+from db_store import (
+    create_chat,
+    create_message,
+    create_project,
+    delete_chat,
+    delete_message,
+    delete_project,
+    get_chat,
+    get_message,
+    get_project,
+    get_workspace,
+    list_chats,
+    list_messages,
+    list_projects,
+    run_migrations,
+    update_chat,
+    update_message,
+    update_project,
+    update_workspace,
+)
 from llm_providers import DEFAULTS, ProviderLLM
 from rag_agent import GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, refine_prism_query, validate_retrieval
 from system_prompts import get_profile, profiles
 
 
-HOST = "127.0.0.1"
-PORT = 8080
+HOST = os.environ.get("BACKEND_HOST", "127.0.0.1")
+PORT = int(os.environ.get("BACKEND_PORT", "8080"))
 MATHML_CACHE_DIR = Path(".ingestion_cache") / "mathml"
 UPLOAD_DIR = Path(".ingestion_cache") / "uploads"
 PROVIDERS_CONFIG_PATH = Path(".ingestion_cache") / "llm_providers.json"
 SYSTEM_PROMPT_CONFIG_PATH = Path(".ingestion_cache") / "system_prompt.json"
 FLOW_CONFIG_PATH = Path(".ingestion_cache") / "flow_mode.json"
 FLOW_MODES = {"python", "rust", "hybrid"}
+OPENAPI_SPEC_PATH = Path("openapi.json")
 
 _agent: RAGAgent | None = None
 _agent_lock = threading.Lock()
 _request_lock = threading.Lock()
+
+
+SWAGGER_UI_HTML = """<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RAG Assistant API</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+  <style>body { margin: 0; background: #fafafa; } .swagger-ui .topbar { display: none; }</style>
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    window.ui = SwaggerUIBundle({
+      url: "/api/openapi.json",
+      dom_id: "#swagger-ui",
+      deepLinking: true,
+      displayRequestDuration: true,
+      persistAuthorization: true
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+def load_openapi_spec() -> dict:
+    try:
+        spec = json.loads(OPENAPI_SPEC_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Не удалось прочитать OpenAPI-спецификацию: {exc}") from exc
+    if not isinstance(spec, dict):
+        raise RuntimeError("OpenAPI-спецификация должна быть JSON-объектом.")
+    return spec
 
 
 def load_provider_config() -> dict:
@@ -69,12 +126,24 @@ def load_flow_mode() -> str:
         return "python"
 
 
+def storage_defaults() -> tuple[str, str, str]:
+    config = load_provider_config()
+    return (
+        load_flow_mode(),
+        str(config.get("provider", "ollama")),
+        str(config.get("model", LLM_MODEL)),
+    )
+
+
 def save_flow_mode(mode: str) -> None:
     FLOW_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     FLOW_CONFIG_PATH.write_text(json.dumps({"mode": mode}), encoding="utf-8")
 
 
 def _rust_command() -> list[str]:
+    configured = os.environ.get("RUST_CLI_PATH", "").strip()
+    if configured:
+        return [configured]
     binary = Path("target") / "debug" / ("llm-rust.exe" if os.name == "nt" else "llm-rust")
     return [str(binary)] if binary.exists() else ["cargo", "run", "--quiet"]
 
@@ -587,8 +656,55 @@ $("cacheBtn").onclick = async () => {
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlparse(self.path).path
+        if path == "/docs":
+            self.send_html(SWAGGER_UI_HTML)
+            return
+        if path == "/api/openapi.json":
+            self.send_json(load_openapi_spec())
+            return
         if path == "/":
             self.send_html(INDEX_HTML)
+            return
+        if path == "/api/workspace":
+            self.send_json(get_workspace(*storage_defaults()))
+            return
+        if path == "/api/projects":
+            self.send_json({"items": list_projects()})
+            return
+        if path.startswith("/api/projects/") and path.count("/") == 3:
+            project_id = path.rsplit("/", 1)[-1]
+            project = get_project(project_id)
+            if project is None:
+                self.send_json({"error": "not found"}, 404)
+                return
+            self.send_json(project)
+            return
+        if path.startswith("/api/projects/") and path.endswith("/chats"):
+            project_id = path.split("/")[3]
+            self.send_json({"items": list_chats(project_id)})
+            return
+        if path == "/api/chats":
+            self.send_json({"items": list_chats()})
+            return
+        if path.startswith("/api/chats/") and path.count("/") == 3:
+            chat_id = path.rsplit("/", 1)[-1]
+            chat = get_chat(chat_id)
+            if chat is None:
+                self.send_json({"error": "not found"}, 404)
+                return
+            self.send_json(chat)
+            return
+        if path.startswith("/api/chats/") and path.endswith("/messages"):
+            chat_id = path.split("/")[3]
+            self.send_json({"items": list_messages(chat_id)})
+            return
+        if path.startswith("/api/messages/") and path.count("/") == 3:
+            message_id = path.rsplit("/", 1)[-1]
+            message = get_message(message_id)
+            if message is None:
+                self.send_json({"error": "not found"}, 404)
+                return
+            self.send_json(message)
             return
         if path == "/api/models":
             self.handle_models()
@@ -601,6 +717,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/flow-mode":
             self.send_json({"mode": load_flow_mode()})
+            return
+        if path == "/api/settings":
+            self.send_json(get_workspace(*storage_defaults()))
             return
         self.send_json({"error": "not found"}, 404)
 
@@ -630,8 +749,59 @@ class Handler(BaseHTTPRequestHandler):
                 self.handle_load(body)
             elif path == "/api/cache/clear":
                 self.handle_cache_clear()
+            elif path == "/api/settings":
+                self.send_json(update_workspace(body, *storage_defaults()))
+            elif path == "/api/projects":
+                self.send_json(create_project(body), 201)
+            elif path.startswith("/api/projects/") and path.count("/") == 3:
+                self.send_json({"error": "use PATCH or DELETE for this resource"}, 405)
+            elif path.startswith("/api/projects/") and path.endswith("/chats"):
+                project_id = path.split("/")[3]
+                self.send_json(create_chat(project_id, body, *storage_defaults()), 201)
+            elif path == "/api/chats":
+                self.send_json(create_chat(str(body.get("project_id", "")).strip(), body, *storage_defaults()), 201)
+            elif path.startswith("/api/chats/") and path.count("/") == 3:
+                self.send_json({"error": "use PATCH or DELETE for this resource"}, 405)
+            elif path.startswith("/api/chats/") and path.endswith("/messages"):
+                chat_id = path.split("/")[3]
+                self.send_json(create_message(chat_id, body), 201)
+            elif path.startswith("/api/messages/") and path.count("/") == 3:
+                self.send_json({"error": "use PATCH or DELETE for this resource"}, 405)
             else:
                 self.send_json({"error": "not found"}, 404)
+        except Exception as exc:
+            self.send_json({"error": str(exc)}, 500)
+
+    def do_PATCH(self) -> None:
+        try:
+            path = urlparse(self.path).path
+            body = self.read_json()
+            if path.startswith("/api/projects/") and path.count("/") == 3:
+                updated = update_project(path.rsplit("/", 1)[-1], body)
+            elif path.startswith("/api/chats/") and path.count("/") == 3:
+                updated = update_chat(path.rsplit("/", 1)[-1], body)
+            elif path.startswith("/api/messages/") and path.count("/") == 3:
+                updated = update_message(path.rsplit("/", 1)[-1], body)
+            else:
+                self.send_json({"error": "not found"}, 404)
+                return
+            self.send_json(updated or {"error": "not found"}, 200 if updated else 404)
+        except Exception as exc:
+            self.send_json({"error": str(exc)}, 500)
+
+    def do_DELETE(self) -> None:
+        try:
+            path = urlparse(self.path).path
+            if path.startswith("/api/projects/") and path.count("/") == 3:
+                deleted = delete_project(path.rsplit("/", 1)[-1])
+            elif path.startswith("/api/chats/") and path.count("/") == 3:
+                deleted = delete_chat(path.rsplit("/", 1)[-1])
+            elif path.startswith("/api/messages/") and path.count("/") == 3:
+                deleted = delete_message(path.rsplit("/", 1)[-1])
+            else:
+                self.send_json({"error": "not found"}, 404)
+                return
+            self.send_json({"deleted": deleted}, 200 if deleted else 404)
         except Exception as exc:
             self.send_json({"error": str(exc)}, 500)
 
@@ -930,7 +1100,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def send_json(self, data: dict, status: int = 200) -> None:
-        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        payload = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -943,8 +1113,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    try:
+        run_migrations()
+        get_workspace(*storage_defaults())
+    except Exception as exc:
+        # Keep API documentation and stateless RAG routes available while a
+        # local PostgreSQL container is being repaired or started.
+        print("PostgreSQL unavailable at startup; check DATABASE_URL and the container logs.")
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Web UI: http://{HOST}:{PORT}")
+    print(f"Swagger UI: http://{HOST}:{PORT}/docs")
     server.serve_forever()
 
 

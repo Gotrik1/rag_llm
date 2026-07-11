@@ -44,6 +44,42 @@ type ChatEntry = {
   status?: "running" | "complete" | "error";
 };
 
+type WorkspaceState = {
+  id: string;
+  active_project_id?: string | null;
+  active_chat_id?: string | null;
+  settings?: Record<string, unknown>;
+};
+
+type ProjectRecord = {
+  id: string;
+  name: string;
+  description: string;
+  settings?: Record<string, unknown>;
+  memory?: Record<string, unknown>;
+  chats?: ChatRecord[];
+};
+
+type ChatRecord = {
+  id: string;
+  project_id: string;
+  title: string;
+  mode: FlowMode;
+  provider: ProviderName;
+  model_name: string;
+  metadata?: Record<string, unknown>;
+};
+
+type MessageRecord = {
+  id: string;
+  chat_id: string;
+  role: Role;
+  content: string;
+  content_html?: string;
+  status?: string;
+  metadata?: Record<string, unknown>;
+};
+
 type ApiSource = {
   file: string;
   section?: string;
@@ -142,6 +178,7 @@ type PanelTab = "evidence" | "sources" | "debug";
 const ASK_TIMEOUT_MS = 180_000;
 const DEBUG_TIMEOUT_MS = 60_000;
 const UPLOAD_TIMEOUT_MS = 300_000;
+const API_TIMEOUT_MS = 60_000;
 
 declare global {
   interface Window {
@@ -208,6 +245,15 @@ async function postFormData<T>(path: string, body: FormData, timeoutMs: number):
   } finally {
     window.clearTimeout(timeoutId);
   }
+}
+
+async function fetchJson<T>(path: string): Promise<T> {
+  const response = await fetch(path, { cache: "no-store" });
+  const data = (await response.json()) as T & { error?: string };
+  if (!response.ok) {
+    throw new Error(data.error || response.statusText);
+  }
+  return data;
 }
 
 const extractText = (message: AppendMessage) => {
@@ -305,14 +351,98 @@ export function App() {
   const [isLoadingModels, setIsLoadingModels] = useState(true);
   const [isChangingModel, setIsChangingModel] = useState(false);
   const [activeProvider, setActiveProvider] = useState<ProviderName>("ollama");
+  const [workspace, setWorkspace] = useState<WorkspaceState | null>(null);
+  const [projects, setProjects] = useState<ProjectRecord[]>([]);
+  const [activeProjectId, setActiveProjectId] = useState("");
+  const [activeChatId, setActiveChatId] = useState("");
+  const [workspaceError, setWorkspaceError] = useState("");
+  const [isWorkspaceLoading, setIsWorkspaceLoading] = useState(true);
+
+  const activeProject = projects.find((project) => project.id === activeProjectId) ?? projects[0] ?? null;
+  const activeChats = activeProject?.chats ?? [];
+  const activeChat = activeChats.find((chat) => chat.id === activeChatId) ?? activeChats[0] ?? null;
+
+  const loadWorkspace = useCallback(async () => {
+    setIsWorkspaceLoading(true);
+    setWorkspaceError("");
+    try {
+      const [workspaceData, projectData] = await Promise.all([
+        fetchJson<WorkspaceState>("/api/workspace"),
+        fetchJson<{ items: ProjectRecord[] }>("/api/projects")
+      ]);
+      setWorkspace(workspaceData);
+      setProjects(projectData.items);
+      const nextProjectId = workspaceData.active_project_id || projectData.items[0]?.id || "";
+      const nextProject = projectData.items.find((item) => item.id === nextProjectId) ?? projectData.items[0];
+      const nextChatId = workspaceData.active_chat_id || nextProject?.chats?.[0]?.id || "";
+      setActiveProjectId(nextProject?.id || "");
+      setActiveChatId(nextChatId);
+    } catch (error) {
+      setWorkspaceError(error instanceof Error ? error.message : "Не удалось загрузить workspace");
+    } finally {
+      setIsWorkspaceLoading(false);
+    }
+  }, []);
+
+  const refreshChats = useCallback(async (projectId?: string) => {
+    const targetProjectId = projectId || activeProjectId;
+    if (!targetProjectId) return;
+    const data = await fetchJson<{ items: ChatRecord[] }>(`/api/projects/${targetProjectId}/chats`);
+    setProjects((current) =>
+      current.map((project) => (project.id === targetProjectId ? { ...project, chats: data.items } : project))
+    );
+  }, [activeProjectId]);
+
+  const loadMessages = useCallback(async (chatId?: string) => {
+    const targetChatId = chatId || activeChatId;
+    if (!targetChatId) return;
+    const data = await fetchJson<{ items: MessageRecord[] }>(`/api/chats/${targetChatId}/messages`);
+    setMessages(
+      data.items.map((item) => ({
+        id: item.id,
+        role: item.role,
+        text: item.content,
+        html: item.content_html || undefined,
+        status: item.role === "assistant" ? (item.status === "running" ? "running" : item.status === "error" ? "error" : "complete") : "complete",
+        modelLabel: item.metadata?.model_label ? String(item.metadata.model_label) : undefined
+      }))
+    );
+  }, [activeChatId]);
+
+  const syncWorkspace = useCallback(async (nextProjectId: string, nextChatId: string) => {
+    const updated = await postJson<WorkspaceState>("/api/settings", {
+      active_project_id: nextProjectId,
+      active_chat_id: nextChatId,
+      settings: workspace?.settings ?? {}
+    }, API_TIMEOUT_MS);
+    setWorkspace(updated);
+  }, [workspace?.settings]);
+
+  const persistMessage = useCallback(async (chatId: string, payload: {
+    role: Role;
+    content: string;
+    content_html?: string;
+    status?: string;
+    metadata?: Record<string, unknown>;
+  }) => {
+    await postJson<MessageRecord>(`/api/chats/${chatId}/messages`, payload, API_TIMEOUT_MS);
+  }, []);
+
+  useEffect(() => {
+    if (!activeChatId) return;
+    void loadMessages(activeChatId);
+  }, [activeChatId, loadMessages]);
+
+  useEffect(() => {
+    if (!activeProjectId) return;
+    void refreshChats(activeProjectId);
+  }, [activeProjectId, refreshChats]);
 
   const loadModels = useCallback(async () => {
     setIsLoadingModels(true);
     setModelError("");
     try {
-      const response = await fetch("/api/models", { cache: "no-store" });
-      const data = (await response.json()) as ModelsResponse & { error?: string };
-      if (!response.ok) throw new Error(data.error || response.statusText);
+      const data = await fetchJson<ModelsResponse>("/api/models");
       setModels(data.models);
       setSelectedModel(data.selected);
     } catch (error) {
@@ -324,7 +454,8 @@ export function App() {
 
   useEffect(() => {
     void loadModels();
-  }, [loadModels]);
+    void loadWorkspace();
+  }, [loadModels, loadWorkspace]);
 
   const changeModel = useCallback(async (model: string) => {
     if (!model || model === selectedModel || isChangingModel || isRunning) return;
@@ -340,9 +471,52 @@ export function App() {
     }
   }, [isChangingModel, isRunning, selectedModel]);
 
+  const switchProject = useCallback(async (projectId: string) => {
+    const project = projects.find((item) => item.id === projectId);
+    if (!project) return;
+    const chatId = project.chats?.[0]?.id || "";
+    setActiveProjectId(projectId);
+    setActiveChatId(chatId);
+    await syncWorkspace(projectId, chatId);
+    if (chatId) {
+      await loadMessages(chatId);
+    } else {
+      setMessages([]);
+    }
+  }, [loadMessages, projects, syncWorkspace]);
+
+  const switchChat = useCallback(async (chatId: string) => {
+    if (!chatId) return;
+    setActiveChatId(chatId);
+    await syncWorkspace(activeProjectId, chatId);
+    await loadMessages(chatId);
+  }, [activeProjectId, loadMessages, syncWorkspace]);
+
+  const createProjectRecord = useCallback(async () => {
+    const created = await postJson<ProjectRecord>("/api/projects", { name: "Новый проект" }, API_TIMEOUT_MS);
+    const refreshed = await fetchJson<{ items: ProjectRecord[] }>("/api/projects");
+    setProjects(refreshed.items);
+    setActiveProjectId(created.id);
+    const chat = await postJson<ChatRecord>(`/api/projects/${created.id}/chats`, { title: "Новый чат" }, API_TIMEOUT_MS);
+    await refreshChats(created.id);
+    setActiveChatId(chat.id);
+    await syncWorkspace(created.id, chat.id);
+    setMessages([]);
+  }, [refreshChats, syncWorkspace]);
+
+  const createChatRecord = useCallback(async () => {
+    if (!activeProjectId) return;
+    const chat = await postJson<ChatRecord>(`/api/projects/${activeProjectId}/chats`, { title: "Новый чат" }, API_TIMEOUT_MS);
+    await refreshChats(activeProjectId);
+    setActiveChatId(chat.id);
+    await syncWorkspace(activeProjectId, chat.id);
+    setMessages([]);
+  }, [activeProjectId, refreshChats, syncWorkspace]);
+
   const onNew = useCallback(async (message: AppendMessage) => {
     const question = extractText(message);
     if (!question) return;
+    if (!activeChatId) return;
 
     const userMessage: ChatEntry = {
       id: createId(),
@@ -367,7 +541,15 @@ export function App() {
     setActiveTab("evidence");
 
     try {
+      await persistMessage(activeChatId, { role: "user", content: question });
       const data = await postJson<AskResponse>("/api/ask", { question }, ASK_TIMEOUT_MS);
+      await persistMessage(activeChatId, {
+        role: "assistant",
+        content: data.answer || "Пустой ответ.",
+        content_html: data.html_answer || "",
+        status: "complete",
+        metadata: { llm: data.llm, sources: data.sources, usage: data.usage }
+      });
 
       setLastResult(data);
       setMessages((current) =>
@@ -385,6 +567,7 @@ export function App() {
       );
     } catch (error) {
       const text = error instanceof Error ? error.message : "Ошибка запроса";
+      void persistMessage(activeChatId, { role: "assistant", content: text, status: "error" });
       setMessages((current) =>
         current.map((item) =>
           item.id === assistantId
@@ -399,7 +582,7 @@ export function App() {
     } finally {
       setIsRunning(false);
     }
-  }, []);
+  }, [activeChatId, persistMessage]);
 
   const adapter = useMemo<ExternalStoreAdapter<ChatEntry>>(
     () => ({
@@ -414,7 +597,8 @@ export function App() {
 
   const runtime = useExternalStoreRuntime(adapter);
 
-  const clearThread = () => {
+  const clearThread = async () => {
+    await createChatRecord();
     setMessages([]);
     setLastResult(null);
     setLastQuestion("");
@@ -471,10 +655,30 @@ export function App() {
               <div className="brand-subtitle">Ollama + Qdrant</div>
             </div>
           </div>
-          <button className="new-thread" onClick={clearThread} type="button">
+          <button className="new-thread" onClick={() => void clearThread()} type="button">
             <RotateCcw size={16} />
             Новый диалог
           </button>
+          <section className="workspace-switcher" aria-label="Workspace">
+            <div className="loader-title">
+              <Database size={15} />
+              <span>Workspace</span>
+            </div>
+            <select disabled={isWorkspaceLoading || !projects.length} value={activeProjectId} onChange={(event) => void switchProject(event.target.value)}>
+              {!projects.length ? <option value="">Нет проектов</option> : null}
+              {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+            </select>
+            <select disabled={isWorkspaceLoading || !activeChats.length} value={activeChatId} onChange={(event) => void switchChat(event.target.value)}>
+              {!activeChats.length ? <option value="">Нет чатов</option> : null}
+              {activeChats.map((chat) => <option key={chat.id} value={chat.id}>{chat.title}</option>)}
+            </select>
+            <div className="provider-actions">
+              <button type="button" onClick={() => void createProjectRecord()}><Files size={14} /> Проект</button>
+              <button type="button" onClick={() => void createChatRecord()}><Sparkles size={14} /> Чат</button>
+            </div>
+            {workspaceError ? <div className="provider-status">{workspaceError}</div> : null}
+            {workspace ? <div className="sidebar-note">Активный проект: {activeProject?.name ?? "нет"}</div> : null}
+          </section>
           <ProviderSettings models={models} onProviderChange={setActiveProvider} />
           <FlowModeSelector isRunning={isRunning} />
           <SystemPromptSelector isRunning={isRunning} />

@@ -1,0 +1,14 @@
+.git
+.github
+.venv
+__pycache__
+.ingestion_cache
+bm25_index*
+qdrant_storage
+tantivy_index
+target
+ui/node_modules
+ui/dist
+cache.db
+*.pyc
+.env

@@ -6,6 +6,7 @@ use qdrant_client::qdrant::{
 use qdrant_client::Qdrant;
 use serde_json::json;
 use std::collections::HashMap;
+use std::env;
 
 const COLLECTION: &str = "knowledge_base";
 pub const VECTOR_DIM: u64 = 384;
@@ -16,7 +17,9 @@ pub struct VectorStore {
 
 impl VectorStore {
     pub async fn new() -> Result<Self> {
-        let client = Qdrant::from_url("http://localhost:6334").build()?;
+        let qdrant_url = env::var("QDRANT_GRPC_URL")
+            .unwrap_or_else(|_| "http://localhost:6334".to_string());
+        let client = Qdrant::from_url(&qdrant_url).build()?;
         let store = Self { client };
         store.ensure_collection().await?;
         Ok(store)

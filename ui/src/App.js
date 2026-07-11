@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 const ASK_TIMEOUT_MS = 180000;
 const DEBUG_TIMEOUT_MS = 60000;
 const UPLOAD_TIMEOUT_MS = 300000;
+const API_TIMEOUT_MS = 60000;
 const createId = () => crypto.randomUUID();
 async function postJson(path, body, timeoutMs) {
     const controller = new AbortController();
@@ -56,6 +57,14 @@ async function postFormData(path, body, timeoutMs) {
     finally {
         window.clearTimeout(timeoutId);
     }
+}
+async function fetchJson(path) {
+    const response = await fetch(path, { cache: "no-store" });
+    const data = (await response.json());
+    if (!response.ok) {
+        throw new Error(data.error || response.statusText);
+    }
+    return data;
 }
 const extractText = (message) => {
     const content = message.content;
@@ -146,14 +155,85 @@ export function App() {
     const [isLoadingModels, setIsLoadingModels] = useState(true);
     const [isChangingModel, setIsChangingModel] = useState(false);
     const [activeProvider, setActiveProvider] = useState("ollama");
+    const [workspace, setWorkspace] = useState(null);
+    const [projects, setProjects] = useState([]);
+    const [activeProjectId, setActiveProjectId] = useState("");
+    const [activeChatId, setActiveChatId] = useState("");
+    const [workspaceError, setWorkspaceError] = useState("");
+    const [isWorkspaceLoading, setIsWorkspaceLoading] = useState(true);
+    const activeProject = projects.find((project) => project.id === activeProjectId) ?? projects[0] ?? null;
+    const activeChats = activeProject?.chats ?? [];
+    const activeChat = activeChats.find((chat) => chat.id === activeChatId) ?? activeChats[0] ?? null;
+    const loadWorkspace = useCallback(async () => {
+        setIsWorkspaceLoading(true);
+        setWorkspaceError("");
+        try {
+            const [workspaceData, projectData] = await Promise.all([
+                fetchJson("/api/workspace"),
+                fetchJson("/api/projects")
+            ]);
+            setWorkspace(workspaceData);
+            setProjects(projectData.items);
+            const nextProjectId = workspaceData.active_project_id || projectData.items[0]?.id || "";
+            const nextProject = projectData.items.find((item) => item.id === nextProjectId) ?? projectData.items[0];
+            const nextChatId = workspaceData.active_chat_id || nextProject?.chats?.[0]?.id || "";
+            setActiveProjectId(nextProject?.id || "");
+            setActiveChatId(nextChatId);
+        }
+        catch (error) {
+            setWorkspaceError(error instanceof Error ? error.message : "Не удалось загрузить workspace");
+        }
+        finally {
+            setIsWorkspaceLoading(false);
+        }
+    }, []);
+    const refreshChats = useCallback(async (projectId) => {
+        const targetProjectId = projectId || activeProjectId;
+        if (!targetProjectId)
+            return;
+        const data = await fetchJson(`/api/projects/${targetProjectId}/chats`);
+        setProjects((current) => current.map((project) => (project.id === targetProjectId ? { ...project, chats: data.items } : project)));
+    }, [activeProjectId]);
+    const loadMessages = useCallback(async (chatId) => {
+        const targetChatId = chatId || activeChatId;
+        if (!targetChatId)
+            return;
+        const data = await fetchJson(`/api/chats/${targetChatId}/messages`);
+        setMessages(data.items.map((item) => ({
+            id: item.id,
+            role: item.role,
+            text: item.content,
+            html: item.content_html || undefined,
+            status: item.role === "assistant" ? (item.status === "running" ? "running" : item.status === "error" ? "error" : "complete") : "complete",
+            modelLabel: item.metadata?.model_label ? String(item.metadata.model_label) : undefined
+        })));
+    }, [activeChatId]);
+    const syncWorkspace = useCallback(async (nextProjectId, nextChatId) => {
+        const updated = await postJson("/api/settings", {
+            active_project_id: nextProjectId,
+            active_chat_id: nextChatId,
+            settings: workspace?.settings ?? {}
+        }, API_TIMEOUT_MS);
+        setWorkspace(updated);
+    }, [workspace?.settings]);
+    const persistMessage = useCallback(async (chatId, payload) => {
+        await postJson(`/api/chats/${chatId}/messages`, payload, API_TIMEOUT_MS);
+    }, []);
+    useEffect(() => {
+        if (!activeChatId)
+            return;
+        void loadMessages(activeChatId);
+    }, [activeChatId, loadMessages]);
+    useEffect(() => {
+        if (!activeProjectId)
+            return;
+        void refreshChats(activeProjectId);
+    }, [activeProjectId, refreshChats]);
     const loadModels = useCallback(async () => {
         setIsLoadingModels(true);
         setModelError("");
         try {
-            const response = await fetch("/api/models", { cache: "no-store" });
-            const data = (await response.json());
-            if (!response.ok)
-                throw new Error(data.error || response.statusText);
+            const data = await fetchJson("/api/models");
             setModels(data.models);
             setSelectedModel(data.selected);
         }
@@ -166,7 +246,8 @@ export function App() {
     }, []);
     useEffect(() => {
         void loadModels();
-    }, [loadModels]);
+        void loadWorkspace();
+    }, [loadModels, loadWorkspace]);
     const changeModel = useCallback(async (model) => {
         if (!model || model === selectedModel || isChangingModel || isRunning)
             return;
@@ -183,9 +264,53 @@ export function App() {
             setIsChangingModel(false);
         }
     }, [isChangingModel, isRunning, selectedModel]);
+    const switchProject = useCallback(async (projectId) => {
+        const project = projects.find((item) => item.id === projectId);
+        if (!project)
+            return;
+        const chatId = project.chats?.[0]?.id || "";
+        setActiveProjectId(projectId);
+        setActiveChatId(chatId);
+        await syncWorkspace(projectId, chatId);
+        if (chatId) {
+            await loadMessages(chatId);
+        }
+        else {
+            setMessages([]);
+        }
+    }, [loadMessages, projects, syncWorkspace]);
+    const switchChat = useCallback(async (chatId) => {
+        if (!chatId)
+            return;
+        setActiveChatId(chatId);
+        await syncWorkspace(activeProjectId, chatId);
+        await loadMessages(chatId);
+    }, [activeProjectId, loadMessages, syncWorkspace]);
+    const createProjectRecord = useCallback(async () => {
+        const created = await postJson("/api/projects", { name: "Новый проект" }, API_TIMEOUT_MS);
+        const refreshed = await fetchJson("/api/projects");
+        setProjects(refreshed.items);
+        setActiveProjectId(created.id);
+        const chat = await postJson(`/api/projects/${created.id}/chats`, { title: "Новый чат" }, API_TIMEOUT_MS);
+        await refreshChats(created.id);
+        setActiveChatId(chat.id);
+        await syncWorkspace(created.id, chat.id);
+        setMessages([]);
+    }, [refreshChats, syncWorkspace]);
+    const createChatRecord = useCallback(async () => {
+        if (!activeProjectId)
+            return;
+        const chat = await postJson(`/api/projects/${activeProjectId}/chats`, { title: "Новый чат" }, API_TIMEOUT_MS);
+        await refreshChats(activeProjectId);
+        setActiveChatId(chat.id);
+        await syncWorkspace(activeProjectId, chat.id);
+        setMessages([]);
+    }, [activeProjectId, refreshChats, syncWorkspace]);
     const onNew = useCallback(async (message) => {
         const question = extractText(message);
         if (!question)
+            return;
+        if (!activeChatId)
             return;
         const userMessage = {
             id: createId(),
@@ -208,7 +333,15 @@ export function App() {
         setDebugError("");
         setActiveTab("evidence");
         try {
+            await persistMessage(activeChatId, { role: "user", content: question });
             const data = await postJson("/api/ask", { question }, ASK_TIMEOUT_MS);
+            await persistMessage(activeChatId, {
+                role: "assistant",
+                content: data.answer || "Пустой ответ.",
+                content_html: data.html_answer || "",
+                status: "complete",
+                metadata: { llm: data.llm, sources: data.sources, usage: data.usage }
+            });
             setLastResult(data);
             setMessages((current) => current.map((item) => item.id === assistantId
                 ? {
@@ -222,6 +355,7 @@ export function App() {
         }
         catch (error) {
             const text = error instanceof Error ? error.message : "Ошибка запроса";
+            void persistMessage(activeChatId, { role: "assistant", content: text, status: "error" });
             setMessages((current) => current.map((item) => item.id === assistantId
                 ? {
                     ...item,
@@ -233,7 +367,7 @@ export function App() {
         finally {
             setIsRunning(false);
         }
-    }, []);
+    }, [activeChatId, persistMessage]);
     const adapter = useMemo(() => ({
         messages,
         isRunning,
@@ -242,7 +376,8 @@ export function App() {
         convertMessage: toThreadMessage
     }), [messages, isRunning, onNew]);
     const runtime = useExternalStoreRuntime(adapter);
-    const clearThread = () => {
+    const clearThread = async () => {
+        await createChatRecord();
         setMessages([]);
         setLastResult(null);
         setLastQuestion("");
@@ -286,7 +421,7 @@ export function App() {
             setIsUploading(false);
         }
     }, [isUploading, selectedFiles]);
-    return (_jsx(AssistantRuntimeProvider, { runtime: runtime, children: _jsxs("main", { className: "app-shell", children: [_jsxs("aside", { className: "sidebar", children: [_jsxs("div", { className: "brand", children: [_jsx("div", { className: "brand-mark", children: _jsx(Sparkles, { size: 18 }) }), _jsxs("div", { children: [_jsx("div", { className: "brand-title", children: "RAG Assistant" }), _jsx("div", { className: "brand-subtitle", children: "Ollama + Qdrant" })] })] }), _jsxs("button", { className: "new-thread", onClick: clearThread, type: "button", children: [_jsx(RotateCcw, { size: 16 }), "\u041D\u043E\u0432\u044B\u0439 \u0434\u0438\u0430\u043B\u043E\u0433"] }), _jsx(ProviderSettings, { models: models, onProviderChange: setActiveProvider }), _jsx(FlowModeSelector, { isRunning: isRunning }), _jsx(SystemPromptSelector, { isRunning: isRunning }), activeProvider === "ollama" ? (_jsx(ModelSelector, { error: modelError, isChanging: isChangingModel, isLoading: isLoadingModels, isRunning: isRunning, models: models, selectedModel: selectedModel, onChange: changeModel, onRefresh: loadModels })) : null, _jsx(KnowledgeLoader, { error: uploadError, isUploading: isUploading, result: uploadResult, selectedFiles: selectedFiles, onFilesChange: setSelectedFiles, onUpload: uploadFiles }), _jsx("div", { className: "sidebar-note", children: "\u0418\u043D\u0442\u0435\u0440\u0444\u0435\u0439\u0441 \u0440\u0430\u0431\u043E\u0442\u0430\u0435\u0442 \u0447\u0435\u0440\u0435\u0437 assistant-ui \u0438 \u043B\u043E\u043A\u0430\u043B\u044C\u043D\u044B\u0439 backend 127.0.0.1:8080." })] }), _jsx("section", { className: "chat-surface", children: _jsx(Thread, {}) }), _jsx(EvidencePanel, { activeTab: activeTab, debugError: debugError, debugResult: debugResult, isDebugging: isDebugging, lastQuestion: lastQuestion, result: lastResult, onDebug: runDebug, onTabChange: setActiveTab })] }) }));
+    return (_jsx(AssistantRuntimeProvider, { runtime: runtime, children: _jsxs("main", { className: "app-shell", children: [_jsxs("aside", { className: "sidebar", children: [_jsxs("div", { className: "brand", children: [_jsx("div", { className: "brand-mark", children: _jsx(Sparkles, { size: 18 }) }), _jsxs("div", { children: [_jsx("div", { className: "brand-title", children: "RAG Assistant" }), _jsx("div", { className: "brand-subtitle", children: "Ollama + Qdrant" })] })] }), _jsxs("button", { className: "new-thread", onClick: () => void clearThread(), type: "button", children: [_jsx(RotateCcw, { size: 16 }), "\u041D\u043E\u0432\u044B\u0439 \u0434\u0438\u0430\u043B\u043E\u0433"] }), _jsxs("section", { className: "workspace-switcher", "aria-label": "Workspace", children: [_jsxs("div", { className: "loader-title", children: [_jsx(Database, { size: 15 }), _jsx("span", { children: "Workspace" })] }), _jsxs("select", { disabled: isWorkspaceLoading || !projects.length, value: activeProjectId, onChange: (event) => void switchProject(event.target.value), children: [!projects.length ? _jsx("option", { value: "", children: "\u041D\u0435\u0442 \u043F\u0440\u043E\u0435\u043A\u0442\u043E\u0432" }) : null, projects.map((project) => _jsx("option", { value: project.id, children: project.name }, project.id))] }), _jsxs("select", { disabled: isWorkspaceLoading || !activeChats.length, value: activeChatId, onChange: (event) => void switchChat(event.target.value), children: [!activeChats.length ? _jsx("option", { value: "", children: "\u041D\u0435\u0442 \u0447\u0430\u0442\u043E\u0432" }) : null, activeChats.map((chat) => _jsx("option", { value: chat.id, children: chat.title }, chat.id))] }), _jsxs("div", { className: "provider-actions", children: [_jsxs("button", { type: "button", onClick: () => void createProjectRecord(), children: [_jsx(Files, { size: 14 }), " \u041F\u0440\u043E\u0435\u043A\u0442"] }), _jsxs("button", { type: "button", onClick: () => void createChatRecord(), children: [_jsx(Sparkles, { size: 14 }), " \u0427\u0430\u0442"] })] }), workspaceError ? _jsx("div", { className: "provider-status", children: workspaceError }) : null, workspace ? _jsxs("div", { className: "sidebar-note", children: ["\u0410\u043A\u0442\u0438\u0432\u043D\u044B\u0439 \u043F\u0440\u043E\u0435\u043A\u0442: ", activeProject?.name ?? "нет"] }) : null] }), _jsx(ProviderSettings, { models: models, onProviderChange: setActiveProvider }), _jsx(FlowModeSelector, { isRunning: isRunning }), _jsx(SystemPromptSelector, { isRunning: isRunning }), activeProvider === "ollama" ? (_jsx(ModelSelector, { error: modelError, isChanging: isChangingModel, isLoading: isLoadingModels, isRunning: isRunning, models: models, selectedModel: selectedModel, onChange: changeModel, onRefresh: loadModels })) : null, _jsx(KnowledgeLoader, { error: uploadError, isUploading: isUploading, result: uploadResult, selectedFiles: selectedFiles, onFilesChange: setSelectedFiles, onUpload: uploadFiles }), _jsx("div", { className: "sidebar-note", children: "\u0418\u043D\u0442\u0435\u0440\u0444\u0435\u0439\u0441 \u0440\u0430\u0431\u043E\u0442\u0430\u0435\u0442 \u0447\u0435\u0440\u0435\u0437 assistant-ui \u0438 \u043B\u043E\u043A\u0430\u043B\u044C\u043D\u044B\u0439 backend 127.0.0.1:8080." })] }), _jsx("section", { className: "chat-surface", children: _jsx(Thread, {}) }), _jsx(EvidencePanel, { activeTab: activeTab, debugError: debugError, debugResult: debugResult, isDebugging: isDebugging, lastQuestion: lastQuestion, result: lastResult, onDebug: runDebug, onTabChange: setActiveTab })] }) }));
 }
 function FlowModeSelector({ isRunning }) {
     const [mode, setMode] = useState("python");

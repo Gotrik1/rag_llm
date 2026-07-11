@@ -55,6 +55,12 @@ class WorkspacePersistenceIntegrationTests(unittest.TestCase):
             self.assertEqual(project["memory"], {"text": "Integration memory"})
             project_id = project["id"]
 
+            status, project = self.request_json("PATCH", f"/api/projects/{project_id}", {
+                "name": f"renamed-project-{suffix}",
+            })
+            self.assertEqual(status, 200)
+            self.assertEqual(project["name"], f"renamed-project-{suffix}")
+
             status, chat = self.request_json("POST", f"/api/projects/{project_id}/chats", {
                 "title": f"integration-chat-{suffix}",
                 "mode": "python",
@@ -62,6 +68,12 @@ class WorkspacePersistenceIntegrationTests(unittest.TestCase):
             self.assertEqual(status, 201)
             self.assertEqual(chat["project_id"], project_id)
             chat_id = chat["id"]
+
+            status, chat = self.request_json("PATCH", f"/api/chats/{chat_id}", {
+                "title": f"renamed-chat-{suffix}",
+            })
+            self.assertEqual(status, 200)
+            self.assertEqual(chat["title"], f"renamed-chat-{suffix}")
 
             status, workspace = self.request_json("POST", "/api/settings", {
                 "active_project_id": project_id,

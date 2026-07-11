@@ -25,6 +25,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Paintbrush,
+  Pencil,
   Pin,
   Plus,
   RefreshCw,
@@ -39,7 +40,7 @@ import {
   User,
   X
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { getJson, patchJson, postFormData, postJson } from "./api";
 
 type Role = "user" | "assistant";
@@ -502,6 +503,32 @@ export function App() {
     }
   }, [activeProjectId, projects]);
 
+  const renameProject = useCallback(async (projectId: string) => {
+    const project = projects.find((item) => item.id === projectId);
+    if (!project) return;
+    const name = window.prompt("Название проекта", project.name)?.trim();
+    if (!name || name === project.name) return;
+    try {
+      const record = await patchJson<ProjectRecord>(`/api/projects/${projectId}`, { name }, API_TIMEOUT_MS);
+      setProjects((current) => current.map((item) => item.id === projectId ? projectFromRecord(record) : item));
+    } catch (error) {
+      setWorkspaceError(error instanceof Error ? error.message : "Не удалось переименовать проект");
+    }
+  }, [projects]);
+
+  const renameChat = useCallback(async (chatId: string) => {
+    const chat = chats.find((item) => item.id === chatId);
+    if (!chat) return;
+    const title = window.prompt("Название чата", chat.title)?.trim();
+    if (!title || title === chat.title) return;
+    try {
+      const record = await patchJson<ChatRecord>(`/api/chats/${chatId}`, { title }, API_TIMEOUT_MS);
+      setChats((current) => current.map((item) => item.id === chatId ? chatFromRecord(record) : item));
+    } catch (error) {
+      setWorkspaceError(error instanceof Error ? error.message : "Не удалось переименовать чат");
+    }
+  }, [chats]);
+
   const onNew = useCallback(async (message: AppendMessage) => {
     const question = extractText(message);
     if (!question || !activeChatId) return;
@@ -665,8 +692,10 @@ export function App() {
             chats={chats}
             projects={projects}
             onChatChange={(chat) => void openChat(chat)}
+            onChatRename={(chatId) => void renameChat(chatId)}
             onProjectChange={(projectId) => void selectProject(projectId)}
             onProjectCreate={() => void createProject()}
+            onProjectRename={(projectId) => void renameProject(projectId)}
           />
           {workspaceError && <div className="sidebar-note">{workspaceError}</div>}
         </aside>
@@ -715,15 +744,19 @@ function NavigationSidebar({
   chats,
   projects,
   onChatChange,
+  onChatRename,
   onProjectChange,
-  onProjectCreate
+  onProjectCreate,
+  onProjectRename
 }: {
   activeProjectId: string;
   chats: ChatSummary[];
   projects: Project[];
   onChatChange: (chat: ChatSummary) => void;
+  onChatRename: (chatId: string) => void;
   onProjectChange: (projectId: string) => void;
   onProjectCreate: () => void;
+  onProjectRename: (projectId: string) => void;
 }) {
   const [showAllProjects, setShowAllProjects] = useState(false);
   const visibleProjects = showAllProjects ? projects : projects.slice(0, 5);
@@ -735,16 +768,14 @@ function NavigationSidebar({
         <div className="nav-section-title">Закреплённые</div>
         <div className="project-list pinned-list">
           {pinnedProjects.map((project) => (
-            <button
-              className={`nav-item ${project.id === activeProjectId ? "active" : ""}`}
+            <NavigationItem
+              active={project.id === activeProjectId}
+              icon={<Folder size={17} />}
               key={project.id}
-              onClick={() => onProjectChange(project.id)}
-              type="button"
-            >
-              <Folder size={17} />
-              <span>{project.name}</span>
-              <span className="nav-pin" title="Закрепить"><Pin size={15} /></span>
-            </button>
+              label={project.name}
+              onOpen={() => onProjectChange(project.id)}
+              onRename={() => onProjectRename(project.id)}
+            />
           ))}
         </div>
       </section>
@@ -756,16 +787,14 @@ function NavigationSidebar({
         </div>
         <div className="project-list">
           {visibleProjects.map((project) => (
-            <button
-              className={`nav-item ${project.id === activeProjectId ? "active" : ""}`}
+            <NavigationItem
+              active={project.id === activeProjectId}
+              icon={<Folder size={17} />}
               key={project.id}
-              onClick={() => onProjectChange(project.id)}
-              type="button"
-            >
-              <Folder size={17} />
-              <span>{project.name}</span>
-              <span className="nav-pin" title="Закрепить"><Pin size={15} /></span>
-            </button>
+              label={project.name}
+              onOpen={() => onProjectChange(project.id)}
+              onRename={() => onProjectRename(project.id)}
+            />
           ))}
         </div>
         {projects.length > 5 ? (
@@ -779,15 +808,47 @@ function NavigationSidebar({
         <div className="nav-section-title">Чаты</div>
         <div className="sidebar-chat-list">
           {chats.length ? chats.map((chat) => (
-            <button className="nav-item chat-nav-item" key={chat.id} onClick={() => onChatChange(chat)} type="button">
-              <MessageSquare size={16} />
-              <span>{chat.title}</span>
-              <span className="nav-pin" title="Закрепить"><Pin size={15} /></span>
-            </button>
+            <NavigationItem
+              chat
+              icon={<MessageSquare size={16} />}
+              key={chat.id}
+              label={chat.title}
+              onOpen={() => onChatChange(chat)}
+              onRename={() => onChatRename(chat.id)}
+            />
           )) : <div className="sidebar-empty">История появится после первого вопроса.</div>}
         </div>
       </section>
     </nav>
+  );
+}
+
+function NavigationItem({
+  active = false,
+  chat = false,
+  icon,
+  label,
+  onOpen,
+  onRename
+}: {
+  active?: boolean;
+  chat?: boolean;
+  icon: ReactNode;
+  label: string;
+  onOpen: () => void;
+  onRename: () => void;
+}) {
+  return (
+    <div className="nav-row">
+      <button className={`nav-item ${chat ? "chat-nav-item" : ""} ${active ? "active" : ""}`} onClick={onOpen} type="button">
+        {icon}
+        <span>{label}</span>
+        <span className="nav-pin" title="Закрепить"><Pin size={15} /></span>
+      </button>
+      <button className="nav-rename" onClick={onRename} title="Переименовать" type="button">
+        <Pencil size={14} />
+      </button>
+    </div>
   );
 }
 

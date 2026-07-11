@@ -216,6 +216,40 @@ textarea {
   margin-top: 10px;
 }
 
+.nav-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 2px;
+}
+
+.nav-row .nav-item {
+  flex: 1 1 auto;
+}
+
+.nav-rename {
+  display: none;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #aeb5be;
+  cursor: pointer;
+}
+
+.nav-row:hover .nav-rename,
+.nav-rename:focus-visible {
+  display: grid;
+}
+
+.nav-rename:hover {
+  background: #1c1c1c;
+  color: #fff;
+}
+
 .nav-item {
   display: flex;
   min-width: 0;
@@ -274,7 +308,6 @@ textarea {
 }
 
 .chat-nav-item {
-  display: block;
   padding-left: 5px;
 }
 
@@ -1278,6 +1311,15 @@ sub {
   color: #d96548;
 }
 
+.theme-portal .nav-rename {
+  color: #f28a32;
+}
+
+.theme-portal .nav-rename:hover {
+  background: var(--sidebar-hover-bg);
+  color: var(--sidebar-hover-text);
+}
+
 .theme-portal .nav-add-project:hover {
   background: var(--sidebar-hover-bg);
   color: var(--sidebar-hover-text);
@@ -1576,6 +1618,7 @@ sub {
   .app-shell.sidebar-collapsed .new-thread > span:not(.new-thread-icon),
   .app-shell.sidebar-collapsed .nav-section-title,
   .app-shell.sidebar-collapsed .nav-item span,
+  .app-shell.sidebar-collapsed .nav-rename,
   .app-shell.sidebar-collapsed .show-more,
   .app-shell.sidebar-collapsed .sidebar-empty {
     display: none;

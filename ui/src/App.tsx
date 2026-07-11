@@ -20,16 +20,24 @@ import {
   Cpu,
   FileText,
   Files,
+  Folder,
   PanelRight,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Paintbrush,
+  Pin,
+  Plus,
   RefreshCw,
-  RotateCcw,
   Save,
   Send,
+  Settings2,
   Sigma,
   Sparkles,
+  MessageSquare,
   TestTube2,
   UploadCloud,
-  User
+  User,
+  X
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -137,7 +145,33 @@ type SystemPromptsResponse = {
 
 type FlowMode = "python" | "rust" | "hybrid";
 
-type PanelTab = "evidence" | "sources" | "debug";
+type PanelTab = "system" | "evidence" | "sources" | "debug";
+type AppTheme = "default" | "portal";
+
+type Project = {
+  id: string;
+  name: string;
+  memory: string;
+};
+
+type ChatSummary = {
+  id: string;
+  projectId: string;
+  title: string;
+  updatedAt: number;
+  messages: ChatEntry[];
+};
+
+const DEFAULT_PROJECT: Project = {
+  id: "regulations",
+  name: "Регламенты",
+  memory: "Точный поиск по пунктам регламентов. Формулы и источники показывать явно."
+};
+
+const PROJECTS_KEY = "rag-assistant-projects";
+const CHATS_KEY = "rag-assistant-chats";
+const THEME_KEY = "rag-assistant-theme";
+const SIDEBAR_COLLAPSED_KEY = "rag-assistant-sidebar-collapsed";
 
 const ASK_TIMEOUT_MS = 180_000;
 const DEBUG_TIMEOUT_MS = 60_000;
@@ -158,6 +192,15 @@ declare global {
 }
 
 const createId = () => crypto.randomUUID();
+
+function readStored<T>(key: string, fallback: T): T {
+  try {
+    const value = window.localStorage.getItem(key);
+    return value ? (JSON.parse(value) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 async function postJson<T>(path: string, body: unknown, timeoutMs: number): Promise<T> {
   const controller = new AbortController();
@@ -294,7 +337,11 @@ export function App() {
   const [debugResult, setDebugResult] = useState<DebugResponse | null>(null);
   const [debugError, setDebugError] = useState("");
   const [isDebugging, setIsDebugging] = useState(false);
-  const [activeTab, setActiveTab] = useState<PanelTab>("evidence");
+  const [activeTab, setActiveTab] = useState<PanelTab>("system");
+  const [projects, setProjects] = useState<Project[]>(() => readStored(PROJECTS_KEY, [DEFAULT_PROJECT]));
+  const [activeProjectId, setActiveProjectId] = useState(DEFAULT_PROJECT.id);
+  const [chats, setChats] = useState<ChatSummary[]>(() => readStored(CHATS_KEY, []));
+  const [activeChatId, setActiveChatId] = useState<string>(() => createId());
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [uploadResult, setUploadResult] = useState<UploadResponse | null>(null);
   const [uploadError, setUploadError] = useState("");
@@ -305,6 +352,42 @@ export function App() {
   const [isLoadingModels, setIsLoadingModels] = useState(true);
   const [isChangingModel, setIsChangingModel] = useState(false);
   const [activeProvider, setActiveProvider] = useState<ProviderName>("ollama");
+  const [theme, setTheme] = useState<AppTheme>(() => window.localStorage.getItem(THEME_KEY) === "portal" ? "portal" : "default");
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => readStored(SIDEBAR_COLLAPSED_KEY, false));
+
+  const activeProject = projects.find((project) => project.id === activeProjectId) ?? DEFAULT_PROJECT;
+
+  useEffect(() => {
+    window.localStorage.setItem(PROJECTS_KEY, JSON.stringify(projects));
+  }, [projects]);
+
+  useEffect(() => {
+    window.localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
+
+  useEffect(() => {
+    window.localStorage.setItem(SIDEBAR_COLLAPSED_KEY, JSON.stringify(isSidebarCollapsed));
+  }, [isSidebarCollapsed]);
+
+  useEffect(() => {
+    if (!messages.length) return;
+    setChats((current) => {
+      const existing = current.find((chat) => chat.id === activeChatId);
+      const firstQuestion = messages.find((message) => message.role === "user")?.text;
+      const nextChat: ChatSummary = {
+        id: activeChatId,
+        projectId: activeProjectId,
+        title: existing?.title && existing.title !== "Новый диалог"
+          ? existing.title
+          : (firstQuestion?.slice(0, 48) || "Новый диалог"),
+        updatedAt: Date.now(),
+        messages
+      };
+      const next = [nextChat, ...current.filter((chat) => chat.id !== activeChatId)].slice(0, 30);
+      window.localStorage.setItem(CHATS_KEY, JSON.stringify(next));
+      return next;
+    });
+  }, [activeChatId, activeProjectId, messages]);
 
   const loadModels = useCallback(async () => {
     setIsLoadingModels(true);
@@ -364,7 +447,7 @@ export function App() {
     setLastQuestion(question);
     setDebugResult(null);
     setDebugError("");
-    setActiveTab("evidence");
+    setActiveTab("system");
 
     try {
       const data = await postJson<AskResponse>("/api/ask", { question }, ASK_TIMEOUT_MS);
@@ -415,11 +498,33 @@ export function App() {
   const runtime = useExternalStoreRuntime(adapter);
 
   const clearThread = () => {
+    setActiveChatId(createId());
     setMessages([]);
     setLastResult(null);
     setLastQuestion("");
     setDebugResult(null);
     setDebugError("");
+    setActiveTab("system");
+  };
+
+  const openChat = (chat: ChatSummary) => {
+    setActiveChatId(chat.id);
+    setActiveProjectId(chat.projectId);
+    setMessages(chat.messages);
+    setLastResult(null);
+    setLastQuestion(chat.messages.filter((message) => message.role === "user").slice(-1)[0]?.text ?? "");
+    setDebugResult(null);
+    setDebugError("");
+    setActiveTab("system");
+  };
+
+  const createProject = () => {
+    const name = window.prompt("Название проекта", "Новый проект")?.trim();
+    if (!name) return;
+    const project = { id: createId(), name, memory: "Память проекта пока пуста." };
+    setProjects((current) => [...current, project]);
+    setActiveProjectId(project.id);
+    clearThread();
   };
 
   const runDebug = useCallback(async () => {
@@ -460,48 +565,31 @@ export function App() {
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
-      <main className="app-shell">
+      <main className={`app-shell theme-${theme} ${isSidebarCollapsed ? "sidebar-collapsed" : ""}`}>
         <aside className="sidebar">
-          <div className="brand">
-            <div className="brand-mark">
-              <Sparkles size={18} />
-            </div>
-            <div>
-              <div className="brand-title">RAG Assistant</div>
-              <div className="brand-subtitle">Ollama + Qdrant</div>
-            </div>
+          <div className="sidebar-topbar">
+            <div className="sidebar-title">AI ИАС Энергобаланс</div>
+            <button
+              className="sidebar-collapse"
+              onClick={() => setIsSidebarCollapsed((value) => !value)}
+              title={isSidebarCollapsed ? "Развернуть левый сайдбар" : "Свернуть левый сайдбар"}
+              type="button"
+            >
+              {isSidebarCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
+            </button>
           </div>
           <button className="new-thread" onClick={clearThread} type="button">
-            <RotateCcw size={16} />
-            Новый диалог
+            <span className="new-thread-icon"><Plus size={16} /></span>
+            <span>Новый диалог</span>
           </button>
-          <ProviderSettings models={models} onProviderChange={setActiveProvider} />
-          <FlowModeSelector isRunning={isRunning} />
-          <SystemPromptSelector isRunning={isRunning} />
-          {activeProvider === "ollama" ? (
-            <ModelSelector
-              error={modelError}
-              isChanging={isChangingModel}
-              isLoading={isLoadingModels}
-              isRunning={isRunning}
-              models={models}
-              selectedModel={selectedModel}
-              onChange={changeModel}
-              onRefresh={loadModels}
-            />
-          ) : null}
-          <KnowledgeLoader
-            error={uploadError}
-            isUploading={isUploading}
-            result={uploadResult}
-            selectedFiles={selectedFiles}
-            onFilesChange={setSelectedFiles}
-            onUpload={uploadFiles}
+          <NavigationSidebar
+            activeProjectId={activeProjectId}
+            chats={chats}
+            projects={projects}
+            onChatChange={openChat}
+            onProjectChange={(projectId) => { setActiveProjectId(projectId); clearThread(); }}
+            onProjectCreate={createProject}
           />
-          <div className="sidebar-note">
-            Интерфейс работает через assistant-ui и локальный backend
-            127.0.0.1:8080.
-          </div>
         </aside>
 
         <section className="chat-surface">
@@ -510,16 +598,117 @@ export function App() {
 
         <EvidencePanel
           activeTab={activeTab}
+          activeProject={activeProject}
+          activeProvider={activeProvider}
+          theme={theme}
           debugError={debugError}
           debugResult={debugResult}
           isDebugging={isDebugging}
+          isChangingModel={isChangingModel}
+          isLoadingModels={isLoadingModels}
+          isRunning={isRunning}
           lastQuestion={lastQuestion}
+          modelError={modelError}
+          models={models}
           result={lastResult}
+          selectedModel={selectedModel}
+          onChangeModel={changeModel}
           onDebug={runDebug}
+          error={uploadError}
+          isUploading={isUploading}
+          onProviderSettingsChange={setActiveProvider}
+          onProjectMemoryChange={(memory) => setProjects((current) => current.map((project) => project.id === activeProject.id ? { ...project, memory } : project))}
+          onRefreshModels={loadModels}
           onTabChange={setActiveTab}
+          onThemeChange={setTheme}
+          selectedFiles={selectedFiles}
+          uploadResult={uploadResult}
+          onFilesChange={setSelectedFiles}
+          onUpload={uploadFiles}
         />
       </main>
     </AssistantRuntimeProvider>
+  );
+}
+
+function NavigationSidebar({
+  activeProjectId,
+  chats,
+  projects,
+  onChatChange,
+  onProjectChange,
+  onProjectCreate
+}: {
+  activeProjectId: string;
+  chats: ChatSummary[];
+  projects: Project[];
+  onChatChange: (chat: ChatSummary) => void;
+  onProjectChange: (projectId: string) => void;
+  onProjectCreate: () => void;
+}) {
+  const [showAllProjects, setShowAllProjects] = useState(false);
+  const visibleProjects = showAllProjects ? projects : projects.slice(0, 5);
+  const pinnedProjects = projects.slice(0, 2);
+
+  return (
+    <nav className="navigation-sidebar" aria-label="Проекты и чаты">
+      <section className="nav-section">
+        <div className="nav-section-title">Закреплённые</div>
+        <div className="project-list pinned-list">
+          {pinnedProjects.map((project) => (
+            <button
+              className={`nav-item ${project.id === activeProjectId ? "active" : ""}`}
+              key={project.id}
+              onClick={() => onProjectChange(project.id)}
+              type="button"
+            >
+              <Folder size={17} />
+              <span>{project.name}</span>
+              <span className="nav-pin" title="Закрепить"><Pin size={15} /></span>
+            </button>
+          ))}
+        </div>
+      </section>
+
+      <section className="nav-section">
+        <div className="nav-section-header">
+          <div className="nav-section-title">Проекты</div>
+          <button className="nav-add-project" onClick={onProjectCreate} title="Новый проект" type="button"><Plus size={15} /></button>
+        </div>
+        <div className="project-list">
+          {visibleProjects.map((project) => (
+            <button
+              className={`nav-item ${project.id === activeProjectId ? "active" : ""}`}
+              key={project.id}
+              onClick={() => onProjectChange(project.id)}
+              type="button"
+            >
+              <Folder size={17} />
+              <span>{project.name}</span>
+              <span className="nav-pin" title="Закрепить"><Pin size={15} /></span>
+            </button>
+          ))}
+        </div>
+        {projects.length > 5 ? (
+          <button className="show-more" onClick={() => setShowAllProjects((value) => !value)} type="button">
+            {showAllProjects ? "Скрыть" : "Показать еще"}
+          </button>
+        ) : null}
+      </section>
+
+      <section className="nav-section chats-section">
+        <div className="nav-section-title">Чаты</div>
+        <div className="sidebar-chat-list">
+          {chats.length ? chats.map((chat) => (
+            <button className="nav-item chat-nav-item" key={chat.id} onClick={() => onChatChange(chat)} type="button">
+              <MessageSquare size={16} />
+              <span>{chat.title}</span>
+              <span className="nav-pin" title="Закрепить"><Pin size={15} /></span>
+            </button>
+          )) : <div className="sidebar-empty">История появится после первого вопроса.</div>}
+        </div>
+      </section>
+    </nav>
   );
 }
 
@@ -916,31 +1105,86 @@ function Composer() {
 
 function EvidencePanel({
   activeTab,
+  activeProject,
+  activeProvider,
+  theme,
   debugError,
   debugResult,
   isDebugging,
+  isChangingModel,
+  isLoadingModels,
+  isRunning,
   lastQuestion,
+  modelError,
+  models,
   result,
+  selectedModel,
+  onChangeModel,
   onDebug,
-  onTabChange
+  onProviderSettingsChange,
+  onProjectMemoryChange,
+  onRefreshModels,
+  onTabChange,
+  onThemeChange,
+  error,
+  isUploading,
+  selectedFiles,
+  uploadResult,
+  onFilesChange,
+  onUpload
 }: {
   activeTab: PanelTab;
+  activeProject: Project;
+  activeProvider: ProviderName;
+  theme: AppTheme;
   debugError: string;
   debugResult: DebugResponse | null;
   isDebugging: boolean;
+  isChangingModel: boolean;
+  isLoadingModels: boolean;
+  isRunning: boolean;
   lastQuestion: string;
+  modelError: string;
+  models: string[];
   result: AskResponse | null;
+  selectedModel: string;
+  onChangeModel: (model: string) => void;
   onDebug: () => void;
+  onProviderSettingsChange: (provider: ProviderName) => void;
+  onProjectMemoryChange: (memory: string) => void;
+  onRefreshModels: () => void;
   onTabChange: (tab: PanelTab) => void;
+  onThemeChange: (theme: AppTheme) => void;
+  error: string;
+  isUploading: boolean;
+  selectedFiles: File[];
+  uploadResult: UploadResponse | null;
+  onFilesChange: (files: File[]) => void;
+  onUpload: () => void;
 }) {
+  const [isThemeModalOpen, setIsThemeModalOpen] = useState(false);
+
   return (
     <aside className="evidence-panel">
-      <div className="panel-heading">
-        <PanelRight size={17} />
-        <span>Панели</span>
+      <div className="workspace-heading">
+        <div className="panel-heading">
+          <PanelRight size={17} />
+          <span>Техническая панель</span>
+        </div>
+        <button className="icon-button panel-settings" onClick={() => setIsThemeModalOpen(true)} title="Настройки рабочей области" type="button">
+          <Settings2 size={16} />
+        </button>
       </div>
 
       <div className="panel-tabs" role="tablist" aria-label="Evidence panels">
+        <button
+          className={activeTab === "system" ? "active" : ""}
+          onClick={() => onTabChange("system")}
+          type="button"
+        >
+          <Settings2 size={14} />
+          Система
+        </button>
         <button
           className={activeTab === "evidence" ? "active" : ""}
           onClick={() => onTabChange("evidence")}
@@ -967,7 +1211,45 @@ function EvidencePanel({
         </button>
       </div>
 
-      {!result ? (
+      {activeTab === "system" ? (
+        <div className="system-panel">
+          <div className="system-intro">
+            <div className="system-kicker">Рабочие настройки</div>
+            <h2>Система</h2>
+            <p>Параметры ниже применяются к следующим запросам.</p>
+          </div>
+          <section className="project-memory-panel">
+            <div className="project-memory-heading"><Folder size={14} /><span>{activeProject.name}</span></div>
+            <label>
+              <span>Память проекта</span>
+              <textarea value={activeProject.memory} onChange={(event) => onProjectMemoryChange(event.target.value)} />
+            </label>
+          </section>
+          <ProviderSettings models={models} onProviderChange={onProviderSettingsChange} />
+          <FlowModeSelector isRunning={isRunning} />
+          <SystemPromptSelector isRunning={isRunning} />
+          {activeProvider === "ollama" ? (
+            <ModelSelector
+              error={modelError}
+              isChanging={isChangingModel}
+              isLoading={isLoadingModels}
+              isRunning={isRunning}
+              models={models}
+              selectedModel={selectedModel}
+              onChange={onChangeModel}
+              onRefresh={onRefreshModels}
+            />
+          ) : null}
+          <KnowledgeLoader
+            error={error}
+            isUploading={isUploading}
+            result={uploadResult}
+            selectedFiles={selectedFiles}
+            onFilesChange={onFilesChange}
+            onUpload={onUpload}
+          />
+        </div>
+      ) : !result ? (
         <div className="panel-empty">Здесь появятся источники последнего ответа.</div>
       ) : activeTab === "evidence" ? (
         <EvidenceSummary result={result} />
@@ -983,7 +1265,37 @@ function EvidencePanel({
           onDebug={onDebug}
         />
       )}
+
+      {isThemeModalOpen ? (
+        <div className="theme-modal-backdrop" role="presentation" onMouseDown={() => setIsThemeModalOpen(false)}>
+          <section className="theme-modal" role="dialog" aria-modal="true" aria-labelledby="theme-modal-title" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="theme-modal-heading">
+              <div>
+                <div className="system-kicker">Настройки интерфейса</div>
+                <h2 id="theme-modal-title">Тема</h2>
+              </div>
+              <button className="icon-button" onClick={() => setIsThemeModalOpen(false)} title="Закрыть" type="button"><X size={17} /></button>
+            </div>
+            <ThemeSelector theme={theme} onChange={onThemeChange} />
+          </section>
+        </div>
+      ) : null}
     </aside>
+  );
+}
+
+function ThemeSelector({ theme, onChange }: { theme: AppTheme; onChange: (theme: AppTheme) => void }) {
+  return (
+    <section className="theme-selector" aria-label="Тема интерфейса">
+      <div className="theme-selector-title"><Paintbrush size={14} /> Тема интерфейса</div>
+      <select value={theme} onChange={(event) => onChange(event.target.value as AppTheme)}>
+        <option value="default">Базовая</option>
+        <option value="portal">Корпоративная</option>
+      </select>
+      <div className="theme-selector-description">
+        {theme === "portal" ? "Контрастная палитра для встраивания в корпоративный портал." : "Нейтральная тема RAG Assistant."}
+      </div>
+    </section>
   );
 }
 

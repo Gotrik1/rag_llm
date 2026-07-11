@@ -20,13 +20,18 @@ import {
   Cpu,
   FileText,
   Files,
+  Folder,
   PanelRight,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Paintbrush,
   RefreshCw,
-  RotateCcw,
   Save,
   Send,
+  Settings2,
   Sigma,
   Sparkles,
+  MessageSquare,
   TestTube2,
   UploadCloud,
   User
@@ -173,7 +178,8 @@ type SystemPromptsResponse = {
 
 type FlowMode = "python" | "rust" | "hybrid";
 
-type PanelTab = "evidence" | "sources" | "debug";
+type PanelTab = "system" | "evidence" | "sources" | "debug";
+type AppTheme = "default" | "portal";
 
 const ASK_TIMEOUT_MS = 180_000;
 const DEBUG_TIMEOUT_MS = 60_000;
@@ -253,6 +259,17 @@ async function fetchJson<T>(path: string): Promise<T> {
   if (!response.ok) {
     throw new Error(data.error || response.statusText);
   }
+  return data;
+}
+
+async function patchJson<T>(path: string, body: unknown): Promise<T> {
+  const response = await fetch(path, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const data = (await response.json()) as T & { error?: string };
+  if (!response.ok) throw new Error(data.error || response.statusText);
   return data;
 }
 
@@ -340,7 +357,9 @@ export function App() {
   const [debugResult, setDebugResult] = useState<DebugResponse | null>(null);
   const [debugError, setDebugError] = useState("");
   const [isDebugging, setIsDebugging] = useState(false);
-  const [activeTab, setActiveTab] = useState<PanelTab>("evidence");
+  const [activeTab, setActiveTab] = useState<PanelTab>("system");
+  const [theme, setTheme] = useState<AppTheme>("portal");
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [uploadResult, setUploadResult] = useState<UploadResponse | null>(null);
   const [uploadError, setUploadError] = useState("");
@@ -513,6 +532,12 @@ export function App() {
     setMessages([]);
   }, [activeProjectId, refreshChats, syncWorkspace]);
 
+  const updateProjectMemory = useCallback(async (memory: string) => {
+    if (!activeProject) return;
+    const updated = await patchJson<ProjectRecord>(`/api/projects/${activeProject.id}`, { memory: { text: memory } });
+    setProjects((current) => current.map((project) => project.id === updated.id ? { ...project, ...updated } : project));
+  }, [activeProject]);
+
   const onNew = useCallback(async (message: AppendMessage) => {
     const question = extractText(message);
     if (!question) return;
@@ -644,68 +669,28 @@ export function App() {
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
-      <main className="app-shell">
+      <main className={`app-shell theme-${theme} ${isSidebarCollapsed ? "sidebar-collapsed" : ""}`}>
         <aside className="sidebar">
-          <div className="brand">
-            <div className="brand-mark">
-              <Sparkles size={18} />
-            </div>
-            <div>
-              <div className="brand-title">RAG Assistant</div>
-              <div className="brand-subtitle">Ollama + Qdrant</div>
-            </div>
+          <div className="sidebar-topbar">
+            <div className="sidebar-title">AI ИАС Энергобаланс</div>
+            <button className="sidebar-collapse" onClick={() => setIsSidebarCollapsed((value) => !value)} type="button">
+              {isSidebarCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
+            </button>
           </div>
           <button className="new-thread" onClick={() => void clearThread()} type="button">
-            <RotateCcw size={16} />
-            Новый диалог
+            <Sparkles size={16} /> <span>Новый диалог</span>
           </button>
-          <section className="workspace-switcher" aria-label="Workspace">
-            <div className="loader-title">
-              <Database size={15} />
-              <span>Workspace</span>
-            </div>
-            <select disabled={isWorkspaceLoading || !projects.length} value={activeProjectId} onChange={(event) => void switchProject(event.target.value)}>
-              {!projects.length ? <option value="">Нет проектов</option> : null}
-              {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
-            </select>
-            <select disabled={isWorkspaceLoading || !activeChats.length} value={activeChatId} onChange={(event) => void switchChat(event.target.value)}>
-              {!activeChats.length ? <option value="">Нет чатов</option> : null}
-              {activeChats.map((chat) => <option key={chat.id} value={chat.id}>{chat.title}</option>)}
-            </select>
-            <div className="provider-actions">
-              <button type="button" onClick={() => void createProjectRecord()}><Files size={14} /> Проект</button>
-              <button type="button" onClick={() => void createChatRecord()}><Sparkles size={14} /> Чат</button>
-            </div>
-            {workspaceError ? <div className="provider-status">{workspaceError}</div> : null}
-            {workspace ? <div className="sidebar-note">Активный проект: {activeProject?.name ?? "нет"}</div> : null}
-          </section>
-          <ProviderSettings models={models} onProviderChange={setActiveProvider} />
-          <FlowModeSelector isRunning={isRunning} />
-          <SystemPromptSelector isRunning={isRunning} />
-          {activeProvider === "ollama" ? (
-            <ModelSelector
-              error={modelError}
-              isChanging={isChangingModel}
-              isLoading={isLoadingModels}
-              isRunning={isRunning}
-              models={models}
-              selectedModel={selectedModel}
-              onChange={changeModel}
-              onRefresh={loadModels}
-            />
-          ) : null}
-          <KnowledgeLoader
-            error={uploadError}
-            isUploading={isUploading}
-            result={uploadResult}
-            selectedFiles={selectedFiles}
-            onFilesChange={setSelectedFiles}
-            onUpload={uploadFiles}
+          <NavigationSidebar
+            activeChatId={activeChatId}
+            activeProjectId={activeProjectId}
+            chats={activeChats}
+            isLoading={isWorkspaceLoading}
+            projects={projects}
+            onChatChange={(chatId) => void switchChat(chatId)}
+            onProjectChange={(projectId) => void switchProject(projectId)}
+            onProjectCreate={() => void createProjectRecord()}
           />
-          <div className="sidebar-note">
-            Интерфейс работает через assistant-ui и локальный backend
-            127.0.0.1:8080.
-          </div>
+          {workspaceError ? <div className="sidebar-note">{workspaceError}</div> : null}
         </aside>
 
         <section className="chat-surface">
@@ -714,13 +699,33 @@ export function App() {
 
         <EvidencePanel
           activeTab={activeTab}
+          activeProject={activeProject}
+          activeProvider={activeProvider}
           debugError={debugError}
           debugResult={debugResult}
           isDebugging={isDebugging}
+          isRunning={isRunning}
           lastQuestion={lastQuestion}
           result={lastResult}
           onDebug={runDebug}
           onTabChange={setActiveTab}
+          onThemeChange={setTheme}
+          onProjectMemoryChange={updateProjectMemory}
+          theme={theme}
+          models={models}
+          selectedModel={selectedModel}
+          modelError={modelError}
+          isLoadingModels={isLoadingModels}
+          isChangingModel={isChangingModel}
+          onChangeModel={changeModel}
+          onRefreshModels={loadModels}
+          onProviderSettingsChange={setActiveProvider}
+          uploadError={uploadError}
+          isUploading={isUploading}
+          selectedFiles={selectedFiles}
+          uploadResult={uploadResult}
+          onFilesChange={setSelectedFiles}
+          onUpload={uploadFiles}
         />
       </main>
     </AssistantRuntimeProvider>
@@ -1118,33 +1123,120 @@ function Composer() {
   );
 }
 
+function NavigationSidebar({
+  activeChatId,
+  activeProjectId,
+  chats,
+  isLoading,
+  projects,
+  onChatChange,
+  onProjectChange,
+  onProjectCreate
+}: {
+  activeChatId: string;
+  activeProjectId: string;
+  chats: ChatRecord[];
+  isLoading: boolean;
+  projects: ProjectRecord[];
+  onChatChange: (chatId: string) => void;
+  onProjectChange: (projectId: string) => void;
+  onProjectCreate: () => void;
+}) {
+  return (
+    <nav className="navigation-sidebar" aria-label="Проекты и чаты">
+      <div className="nav-section-header">
+        <div className="nav-section-title">Проекты</div>
+        <button className="nav-add-project" onClick={onProjectCreate} title="Новый проект" type="button"><Sparkles size={15} /></button>
+      </div>
+      <div className="project-list">
+        {projects.map((project) => (
+          <button className={`nav-item ${project.id === activeProjectId ? "active" : ""}`} key={project.id} onClick={() => onProjectChange(project.id)} type="button">
+            <Folder size={16} /><span>{project.name}</span>
+          </button>
+        ))}
+      </div>
+      <div className="nav-section chats-section">
+        <div className="nav-section-title">Чаты</div>
+        <div className="sidebar-chat-list">
+          {isLoading ? <div className="sidebar-empty">Загрузка...</div> : chats.length ? chats.map((chat) => (
+            <button className={`nav-item chat-nav-item ${chat.id === activeChatId ? "active" : ""}`} key={chat.id} onClick={() => onChatChange(chat.id)} type="button">
+              <MessageSquare size={15} /><span>{chat.title}</span>
+            </button>
+          )) : <div className="sidebar-empty">Создайте первый диалог.</div>}
+        </div>
+      </div>
+    </nav>
+  );
+}
+
 function EvidencePanel({
   activeTab,
+  activeProject,
+  activeProvider,
   debugError,
   debugResult,
   isDebugging,
+  isRunning,
   lastQuestion,
   result,
   onDebug,
-  onTabChange
+  onTabChange,
+  onThemeChange,
+  onProjectMemoryChange,
+  theme,
+  models,
+  selectedModel,
+  modelError,
+  isLoadingModels,
+  isChangingModel,
+  onChangeModel,
+  onRefreshModels,
+  onProviderSettingsChange,
+  uploadError,
+  isUploading,
+  selectedFiles,
+  uploadResult,
+  onFilesChange,
+  onUpload
 }: {
   activeTab: PanelTab;
+  activeProject: ProjectRecord | null;
+  activeProvider: ProviderName;
   debugError: string;
   debugResult: DebugResponse | null;
   isDebugging: boolean;
+  isRunning: boolean;
   lastQuestion: string;
   result: AskResponse | null;
   onDebug: () => void;
   onTabChange: (tab: PanelTab) => void;
+  onThemeChange: (theme: AppTheme) => void;
+  onProjectMemoryChange: (memory: string) => void;
+  theme: AppTheme;
+  models: string[];
+  selectedModel: string;
+  modelError: string;
+  isLoadingModels: boolean;
+  isChangingModel: boolean;
+  onChangeModel: (model: string) => void;
+  onRefreshModels: () => void;
+  onProviderSettingsChange: (provider: ProviderName) => void;
+  uploadError: string;
+  isUploading: boolean;
+  selectedFiles: File[];
+  uploadResult: UploadResponse | null;
+  onFilesChange: (files: File[]) => void;
+  onUpload: () => void;
 }) {
   return (
     <aside className="evidence-panel">
       <div className="panel-heading">
         <PanelRight size={17} />
-        <span>Панели</span>
+        <span>Техническая панель</span>
       </div>
 
       <div className="panel-tabs" role="tablist" aria-label="Evidence panels">
+        <button className={activeTab === "system" ? "active" : ""} onClick={() => onTabChange("system")} type="button"><Settings2 size={14} />Система</button>
         <button
           className={activeTab === "evidence" ? "active" : ""}
           onClick={() => onTabChange("evidence")}
@@ -1171,7 +1263,21 @@ function EvidencePanel({
         </button>
       </div>
 
-      {!result ? (
+      {activeTab === "system" ? (
+        <div className="system-panel">
+          <div className="system-intro"><div className="system-kicker">Рабочие настройки</div><h2>Система</h2><p>Настройки применяются к следующим запросам.</p></div>
+          <section className="project-memory-panel">
+            <div className="project-memory-heading"><Folder size={14} />{activeProject?.name ?? "Проект"}</div>
+            <label>Память проекта<textarea value={String(activeProject?.memory?.text ?? "")} onChange={(event) => onProjectMemoryChange(event.target.value)} /></label>
+          </section>
+          <section className="theme-selector"><div className="theme-selector-title"><Paintbrush size={14} />Внешний вид</div><select value={theme} onChange={(event) => onThemeChange(event.target.value as AppTheme)}><option value="portal">Корпоративный портал</option><option value="default">Базовая тема</option></select></section>
+          <ProviderSettings models={models} onProviderChange={onProviderSettingsChange} />
+          <FlowModeSelector isRunning={isRunning} />
+          <SystemPromptSelector isRunning={isRunning} />
+          {activeProvider === "ollama" ? <ModelSelector error={modelError} isChanging={isChangingModel} isLoading={isLoadingModels} isRunning={isRunning} models={models} selectedModel={selectedModel} onChange={onChangeModel} onRefresh={onRefreshModels} /> : null}
+          <KnowledgeLoader error={uploadError} isUploading={isUploading} result={uploadResult} selectedFiles={selectedFiles} onFilesChange={onFilesChange} onUpload={onUpload} />
+        </div>
+      ) : !result ? (
         <div className="panel-empty">Здесь появятся источники последнего ответа.</div>
       ) : activeTab === "evidence" ? (
         <EvidenceSummary result={result} />

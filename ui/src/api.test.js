@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { postFormData, postJson } from "./api";
+import { getJson, patchJson, postFormData, postJson } from "./api";
 const fetchMock = vi.fn();
 vi.stubGlobal("fetch", fetchMock);
 function jsonResponse(data, ok = true, statusText = "OK") {
@@ -34,6 +34,19 @@ describe("HTTP client", () => {
     it("uses the backend error message for unsuccessful JSON requests", async () => {
         fetchMock.mockResolvedValue(jsonResponse({ error: "Модель недоступна" }, false, "Service Unavailable"));
         await expect(postJson("/api/ask", {}, 1000)).rejects.toThrow("Модель недоступна");
+    });
+    it("loads and updates JSON resources with the expected HTTP methods", async () => {
+        fetchMock
+            .mockResolvedValueOnce(jsonResponse({ items: [] }))
+            .mockResolvedValueOnce(jsonResponse({ name: "Переименован" }));
+        await expect(getJson("/api/projects", 1000)).resolves.toEqual({ items: [] });
+        await expect(patchJson("/api/projects/project-id", { name: "Переименован" }, 1000))
+            .resolves.toEqual({ name: "Переименован" });
+        expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/projects", expect.objectContaining({ cache: "no-store" }));
+        expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/projects/project-id", expect.objectContaining({
+            method: "PATCH",
+            body: JSON.stringify({ name: "Переименован" })
+        }));
     });
     it("reports a readable timeout for JSON requests", async () => {
         vi.useFakeTimers();

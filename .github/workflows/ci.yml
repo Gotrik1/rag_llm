@@ -52,6 +52,10 @@ jobs:
         working-directory: ui
         run: npm ci
 
+      - name: Run UI unit tests
+        working-directory: ui
+        run: npm test
+
       - name: Build UI
         working-directory: ui
         run: npm run build
@@ -95,3 +99,6 @@ jobs:
           names={r['table_name'] for r in c.execute(\"select table_name from information_schema.tables where table_schema='public'\").fetchall()};
           required={'projects','chats','messages','documents','evidence_sources','request_errors','workspace_settings'};
           assert required <= names, required-names"
+
+      - name: Run workspace API integration tests
+        run: python -m unittest test_workspace_integration.py

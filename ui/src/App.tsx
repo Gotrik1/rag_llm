@@ -40,7 +40,7 @@ import {
   X
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { postFormData, postJson } from "./api";
+import { getJson, patchJson, postFormData, postJson } from "./api";
 
 type Role = "user" | "assistant";
 
@@ -149,6 +149,35 @@ type FlowMode = "python" | "rust" | "hybrid";
 type PanelTab = "system" | "evidence" | "sources" | "debug";
 type AppTheme = "default" | "portal";
 
+type WorkspaceState = {
+  active_project_id?: string | null;
+  active_chat_id?: string | null;
+  settings?: Record<string, unknown>;
+};
+
+type ProjectRecord = {
+  id: string;
+  name: string;
+  memory?: Record<string, unknown>;
+  chats?: ChatRecord[];
+};
+
+type ChatRecord = {
+  id: string;
+  project_id: string;
+  title: string;
+};
+
+type MessageRecord = {
+  id: string;
+  chat_id: string;
+  role: Role;
+  content: string;
+  content_html?: string;
+  status?: string;
+  metadata?: Record<string, unknown>;
+};
+
 type Project = {
   id: string;
   name: string;
@@ -159,7 +188,6 @@ type ChatSummary = {
   id: string;
   projectId: string;
   title: string;
-  updatedAt: number;
   messages: ChatEntry[];
 };
 
@@ -169,14 +197,13 @@ const DEFAULT_PROJECT: Project = {
   memory: "Точный поиск по пунктам регламентов. Формулы и источники показывать явно."
 };
 
-const PROJECTS_KEY = "rag-assistant-projects";
-const CHATS_KEY = "rag-assistant-chats";
 const THEME_KEY = "rag-assistant-theme";
 const SIDEBAR_COLLAPSED_KEY = "rag-assistant-sidebar-collapsed";
 
 const ASK_TIMEOUT_MS = 180_000;
 const DEBUG_TIMEOUT_MS = 60_000;
 const UPLOAD_TIMEOUT_MS = 300_000;
+const API_TIMEOUT_MS = 60_000;
 
 declare global {
   interface Window {
@@ -193,6 +220,28 @@ declare global {
 }
 
 const createId = () => crypto.randomUUID();
+
+function projectFromRecord(record: ProjectRecord): Project {
+  const memory = typeof record.memory?.text === "string" ? record.memory.text : "";
+  return { id: record.id, name: record.name, memory };
+}
+
+function chatFromRecord(record: ChatRecord): ChatSummary {
+  return { id: record.id, projectId: record.project_id, title: record.title, messages: [] };
+}
+
+function messageFromRecord(record: MessageRecord): ChatEntry {
+  return {
+    id: record.id,
+    role: record.role,
+    text: record.content,
+    html: record.content_html || undefined,
+    modelLabel: typeof record.metadata?.model_label === "string" ? record.metadata.model_label : undefined,
+    status: record.role === "assistant"
+      ? record.status === "running" ? "running" : record.status === "error" ? "error" : "complete"
+      : "complete"
+  };
+}
 
 function readStored<T>(key: string, fallback: T): T {
   try {
@@ -288,10 +337,12 @@ export function App() {
   const [debugError, setDebugError] = useState("");
   const [isDebugging, setIsDebugging] = useState(false);
   const [activeTab, setActiveTab] = useState<PanelTab>("system");
-  const [projects, setProjects] = useState<Project[]>(() => readStored(PROJECTS_KEY, [DEFAULT_PROJECT]));
-  const [activeProjectId, setActiveProjectId] = useState(DEFAULT_PROJECT.id);
-  const [chats, setChats] = useState<ChatSummary[]>(() => readStored(CHATS_KEY, []));
-  const [activeChatId, setActiveChatId] = useState<string>(() => createId());
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [activeProjectId, setActiveProjectId] = useState("");
+  const [chats, setChats] = useState<ChatSummary[]>([]);
+  const [activeChatId, setActiveChatId] = useState("");
+  const [workspaceSettings, setWorkspaceSettings] = useState<Record<string, unknown>>({});
+  const [workspaceError, setWorkspaceError] = useState("");
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [uploadResult, setUploadResult] = useState<UploadResponse | null>(null);
   const [uploadError, setUploadError] = useState("");
@@ -308,10 +359,6 @@ export function App() {
   const activeProject = projects.find((project) => project.id === activeProjectId) ?? DEFAULT_PROJECT;
 
   useEffect(() => {
-    window.localStorage.setItem(PROJECTS_KEY, JSON.stringify(projects));
-  }, [projects]);
-
-  useEffect(() => {
     window.localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
 
@@ -319,33 +366,58 @@ export function App() {
     window.localStorage.setItem(SIDEBAR_COLLAPSED_KEY, JSON.stringify(isSidebarCollapsed));
   }, [isSidebarCollapsed]);
 
-  useEffect(() => {
-    if (!messages.length) return;
-    setChats((current) => {
-      const existing = current.find((chat) => chat.id === activeChatId);
-      const firstQuestion = messages.find((message) => message.role === "user")?.text;
-      const nextChat: ChatSummary = {
-        id: activeChatId,
-        projectId: activeProjectId,
-        title: existing?.title && existing.title !== "Новый диалог"
-          ? existing.title
-          : (firstQuestion?.slice(0, 48) || "Новый диалог"),
-        updatedAt: Date.now(),
-        messages
-      };
-      const next = [nextChat, ...current.filter((chat) => chat.id !== activeChatId)].slice(0, 30);
-      window.localStorage.setItem(CHATS_KEY, JSON.stringify(next));
-      return next;
-    });
-  }, [activeChatId, activeProjectId, messages]);
+  const resetThreadState = useCallback(() => {
+    setMessages([]);
+    setLastResult(null);
+    setLastQuestion("");
+    setDebugResult(null);
+    setDebugError("");
+    setActiveTab("system");
+  }, []);
+
+  const loadMessages = useCallback(async (chatId: string) => {
+    const data = await getJson<{ items: MessageRecord[] }>(`/api/chats/${chatId}/messages`, API_TIMEOUT_MS);
+    setMessages(data.items.map(messageFromRecord));
+  }, []);
+
+  const syncWorkspace = useCallback(async (projectId: string, chatId: string) => {
+    const workspace = await postJson<WorkspaceState>("/api/settings", {
+      active_project_id: projectId,
+      active_chat_id: chatId,
+      settings: workspaceSettings
+    }, API_TIMEOUT_MS);
+    setWorkspaceSettings(workspace.settings ?? workspaceSettings);
+  }, [workspaceSettings]);
+
+  const loadWorkspace = useCallback(async () => {
+    setWorkspaceError("");
+    try {
+      const [workspace, projectData] = await Promise.all([
+        getJson<WorkspaceState>("/api/workspace", API_TIMEOUT_MS),
+        getJson<{ items: ProjectRecord[] }>("/api/projects", API_TIMEOUT_MS)
+      ]);
+      const nextProjects = projectData.items.map(projectFromRecord);
+      const nextChats = projectData.items.flatMap((project) => (project.chats ?? []).map(chatFromRecord));
+      const nextProjectId = workspace.active_project_id || nextProjects[0]?.id || "";
+      const nextChatId = workspace.active_chat_id || nextChats.find((chat) => chat.projectId === nextProjectId)?.id || "";
+
+      setWorkspaceSettings(workspace.settings ?? {});
+      setProjects(nextProjects);
+      setChats(nextChats);
+      setActiveProjectId(nextProjectId);
+      setActiveChatId(nextChatId);
+      if (nextChatId) await loadMessages(nextChatId);
+      else setMessages([]);
+    } catch (error) {
+      setWorkspaceError(error instanceof Error ? error.message : "Не удалось загрузить проекты и чаты");
+    }
+  }, [loadMessages]);
 
   const loadModels = useCallback(async () => {
     setIsLoadingModels(true);
     setModelError("");
     try {
-      const response = await fetch("/api/models", { cache: "no-store" });
-      const data = (await response.json()) as ModelsResponse & { error?: string };
-      if (!response.ok) throw new Error(data.error || response.statusText);
+      const data = await getJson<ModelsResponse>("/api/models", API_TIMEOUT_MS);
       setModels(data.models);
       setSelectedModel(data.selected);
     } catch (error) {
@@ -357,7 +429,8 @@ export function App() {
 
   useEffect(() => {
     void loadModels();
-  }, [loadModels]);
+    void loadWorkspace();
+  }, [loadModels, loadWorkspace]);
 
   const changeModel = useCallback(async (model: string) => {
     if (!model || model === selectedModel || isChangingModel || isRunning) return;
@@ -373,9 +446,65 @@ export function App() {
     }
   }, [isChangingModel, isRunning, selectedModel]);
 
+  const createChat = useCallback(async (projectId: string) => {
+    const record = await postJson<ChatRecord>(`/api/projects/${projectId}/chats`, { title: "Новый чат" }, API_TIMEOUT_MS);
+    const chat = chatFromRecord(record);
+    setChats((current) => [...current, chat]);
+    setActiveProjectId(projectId);
+    setActiveChatId(chat.id);
+    await syncWorkspace(projectId, chat.id);
+    resetThreadState();
+    return chat;
+  }, [resetThreadState, syncWorkspace]);
+
+  const openChat = useCallback(async (chat: ChatSummary) => {
+    setActiveProjectId(chat.projectId);
+    setActiveChatId(chat.id);
+    await syncWorkspace(chat.projectId, chat.id);
+    await loadMessages(chat.id);
+    setLastResult(null);
+    setLastQuestion("");
+    setDebugResult(null);
+    setDebugError("");
+    setActiveTab("system");
+  }, [loadMessages, syncWorkspace]);
+
+  const selectProject = useCallback(async (projectId: string) => {
+    const chat = chats.find((item) => item.projectId === projectId);
+    if (chat) {
+      await openChat(chat);
+      return;
+    }
+    await createChat(projectId);
+  }, [chats, createChat, openChat]);
+
+  const createProject = useCallback(async () => {
+    const name = window.prompt("Название проекта", "Новый проект")?.trim();
+    if (!name) return;
+    try {
+      const record = await postJson<ProjectRecord>("/api/projects", { name, memory: { text: "Память проекта пока пуста." } }, API_TIMEOUT_MS);
+      setProjects((current) => [...current, projectFromRecord(record)]);
+      await createChat(record.id);
+    } catch (error) {
+      setWorkspaceError(error instanceof Error ? error.message : "Не удалось создать проект");
+    }
+  }, [createChat]);
+
+  const updateProjectMemory = useCallback(async (memory: string) => {
+    if (!activeProjectId) return;
+    const previous = projects;
+    setProjects((current) => current.map((project) => project.id === activeProjectId ? { ...project, memory } : project));
+    try {
+      await patchJson<ProjectRecord>(`/api/projects/${activeProjectId}`, { memory: { text: memory } }, API_TIMEOUT_MS);
+    } catch (error) {
+      setProjects(previous);
+      setWorkspaceError(error instanceof Error ? error.message : "Не удалось сохранить память проекта");
+    }
+  }, [activeProjectId, projects]);
+
   const onNew = useCallback(async (message: AppendMessage) => {
     const question = extractText(message);
-    if (!question) return;
+    if (!question || !activeChatId) return;
 
     const userMessage: ChatEntry = {
       id: createId(),
@@ -400,7 +529,22 @@ export function App() {
     setActiveTab("system");
 
     try {
+      await postJson<MessageRecord>(`/api/chats/${activeChatId}/messages`, { role: "user", content: question }, API_TIMEOUT_MS);
       const data = await postJson<AskResponse>("/api/ask", { question }, ASK_TIMEOUT_MS);
+      await postJson<MessageRecord>(`/api/chats/${activeChatId}/messages`, {
+        role: "assistant",
+        content: data.answer || "Пустой ответ.",
+        content_html: data.html_answer || "",
+        status: "complete",
+        metadata: { model_label: data.llm?.label, sources: data.sources, usage: data.usage }
+      }, API_TIMEOUT_MS);
+
+      const currentChat = chats.find((chat) => chat.id === activeChatId);
+      if (currentChat && currentChat.title === "Новый чат") {
+        const title = question.slice(0, 48);
+        await patchJson<ChatRecord>(`/api/chats/${activeChatId}`, { title }, API_TIMEOUT_MS);
+        setChats((current) => current.map((chat) => chat.id === activeChatId ? { ...chat, title } : chat));
+      }
 
       setLastResult(data);
       setMessages((current) =>
@@ -418,6 +562,11 @@ export function App() {
       );
     } catch (error) {
       const text = error instanceof Error ? error.message : "Ошибка запроса";
+      void postJson<MessageRecord>(`/api/chats/${activeChatId}/messages`, {
+        role: "assistant",
+        content: text,
+        status: "error"
+      }, API_TIMEOUT_MS).catch(() => undefined);
       setMessages((current) =>
         current.map((item) =>
           item.id === assistantId
@@ -432,7 +581,7 @@ export function App() {
     } finally {
       setIsRunning(false);
     }
-  }, []);
+  }, [activeChatId, chats]);
 
   const adapter = useMemo<ExternalStoreAdapter<ChatEntry>>(
     () => ({
@@ -447,35 +596,14 @@ export function App() {
 
   const runtime = useExternalStoreRuntime(adapter);
 
-  const clearThread = () => {
-    setActiveChatId(createId());
-    setMessages([]);
-    setLastResult(null);
-    setLastQuestion("");
-    setDebugResult(null);
-    setDebugError("");
-    setActiveTab("system");
-  };
-
-  const openChat = (chat: ChatSummary) => {
-    setActiveChatId(chat.id);
-    setActiveProjectId(chat.projectId);
-    setMessages(chat.messages);
-    setLastResult(null);
-    setLastQuestion(chat.messages.filter((message) => message.role === "user").slice(-1)[0]?.text ?? "");
-    setDebugResult(null);
-    setDebugError("");
-    setActiveTab("system");
-  };
-
-  const createProject = () => {
-    const name = window.prompt("Название проекта", "Новый проект")?.trim();
-    if (!name) return;
-    const project = { id: createId(), name, memory: "Память проекта пока пуста." };
-    setProjects((current) => [...current, project]);
-    setActiveProjectId(project.id);
-    clearThread();
-  };
+  const clearThread = useCallback(async () => {
+    if (!activeProjectId) return;
+    try {
+      await createChat(activeProjectId);
+    } catch (error) {
+      setWorkspaceError(error instanceof Error ? error.message : "Не удалось создать чат");
+    }
+  }, [activeProjectId, createChat]);
 
   const runDebug = useCallback(async () => {
     if (!lastQuestion || isRunning || isDebugging) return;
@@ -528,7 +656,7 @@ export function App() {
               {isSidebarCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
             </button>
           </div>
-          <button className="new-thread" onClick={clearThread} type="button">
+          <button className="new-thread" onClick={() => void clearThread()} type="button">
             <span className="new-thread-icon"><Plus size={16} /></span>
             <span>Новый диалог</span>
           </button>
@@ -536,10 +664,11 @@ export function App() {
             activeProjectId={activeProjectId}
             chats={chats}
             projects={projects}
-            onChatChange={openChat}
-            onProjectChange={(projectId) => { setActiveProjectId(projectId); clearThread(); }}
-            onProjectCreate={createProject}
+            onChatChange={(chat) => void openChat(chat)}
+            onProjectChange={(projectId) => void selectProject(projectId)}
+            onProjectCreate={() => void createProject()}
           />
+          {workspaceError && <div className="sidebar-note">{workspaceError}</div>}
         </aside>
 
         <section className="chat-surface">
@@ -567,7 +696,7 @@ export function App() {
           error={uploadError}
           isUploading={isUploading}
           onProviderSettingsChange={setActiveProvider}
-          onProjectMemoryChange={(memory) => setProjects((current) => current.map((project) => project.id === activeProject.id ? { ...project, memory } : project))}
+          onProjectMemoryChange={(memory) => void updateProjectMemory(memory)}
           onRefreshModels={loadModels}
           onTabChange={setActiveTab}
           onThemeChange={setTheme}

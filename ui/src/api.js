@@ -1,7 +1,7 @@
 function isTimedOut(error) {
     return error instanceof DOMException && error.name === "AbortError";
 }
-async function post(path, options, timeoutMs, timeoutMessage) {
+async function request(path, options, timeoutMs, timeoutMessage) {
     const controller = new AbortController();
     const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -23,12 +23,22 @@ async function post(path, options, timeoutMs, timeoutMessage) {
     }
 }
 export function postJson(path, body, timeoutMs) {
-    return post(path, {
+    return request(path, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
     }, timeoutMs, "Backend не ответил вовремя. Запрос можно повторить.");
 }
 export function postFormData(path, body, timeoutMs) {
-    return post(path, { method: "POST", body }, timeoutMs, "Загрузка не завершилась вовремя. Попробуй меньший файл или повтори позже.");
+    return request(path, { method: "POST", body }, timeoutMs, "Загрузка не завершилась вовремя. Попробуй меньший файл или повтори позже.");
+}
+export function getJson(path, timeoutMs) {
+    return request(path, { cache: "no-store" }, timeoutMs, "Backend не ответил вовремя. Запрос можно повторить.");
+}
+export function patchJson(path, body, timeoutMs) {
+    return request(path, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+    }, timeoutMs, "Backend не ответил вовремя. Запрос можно повторить.");
 }

@@ -1,8 +1,9 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::env;
 
-const OLLAMA_URL: &str = "http://localhost:11434/api/generate";
-const MODEL: &str = "qwen2.5:14b";
+const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
+const DEFAULT_MODEL: &str = "qwen2.5:14b";
 
 #[derive(Serialize)]
 struct OllamaRequest<'a> {
@@ -40,7 +41,8 @@ impl OllamaClient {
     }
 
     pub async fn generate(&self, context: &str, question: &str) -> Result<String> {
-        self.generate_with_model(context, question, MODEL).await
+        let model = env::var("LLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        self.generate_with_model(context, question, &model).await
     }
 
     pub async fn generate_with_model(&self, context: &str, question: &str, model: &str) -> Result<String> {
@@ -88,7 +90,7 @@ impl OllamaClient {
 
         let resp = self
             .client
-            .post(OLLAMA_URL)
+            .post(ollama_generate_url())
             .json(&request)
             .send()
             .await?
@@ -96,5 +98,15 @@ impl OllamaClient {
             .await?;
 
         Ok(resp.response.trim().to_string())
+    }
+}
+
+fn ollama_generate_url() -> String {
+    let base_url = env::var("OLLAMA_BASE_URL")
+        .unwrap_or_else(|_| DEFAULT_OLLAMA_BASE_URL.to_string());
+    if base_url.ends_with("/api/generate") {
+        base_url
+    } else {
+        format!("{}/api/generate", base_url.trim_end_matches('/'))
     }
 }

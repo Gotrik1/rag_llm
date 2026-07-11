@@ -31,3 +31,4 @@ pymupdf>=1.24.0          # PDF (лучше чем pypdf для сложных)
 
 # Прочее
 nltk>=3.8.0              # нужен BM25Retriever для токенизации
+psycopg[binary]>=3.2.0    # PostgreSQL backend storage

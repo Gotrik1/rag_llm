@@ -1,0 +1,154 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "RAG Assistant API",
+    "version": "1.0.0",
+    "description": "HTTP API for the RAG assistant, workspace state, projects, chats, messages, model settings, and document ingestion. Authentication and RBAC enforcement are intentionally not enabled yet. UUID, tenant_id, and user_id fields reserve the contract for future multi-tenant access control.\n\nProject, chat, and message updates use PATCH. Their DELETE endpoints perform a soft delete."
+  },
+  "servers": [{ "url": "/", "description": "Current RAG Assistant server" }],
+  "tags": [
+    { "name": "Workspace", "description": "Persistent workspace selection and UI settings." },
+    { "name": "Projects", "description": "Projects and their persistent settings/memory." },
+    { "name": "Chats", "description": "Chat threads associated with projects." },
+    { "name": "Messages", "description": "Persistent chat message history." },
+    { "name": "RAG", "description": "Question answering, retrieval debugging, cache, and ingestion." },
+    { "name": "LLM settings", "description": "Provider, model, system-prompt, and flow configuration." }
+  ],
+  "paths": {
+    "/api/workspace": {
+      "get": { "tags": ["Workspace"], "summary": "Get workspace state", "operationId": "getWorkspace", "responses": { "200": { "description": "Current workspace; a default workspace is created on first request.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Workspace" } } } }, "500": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/api/settings": {
+      "get": { "tags": ["Workspace"], "summary": "Get workspace settings", "operationId": "getSettings", "responses": { "200": { "description": "Workspace state.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Workspace" } } } } } },
+      "post": { "tags": ["Workspace"], "summary": "Update workspace settings", "operationId": "updateSettings", "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WorkspaceUpdate" } } } }, "responses": { "200": { "description": "Updated workspace.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Workspace" } } } }, "500": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/api/projects": {
+      "get": { "tags": ["Projects"], "summary": "List active projects", "operationId": "listProjects", "responses": { "200": { "description": "Projects with their active chats.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProjectList" } } } } } },
+      "post": { "tags": ["Projects"], "summary": "Create a project", "operationId": "createProject", "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProjectCreate" } } } }, "responses": { "201": { "description": "Created project.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Project" } } } }, "500": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/api/projects/{project_id}": {
+      "parameters": [{ "$ref": "#/components/parameters/ProjectId" }],
+      "get": { "tags": ["Projects"], "summary": "Get a project", "operationId": "getProject", "responses": { "200": { "description": "Project.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Project" } } } }, "404": { "$ref": "#/components/responses/NotFound" } } },
+      "patch": { "tags": ["Projects"], "summary": "Update a project", "operationId": "updateProject", "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProjectUpdate" } } } }, "responses": { "200": { "description": "Updated project.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Project" } } } }, "404": { "$ref": "#/components/responses/NotFound" } } },
+      "delete": { "tags": ["Projects"], "summary": "Soft-delete a project", "operationId": "deleteProject", "responses": { "200": { "description": "Project marked deleted.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeleteResult" } } } }, "404": { "$ref": "#/components/responses/NotFound" } } }
+    },
+    "/api/projects/{project_id}/chats": {
+      "parameters": [{ "$ref": "#/components/parameters/ProjectId" }],
+      "get": { "tags": ["Chats"], "summary": "List chats in a project", "operationId": "listProjectChats", "responses": { "200": { "description": "Active project chats.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatList" } } } } } },
+      "post": { "tags": ["Chats"], "summary": "Create a chat in a project", "operationId": "createProjectChat", "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatCreate" } } } }, "responses": { "201": { "description": "Created chat.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Chat" } } } }, "500": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/api/chats": {
+      "get": { "tags": ["Chats"], "summary": "List all active chats", "operationId": "listChats", "responses": { "200": { "description": "Active chats.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatList" } } } } } },
+      "post": { "tags": ["Chats"], "summary": "Create a chat", "description": "The project_id body field is required for this variant.", "operationId": "createChat", "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatCreateWithProject" } } } }, "responses": { "201": { "description": "Created chat.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Chat" } } } }, "500": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/api/chats/{chat_id}": {
+      "parameters": [{ "$ref": "#/components/parameters/ChatId" }],
+      "get": { "tags": ["Chats"], "summary": "Get a chat", "operationId": "getChat", "responses": { "200": { "description": "Chat.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Chat" } } } }, "404": { "$ref": "#/components/responses/NotFound" } } },
+      "patch": { "tags": ["Chats"], "summary": "Update a chat", "operationId": "updateChat", "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatUpdate" } } } }, "responses": { "200": { "description": "Updated chat.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Chat" } } } }, "404": { "$ref": "#/components/responses/NotFound" } } },
+      "delete": { "tags": ["Chats"], "summary": "Soft-delete a chat", "operationId": "deleteChat", "responses": { "200": { "description": "Chat marked deleted.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeleteResult" } } } }, "404": { "$ref": "#/components/responses/NotFound" } } }
+    },
+    "/api/chats/{chat_id}/messages": {
+      "parameters": [{ "$ref": "#/components/parameters/ChatId" }],
+      "get": { "tags": ["Messages"], "summary": "List chat messages", "operationId": "listMessages", "responses": { "200": { "description": "Messages ordered by creation time.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MessageList" } } } } } },
+      "post": { "tags": ["Messages"], "summary": "Create a message", "operationId": "createMessage", "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MessageCreate" } } } }, "responses": { "201": { "description": "Created message.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Message" } } } }, "500": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/api/messages/{message_id}": {
+      "parameters": [{ "$ref": "#/components/parameters/MessageId" }],
+      "get": { "tags": ["Messages"], "summary": "Get a message", "operationId": "getMessage", "responses": { "200": { "description": "Message.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Message" } } } }, "404": { "$ref": "#/components/responses/NotFound" } } },
+      "patch": { "tags": ["Messages"], "summary": "Update a message", "operationId": "updateMessage", "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MessageUpdate" } } } }, "responses": { "200": { "description": "Updated message.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Message" } } } }, "404": { "$ref": "#/components/responses/NotFound" } } },
+      "delete": { "tags": ["Messages"], "summary": "Soft-delete a message", "operationId": "deleteMessage", "responses": { "200": { "description": "Message marked deleted.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeleteResult" } } } }, "404": { "$ref": "#/components/responses/NotFound" } } }
+    },
+    "/api/ask": {
+      "post": { "tags": ["RAG"], "summary": "Ask a RAG question", "description": "Runs the selected Python, Rust, or hybrid RAG flow. Chat persistence is handled separately through the Messages API.", "operationId": "ask", "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QuestionRequest" } } } }, "responses": { "200": { "description": "Grounded answer with sources, retrieved context, and usage estimates.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AskResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "500": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/api/debug": {
+      "post": { "tags": ["RAG"], "summary": "Inspect retrieval without generation", "operationId": "debugRetrieval", "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QuestionRequest" } } } }, "responses": { "200": { "description": "Retrieved context and validation diagnostics.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DebugResponse" } } } }, "400": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/api/upload": {
+      "post": { "tags": ["RAG"], "summary": "Upload and ingest documents", "description": "Stores each uploaded file under `.ingestion_cache/uploads` and indexes it in the existing RAG pipeline. Requires Qdrant to be ready.", "operationId": "uploadDocuments", "requestBody": { "required": true, "content": { "multipart/form-data": { "schema": { "type": "object", "properties": { "files": { "type": "array", "items": { "type": "string", "format": "binary" } }, "file": { "type": "string", "format": "binary" } } } } } }, "responses": { "200": { "description": "Ingestion result.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UploadResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "503": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/api/load": {
+      "post": { "tags": ["RAG"], "summary": "Ingest a server-local document", "operationId": "loadDocument", "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoadRequest" } } } }, "responses": { "200": { "description": "Number of indexed chunks.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoadResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "503": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/api/cache/clear": {
+      "post": { "tags": ["RAG"], "summary": "Clear answer cache", "operationId": "clearCache", "responses": { "200": { "description": "Cache cleared.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MessageResponse" } } } } } }
+    },
+    "/api/models": {
+      "get": { "tags": ["LLM settings"], "summary": "List installed Ollama completion models", "operationId": "listModels", "responses": { "200": { "description": "Available Ollama models and selected model.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ModelsResponse" } } } }, "500": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/api/models/select": {
+      "post": { "tags": ["LLM settings"], "summary": "Select an installed Ollama model", "operationId": "selectModel", "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ModelSelectRequest" } } } }, "responses": { "200": { "description": "Selected model.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ModelSelectRequest" } } } }, "400": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/api/providers": {
+      "get": { "tags": ["LLM settings"], "summary": "Get provider configuration", "operationId": "getProvider", "responses": { "200": { "description": "Current public provider config; API keys are never returned.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProviderGetResponse" } } } } } },
+      "post": { "tags": ["LLM settings"], "summary": "Save provider configuration", "operationId": "saveProvider", "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProviderSaveRequest" } } } }, "responses": { "200": { "description": "Saved public configuration.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProviderSaveResponse" } } } }, "400": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/api/providers/test": {
+      "post": { "tags": ["LLM settings"], "summary": "Test provider connectivity", "operationId": "testProvider", "requestBody": { "required": false, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProviderSaveRequest" } } } }, "responses": { "200": { "description": "Connection test result.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MessageResponse" } } } }, "500": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/api/system-prompts": {
+      "get": { "tags": ["LLM settings"], "summary": "List system-prompt profiles", "operationId": "listSystemPrompts", "responses": { "200": { "description": "Available profiles and selected profile.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SystemPromptsResponse" } } } } } }
+    },
+    "/api/system-prompts/select": {
+      "post": { "tags": ["LLM settings"], "summary": "Select a system-prompt profile", "operationId": "selectSystemPrompt", "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SystemPromptSelectRequest" } } } }, "responses": { "200": { "description": "Selected profile.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SystemPromptSelectRequest" } } } }, "400": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/api/flow-mode": {
+      "get": { "tags": ["LLM settings"], "summary": "Get active RAG flow", "operationId": "getFlowMode", "responses": { "200": { "description": "Current flow.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FlowModeResponse" } } } } } },
+      "post": { "tags": ["LLM settings"], "summary": "Set active RAG flow", "operationId": "setFlowMode", "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FlowModeRequest" } } } }, "responses": { "200": { "description": "Flow saved; cache_cleared is true when the flow changed.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FlowModeResponse" } } } }, "400": { "$ref": "#/components/responses/Error" } } }
+    }
+  },
+  "components": {
+    "parameters": {
+      "ProjectId": { "name": "project_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+      "ChatId": { "name": "chat_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+      "MessageId": { "name": "message_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+    },
+    "responses": {
+      "Error": { "description": "Request failed.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "NotFound": { "description": "Entity not found or already soft-deleted.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+    },
+    "schemas": {
+      "Uuid": { "type": "string", "format": "uuid" },
+      "Timestamp": { "type": "string", "format": "date-time" },
+      "JsonObject": { "type": "object", "additionalProperties": true },
+      "Workspace": { "type": "object", "required": ["id", "settings", "created_at", "updated_at"], "properties": { "id": { "$ref": "#/components/schemas/Uuid" }, "tenant_id": { "anyOf": [{ "$ref": "#/components/schemas/Uuid" }, { "type": "null" }] }, "user_id": { "anyOf": [{ "$ref": "#/components/schemas/Uuid" }, { "type": "null" }] }, "active_project_id": { "anyOf": [{ "$ref": "#/components/schemas/Uuid" }, { "type": "null" }] }, "active_chat_id": { "anyOf": [{ "$ref": "#/components/schemas/Uuid" }, { "type": "null" }] }, "settings": { "$ref": "#/components/schemas/JsonObject" }, "created_at": { "$ref": "#/components/schemas/Timestamp" }, "updated_at": { "$ref": "#/components/schemas/Timestamp" }, "deleted_at": { "anyOf": [{ "$ref": "#/components/schemas/Timestamp" }, { "type": "null" }] } } },
+      "WorkspaceUpdate": { "type": "object", "properties": { "active_project_id": { "$ref": "#/components/schemas/Uuid" }, "active_chat_id": { "$ref": "#/components/schemas/Uuid" }, "settings": { "$ref": "#/components/schemas/JsonObject" } } },
+      "Project": { "type": "object", "required": ["id", "name", "description", "settings", "memory", "created_at", "updated_at"], "properties": { "id": { "$ref": "#/components/schemas/Uuid" }, "tenant_id": { "anyOf": [{ "$ref": "#/components/schemas/Uuid" }, { "type": "null" }] }, "user_id": { "anyOf": [{ "$ref": "#/components/schemas/Uuid" }, { "type": "null" }] }, "name": { "type": "string" }, "description": { "type": "string" }, "settings": { "$ref": "#/components/schemas/JsonObject" }, "memory": { "$ref": "#/components/schemas/JsonObject" }, "chats": { "type": "array", "items": { "$ref": "#/components/schemas/Chat" }, "description": "Included only by GET /api/projects." }, "created_at": { "$ref": "#/components/schemas/Timestamp" }, "updated_at": { "$ref": "#/components/schemas/Timestamp" }, "deleted_at": { "anyOf": [{ "$ref": "#/components/schemas/Timestamp" }, { "type": "null" }] } } },
+      "ProjectCreate": { "type": "object", "properties": { "name": { "type": "string", "default": "Новый проект" }, "description": { "type": "string" }, "settings": { "$ref": "#/components/schemas/JsonObject" }, "memory": { "$ref": "#/components/schemas/JsonObject" } } },
+      "ProjectUpdate": { "type": "object", "minProperties": 1, "properties": { "name": { "type": "string" }, "description": { "type": "string" }, "settings": { "$ref": "#/components/schemas/JsonObject" }, "memory": { "$ref": "#/components/schemas/JsonObject" } } },
+      "ProjectList": { "type": "object", "required": ["items"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/Project" } } } },
+      "Chat": { "type": "object", "required": ["id", "project_id", "title", "mode", "provider", "model_name", "metadata", "created_at", "updated_at"], "properties": { "id": { "$ref": "#/components/schemas/Uuid" }, "project_id": { "$ref": "#/components/schemas/Uuid" }, "tenant_id": { "anyOf": [{ "$ref": "#/components/schemas/Uuid" }, { "type": "null" }] }, "user_id": { "anyOf": [{ "$ref": "#/components/schemas/Uuid" }, { "type": "null" }] }, "title": { "type": "string" }, "mode": { "type": "string", "enum": ["python", "rust", "hybrid"] }, "provider": { "type": "string" }, "model_name": { "type": "string" }, "metadata": { "$ref": "#/components/schemas/JsonObject" }, "created_at": { "$ref": "#/components/schemas/Timestamp" }, "updated_at": { "$ref": "#/components/schemas/Timestamp" }, "deleted_at": { "anyOf": [{ "$ref": "#/components/schemas/Timestamp" }, { "type": "null" }] } } },
+      "ChatCreate": { "type": "object", "properties": { "title": { "type": "string", "default": "Новый чат" }, "mode": { "type": "string", "enum": ["python", "rust", "hybrid"] }, "provider": { "type": "string" }, "model_name": { "type": "string" }, "metadata": { "$ref": "#/components/schemas/JsonObject" } } },
+      "ChatCreateWithProject": { "allOf": [{ "$ref": "#/components/schemas/ChatCreate" }, { "type": "object", "required": ["project_id"], "properties": { "project_id": { "$ref": "#/components/schemas/Uuid" } } }] },
+      "ChatUpdate": { "type": "object", "minProperties": 1, "properties": { "title": { "type": "string" }, "mode": { "type": "string", "enum": ["python", "rust", "hybrid"] }, "provider": { "type": "string" }, "model_name": { "type": "string" }, "metadata": { "$ref": "#/components/schemas/JsonObject" } } },
+      "ChatList": { "type": "object", "required": ["items"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/Chat" } } } },
+      "Message": { "type": "object", "required": ["id", "chat_id", "role", "content", "content_html", "status", "metadata", "created_at", "updated_at"], "properties": { "id": { "$ref": "#/components/schemas/Uuid" }, "chat_id": { "$ref": "#/components/schemas/Uuid" }, "role": { "type": "string", "enum": ["user", "assistant", "system", "tool"] }, "content": { "type": "string" }, "content_html": { "type": "string", "description": "Server-rendered HTML for assistant content. Render only in a trusted UI." }, "status": { "type": "string", "default": "complete" }, "metadata": { "$ref": "#/components/schemas/JsonObject" }, "created_at": { "$ref": "#/components/schemas/Timestamp" }, "updated_at": { "$ref": "#/components/schemas/Timestamp" }, "deleted_at": { "anyOf": [{ "$ref": "#/components/schemas/Timestamp" }, { "type": "null" }] } } },
+      "MessageCreate": { "type": "object", "required": ["role", "content"], "properties": { "role": { "type": "string", "enum": ["user", "assistant", "system", "tool"] }, "content": { "type": "string" }, "content_html": { "type": "string" }, "status": { "type": "string", "default": "complete" }, "metadata": { "$ref": "#/components/schemas/JsonObject" } } },
+      "MessageUpdate": { "type": "object", "minProperties": 1, "properties": { "content": { "type": "string" }, "content_html": { "type": "string" }, "status": { "type": "string" }, "metadata": { "$ref": "#/components/schemas/JsonObject" } } },
+      "MessageList": { "type": "object", "required": ["items"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/Message" } } } },
+      "DeleteResult": { "type": "object", "required": ["deleted"], "properties": { "deleted": { "type": "boolean", "const": true } } },
+      "QuestionRequest": { "type": "object", "required": ["question"], "properties": { "question": { "type": "string", "minLength": 1, "example": "Как рассчитывается показатель?" } } },
+      "Source": { "type": "object", "required": ["file", "score"], "properties": { "file": { "type": "string" }, "section": { "type": "string" }, "score": { "type": "number" }, "text_preview": { "type": "string" }, "html_preview": { "type": "string" } } },
+      "ContextItem": { "type": "object", "required": ["file", "score", "text", "html_text"], "properties": { "file": { "type": "string" }, "score": { "type": "number" }, "text": { "type": "string" }, "html_text": { "type": "string" }, "section_path": { "type": "string" }, "section_title": { "type": "string" }, "status": { "type": "string" }, "chunk_type": { "type": "string" }, "flow_origin": { "type": "string" } } },
+      "Formula": { "type": "object", "required": ["text", "html"], "properties": { "text": { "type": "string" }, "html": { "type": "string" } } },
+      "Usage": { "type": "object", "required": ["answer_chars", "answer_tokens_est", "context_chars", "context_tokens_est", "total_tokens_est"], "properties": { "answer_chars": { "type": "integer" }, "answer_tokens_est": { "type": "integer" }, "context_chars": { "type": "integer" }, "context_tokens_est": { "type": "integer" }, "total_tokens_est": { "type": "integer" } } },
+      "AskResponse": { "type": "object", "required": ["answer", "html_answer", "formulas", "warnings", "sources", "context", "from_cache", "llm", "flow_mode", "elapsed_s", "usage"], "properties": { "answer": { "type": "string" }, "html_answer": { "type": "string" }, "formulas": { "type": "array", "items": { "$ref": "#/components/schemas/Formula" } }, "warnings": { "type": "array", "items": { "type": "string" } }, "sources": { "type": "array", "items": { "$ref": "#/components/schemas/Source" } }, "context": { "type": "array", "items": { "$ref": "#/components/schemas/ContextItem" } }, "from_cache": { "type": "boolean" }, "llm": { "$ref": "#/components/schemas/JsonObject" }, "flow_mode": { "type": "string", "enum": ["python", "rust", "hybrid"] }, "elapsed_s": { "type": "number" }, "usage": { "$ref": "#/components/schemas/Usage" } } },
+      "DebugResponse": { "type": "object", "required": ["formulas", "warnings", "context", "elapsed_s", "usage"], "properties": { "formulas": { "type": "array", "items": { "$ref": "#/components/schemas/Formula" } }, "warnings": { "type": "array", "items": { "type": "string" } }, "context": { "type": "array", "items": { "$ref": "#/components/schemas/ContextItem" } }, "elapsed_s": { "type": "number" }, "usage": { "$ref": "#/components/schemas/Usage" } } },
+      "UploadResponse": { "type": "object", "required": ["files", "chunks"], "properties": { "files": { "type": "array", "items": { "type": "object", "required": ["file", "stored_path", "chunks"], "properties": { "file": { "type": "string" }, "stored_path": { "type": "string" }, "chunks": { "type": "integer" } } } }, "chunks": { "type": "integer" } } },
+      "LoadRequest": { "type": "object", "required": ["path"], "properties": { "path": { "type": "string", "description": "Absolute or server-working-directory-relative path." } } },
+      "LoadResponse": { "type": "object", "required": ["chunks"], "properties": { "chunks": { "type": "integer" } } },
+      "ModelsResponse": { "type": "object", "required": ["models", "selected"], "properties": { "models": { "type": "array", "items": { "type": "string" } }, "selected": { "type": "string" } } },
+      "ModelSelectRequest": { "type": "object", "required": ["model"], "properties": { "model": { "type": "string" } } },
+      "ProviderConfig": { "type": "object", "properties": { "provider": { "type": "string" }, "model": { "type": "string" }, "base_url": { "type": "string" }, "folder_id": { "type": "string" }, "auth_type": { "type": "string" }, "has_api_key": { "type": "boolean" }, "api_key_hint": { "type": "string" } } },
+      "ProviderSaveRequest": { "type": "object", "required": ["provider", "model"], "properties": { "provider": { "type": "string", "enum": ["ollama", "openai", "deepseek", "gemini", "gigachat", "yandex"] }, "model": { "type": "string" }, "base_url": { "type": "string" }, "folder_id": { "type": "string" }, "auth_type": { "type": "string", "default": "api_key" }, "api_key": { "type": "string", "format": "password", "writeOnly": true } } },
+      "ProviderGetResponse": { "type": "object", "required": ["config", "defaults"], "properties": { "config": { "$ref": "#/components/schemas/ProviderConfig" }, "defaults": { "$ref": "#/components/schemas/JsonObject" } } },
+      "ProviderSaveResponse": { "type": "object", "required": ["config"], "properties": { "config": { "$ref": "#/components/schemas/ProviderConfig" } } },
+      "SystemPromptsResponse": { "type": "object", "required": ["selected", "prompts"], "properties": { "selected": { "type": "string" }, "prompts": { "type": "array", "items": { "type": "object", "required": ["id", "name", "description"], "properties": { "id": { "type": "string" }, "name": { "type": "string" }, "description": { "type": "string" } } } } } },
+      "SystemPromptSelectRequest": { "type": "object", "required": ["prompt_id"], "properties": { "prompt_id": { "type": "string" } } },
+      "FlowModeRequest": { "type": "object", "required": ["mode"], "properties": { "mode": { "type": "string", "enum": ["python", "rust", "hybrid"] } } },
+      "FlowModeResponse": { "type": "object", "required": ["mode"], "properties": { "mode": { "type": "string", "enum": ["python", "rust", "hybrid"] }, "cache_cleared": { "type": "boolean" } } },
+      "MessageResponse": { "type": "object", "required": ["message"], "properties": { "message": { "type": "string" } } },
+      "Error": { "type": "object", "required": ["error"], "properties": { "error": { "type": "string" } } }
+    }
+  }
+}

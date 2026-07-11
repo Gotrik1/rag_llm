@@ -4,6 +4,7 @@ ui/dist/
 ui/.vite/
 ui/node_modules/.tmp/
 .venv
+.env
 __pycache__/
 .ingestion_cache/
 .fastembed_cache/

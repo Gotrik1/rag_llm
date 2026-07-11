@@ -7,6 +7,8 @@
 ```mermaid
 flowchart TB
     USER["Пользователь"] --> UI["Web UI<br/>TypeScript · React · Vite<br/>Выбор Python / Rust / Hybrid"]
+    UI -->|"Workspace / Projects / Chats / Messages API"| CRUD["Backend storage API<br/>Python · web_ui.py · psycopg 3"]
+    CRUD --> PG[("PostgreSQL 16<br/>projects · chats · messages<br/>workspace_settings")]
     UI -->|"GET / POST /api/flow-mode"| CONFIG[(".ingestion_cache/flow_mode.json<br/>JSON · сохранённый режим")]
     UI -->|"POST /api/ask"| API["web_ui.py<br/>Python · ThreadingHTTPServer<br/>Маршрутизация запроса по flow_mode"]
     CONFIG --> API
@@ -62,6 +64,79 @@ flowchart TB
     R_OUT --> RESPONSE
     H_OUT --> RESPONSE
 ```
+
+## PostgreSQL и backend-хранилище UI
+
+React-клиент больше не использует `localStorage` как основное хранилище проектов и истории чатов. Состояние workspace, проекты, чаты и сообщения загружаются и изменяются через Python API, а данные сохраняются в PostgreSQL через `psycopg 3`.
+
+```mermaid
+flowchart LR
+    REACT["App.tsx<br/>React · TypeScript"] -->|"GET /api/workspace<br/>GET /api/projects"| API["web_ui.py<br/>Python storage API"]
+    REACT -->|"Projects / chats / messages commands"| API
+    API --> DRIVER["psycopg[binary] >= 3.2<br/>dict_row · transactions"]
+    DRIVER --> PG[("PostgreSQL 16")]
+    MIG["migrations/*.sql<br/>schema_migrations"] --> PG
+    COMPOSE["docker-compose.yml<br/>postgres:16-alpine"] --> PG
+```
+
+При запуске `web_ui.py`:
+
+1. читается обязательная переменная `DATABASE_URL`;
+2. открывается одно переиспользуемое соединение `psycopg` с `autocommit=False`;
+3. `run_migrations()` применяет ещё не зарегистрированные SQL-файлы из `migrations/` и пишет версии в `schema_migrations`;
+4. `ensure_default_workspace()` создаёт начальные project, chat и workspace settings, если workspace отсутствует;
+5. только после этого запускается `ThreadingHTTPServer`.
+
+### API хранения
+
+| Операция | Endpoint | Хранение |
+|---|---|---|
+| Получить workspace | `GET /api/workspace`, `GET /api/settings` | `workspace_settings` |
+| Изменить active project/chat и settings | `POST /api/settings` | `workspace_settings` |
+| Список/создание проектов | `GET /api/projects`, `POST /api/projects` | `projects` |
+| Получить/изменить/удалить проект | `GET /api/projects/{id}`, `POST /api/projects/{id}` | `projects` |
+| Чаты проекта | `GET/POST /api/projects/{id}/chats` | `chats` |
+| Все чаты/создание чата | `GET/POST /api/chats` | `chats` |
+| Получить/изменить/удалить чат | `GET /api/chats/{id}`, `POST /api/chats/{id}` | `chats` |
+| Сообщения чата | `GET/POST /api/chats/{id}/messages` | `messages` |
+| Изменить/удалить сообщение | `POST /api/messages/{id}` | `messages` |
+
+Обновление и soft-delete пока передаются через `POST`; удаление обозначается полем `"_delete": true`. Отдельные HTTP-методы `PATCH` и `DELETE` в текущем handler не реализованы.
+
+React при старте параллельно загружает workspace и проекты, восстанавливает `active_project_id`/`active_chat_id`, затем загружает сообщения выбранного чата. Команда нового чата создаёт запись через backend API. Пользовательские и assistant-сообщения отправляются в `/api/chats/{chat_id}/messages`.
+
+### Схема данных
+
+| Таблица | Фактическое назначение |
+|---|---|
+| `workspace_settings` | Активные project/chat и JSONB-настройки UI |
+| `projects` | Проекты, описание, JSONB settings и memory |
+| `chats` | Чаты проекта, flow mode, provider, model и metadata |
+| `messages` | Роли user/assistant/system/tool, текст, HTML, status и metadata |
+| `documents` | Задел для привязки загруженных документов к project/chat |
+| `evidence_sources` | Задел для сохранения evidence конкретного сообщения |
+| `request_errors` | Задел для структурированных ошибок запросов |
+| `rbac_roles`, `rbac_permissions`, `rbac_role_permissions`, `rbac_user_roles` | Схема-задел под RBAC |
+
+CRUD в `web_ui.py` сейчас реализован для `projects`, `chats`, `messages` и `workspace_settings`. Запись в `documents`, `evidence_sources`, `request_errors` и применение RBAC/SSO в runtime пока не реализованы. Поля `tenant_id` и `user_id` существуют в схеме, но аутентификация, tenant isolation и проверка разрешений отсутствуют.
+
+### Конфигурация PostgreSQL
+
+`.env.example` содержит:
+
+```text
+DATABASE_URL=postgresql://rag:ragpassword@127.0.0.1:5432/rag_assistant
+POSTGRES_DB=rag_assistant
+POSTGRES_USER=rag
+POSTGRES_PASSWORD=ragpassword
+POSTGRES_PORT=5432
+BACKEND_HOST=127.0.0.1
+BACKEND_PORT=8080
+```
+
+`docker-compose.yml` поднимает только PostgreSQL 16 Alpine, создаёт named volume `postgres_data`, публикует порт и проверяет готовность через `pg_isready`. SQL-миграции применяет Python backend, а не контейнер PostgreSQL.
+
+Важно: `web_ui.py` читает `os.environ`, но сам не загружает `.env` через `python-dotenv`. Перед запуском `DATABASE_URL` должен находиться в окружении процесса. `POSTGRES_*` используются Compose. `BACKEND_HOST` и `BACKEND_PORT` пока не читаются backend: адрес и порт заданы константами `127.0.0.1:8080`.
 
 ## Семантика режимов
 

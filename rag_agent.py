@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -43,12 +44,12 @@ from document_ingestion import ingest_document
 from llm_providers import ProviderLLM
 
 # ─── Настройки ────────────────────────────────────────────────
-OLLAMA_BASE_URL = "http://127.0.0.1:11434"
-LLM_MODEL       = "qwen2.5:14b"
-EMBED_MODEL      = "nomic-embed-text"   # лёгкая, быстрая, хорошая для рус/англ
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+LLM_MODEL       = os.environ.get("LLM_MODEL", "qwen2.5:14b")
+EMBED_MODEL      = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 
-QDRANT_URL       = "http://127.0.0.1:6333"
-QDRANT_COLLECTION = "rag_docs_v10"
+QDRANT_URL       = os.environ.get("QDRANT_URL", "http://127.0.0.1:6333")
+QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "rag_docs_v10")
 
 CHUNK_SIZE       = 1024
 CHUNK_OVERLAP    = 128
@@ -56,8 +57,8 @@ TOP_K            = 10      # финальных чанков в контекст
 BM25_TOP_K       = 12      # кандидатов от BM25
 VECTOR_TOP_K     = 12      # кандидатов от вектора
 
-CACHE_DB         = "cache.db"
-BM25_PERSIST_DIR = "bm25_index_v10"   # сохраняем ноды для BM25
+CACHE_DB         = os.environ.get("CACHE_DB", "cache.db")
+BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", "bm25_index_v10")
 CACHE_VERSION    = "v19-qwen35-profile"
 
 # Model-specific generation budgets. Qwen 3.5 enables long reasoning by default

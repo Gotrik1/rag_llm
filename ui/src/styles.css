@@ -113,6 +113,24 @@ textarea {
   padding-top: 14px;
 }
 
+.workspace-switcher {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid #2b333d;
+  padding-top: 14px;
+}
+
+.workspace-switcher select {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid #4b5563;
+  border-radius: 7px;
+  background: #151b22;
+  color: #e8eef6;
+  padding: 0 9px;
+  font-size: 13px;
+}
+
 .provider-settings {
   border-top: 1px solid #2b333d;
   padding-top: 14px;

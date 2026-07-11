@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [test, main]
+  push:
+    branches: [test, main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check Python syntax
+        run: python -m py_compile web_ui.py db_store.py rag_agent.py document_ingestion.py docx_parser.py
+
+      - name: Run Python tests
+        run: python -m unittest test_flow_modes.py test_prism.py
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check Rust
+        run: cargo check --locked
+
+      - name: Test Rust
+        run: cargo test --locked
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Build UI
+        working-directory: ui
+        run: npm run build
+
+  postgres-smoke:
+    name: postgres-smoke
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: rag_assistant
+          POSTGRES_USER: rag
+          POSTGRES_PASSWORD: ragpassword
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rag -d rag_assistant"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://rag:ragpassword@127.0.0.1:5432/rag_assistant
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt
+
+      - name: Apply migrations and create default workspace
+        run: python -c "import db_store; db_store.run_migrations(); db_store.get_workspace('python', 'ollama', 'qwen2.5:14b')"
+
+      - name: Verify schema
+        run: >-
+          python -c "import db_store; c=db_store.db();
+          names={r['table_name'] for r in c.execute(\"select table_name from information_schema.tables where table_schema='public'\").fetchall()};
+          required={'projects','chats','messages','documents','evidence_sources','request_errors','workspace_settings'};
+          assert required <= names, required-names"

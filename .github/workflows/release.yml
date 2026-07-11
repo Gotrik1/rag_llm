@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  artifact:
+    name: release-artifact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build UI
+        working-directory: ui
+        run: npm ci && npm run build
+
+      - name: Package release
+        shell: bash
+        run: |
+          mkdir -p release/ui
+          cp -R ui/dist release/ui/dist
+          cp -R src migrations release/
+          cp web_ui.py db_store.py rag_agent.py document_ingestion.py docx_parser.py llm_providers.py system_prompts.py openapi.json release/
+          cp requirements.txt Cargo.toml Cargo.lock docker-compose.yml Dockerfile.backend Dockerfile.rust-cli .env.example architecture.md BRANCHING.md DEPLOYMENT.md release/
+          mkdir -p release/ui
+          cp ui/Dockerfile ui/nginx.conf release/ui/
+          tar -czf rag-llm-${GITHUB_REF_NAME}.tar.gz release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rag-llm-${{ github.ref_name }}
+          path: rag-llm-${{ github.ref_name }}.tar.gz
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: rag-llm-${{ github.ref_name }}.tar.gz
+          generate_release_notes: true

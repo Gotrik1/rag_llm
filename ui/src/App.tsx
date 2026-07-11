@@ -40,6 +40,7 @@ import {
   X
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { postFormData, postJson } from "./api";
 
 type Role = "user" | "assistant";
 
@@ -199,57 +200,6 @@ function readStored<T>(key: string, fallback: T): T {
     return value ? (JSON.parse(value) as T) : fallback;
   } catch {
     return fallback;
-  }
-}
-
-async function postJson<T>(path: string, body: unknown, timeoutMs: number): Promise<T> {
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const response = await fetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: controller.signal
-    });
-    const data = (await response.json()) as T & { error?: string };
-    if (!response.ok) {
-      throw new Error(data.error || response.statusText);
-    }
-    return data;
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw new Error("Backend не ответил вовремя. Запрос можно повторить.");
-    }
-    throw error;
-  } finally {
-    window.clearTimeout(timeoutId);
-  }
-}
-
-async function postFormData<T>(path: string, body: FormData, timeoutMs: number): Promise<T> {
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const response = await fetch(path, {
-      method: "POST",
-      body,
-      signal: controller.signal
-    });
-    const data = (await response.json()) as T & { error?: string };
-    if (!response.ok) {
-      throw new Error(data.error || response.statusText);
-    }
-    return data;
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw new Error("Загрузка не завершилась вовремя. Попробуй меньший файл или повтори позже.");
-    }
-    throw error;
-  } finally {
-    window.clearTimeout(timeoutId);
   }
 }
 

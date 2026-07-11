@@ -2,6 +2,7 @@ import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-run
 import { ActionBarPrimitive, AssistantRuntimeProvider, ComposerPrimitive, MessagePrimitive, ThreadPrimitive, useExternalStoreRuntime, useMessage } from "@assistant-ui/react";
 import { AlertTriangle, Bot, Bug, CheckCircle2, Copy, Database, Cpu, FileText, Files, Folder, PanelRight, PanelLeftClose, PanelLeftOpen, Paintbrush, Pin, Plus, RefreshCw, Save, Send, Settings2, Sigma, Sparkles, MessageSquare, TestTube2, UploadCloud, User, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { postFormData, postJson } from "./api";
 const DEFAULT_PROJECT = {
     id: "regulations",
     name: "Регламенты",
@@ -22,57 +23,6 @@ function readStored(key, fallback) {
     }
     catch {
         return fallback;
-    }
-}
-async function postJson(path, body, timeoutMs) {
-    const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
-    try {
-        const response = await fetch(path, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
-            signal: controller.signal
-        });
-        const data = (await response.json());
-        if (!response.ok) {
-            throw new Error(data.error || response.statusText);
-        }
-        return data;
-    }
-    catch (error) {
-        if (error instanceof DOMException && error.name === "AbortError") {
-            throw new Error("Backend не ответил вовремя. Запрос можно повторить.");
-        }
-        throw error;
-    }
-    finally {
-        window.clearTimeout(timeoutId);
-    }
-}
-async function postFormData(path, body, timeoutMs) {
-    const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
-    try {
-        const response = await fetch(path, {
-            method: "POST",
-            body,
-            signal: controller.signal
-        });
-        const data = (await response.json());
-        if (!response.ok) {
-            throw new Error(data.error || response.statusText);
-        }
-        return data;
-    }
-    catch (error) {
-        if (error instanceof DOMException && error.name === "AbortError") {
-            throw new Error("Загрузка не завершилась вовремя. Попробуй меньший файл или повтори позже.");
-        }
-        throw error;
-    }
-    finally {
-        window.clearTimeout(timeoutId);
     }
 }
 const extractText = (message) => {

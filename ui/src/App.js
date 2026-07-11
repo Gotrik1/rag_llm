@@ -276,11 +276,11 @@ export function App() {
         await createChat(projectId);
     }, [chats, createChat, openChat]);
     const createProject = useCallback(async () => {
-        const name = window.prompt("Название проекта", "Новый проект")?.trim();
-        if (!name)
-            return;
         try {
-            const record = await postJson("/api/projects", { name, memory: { text: "Память проекта пока пуста." } }, API_TIMEOUT_MS);
+            const record = await postJson("/api/projects", {
+                name: "Новый проект",
+                memory: { text: "Память проекта пока пуста." }
+            }, API_TIMEOUT_MS);
             setProjects((current) => [...current, projectFromRecord(record)]);
             await createChat(record.id);
         }

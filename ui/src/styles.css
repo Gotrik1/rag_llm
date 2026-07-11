@@ -193,25 +193,35 @@ textarea {
 
 .nav-section-header {
   display: flex;
+  min-height: 18px;
   align-items: center;
   justify-content: space-between;
-  padding-right: 4px;
+  padding-right: 0;
 }
 
 .nav-add-project {
   display: grid;
-  width: 26px;
-  height: 26px;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
   place-items: center;
-  border: 0;
-  border-radius: 5px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
   background: transparent;
   color: #aeb5be;
+  line-height: 1;
+  padding: 0;
   cursor: pointer;
 }
 
+.nav-add-project svg {
+  width: 13px;
+  height: 13px;
+}
+
 .nav-add-project:hover {
-  background: #1c1c1c;
+  background: #898995;
+  border-color: #898995;
   color: #fff;
 }
 
@@ -1413,8 +1423,8 @@ sub {
 
 .theme-portal .new-thread:hover {
   border-color: transparent;
-  background: var(--sidebar-hover-bg);
-  color: var(--sidebar-hover-text);
+  background: #898995;
+  color: #ffffff;
 }
 
 .theme-portal .sidebar-title {
@@ -1471,9 +1481,12 @@ sub {
   color: #ffffff;
 }
 
-.theme-portal .nav-add-project,
+.theme-portal .nav-add-project {
+  color: #1c1c1c;
+}
+
 .theme-portal .show-more {
-  color: #d96548;
+  color: #1c1c1c;
 }
 
 .theme-portal .nav-inline-action:hover {
@@ -1500,8 +1513,9 @@ sub {
 }
 
 .theme-portal .nav-add-project:hover {
-  background: var(--sidebar-hover-bg);
-  color: var(--sidebar-hover-text);
+  background: #898995;
+  border-color: #898995;
+  color: #ffffff;
 }
 
 .theme-portal .chat-nav-item {

@@ -502,10 +502,11 @@ export function App() {
   }, [chats, createChat, openChat]);
 
   const createProject = useCallback(async () => {
-    const name = window.prompt("Название проекта", "Новый проект")?.trim();
-    if (!name) return;
     try {
-      const record = await postJson<ProjectRecord>("/api/projects", { name, memory: { text: "Память проекта пока пуста." } }, API_TIMEOUT_MS);
+      const record = await postJson<ProjectRecord>("/api/projects", {
+        name: "Новый проект",
+        memory: { text: "Память проекта пока пуста." }
+      }, API_TIMEOUT_MS);
       setProjects((current) => [...current, projectFromRecord(record)]);
       await createChat(record.id);
     } catch (error) {

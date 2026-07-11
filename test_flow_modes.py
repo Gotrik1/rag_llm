@@ -38,19 +38,20 @@ class FlowModeTests(unittest.TestCase):
         with patch.object(web_ui, "load_flow_mode", return_value=mode), \
              patch.object(web_ui, "get_agent", return_value=agent), \
              patch.object(web_ui, "get_profile", return_value={"prompt": "test", "id": "test"}), \
+             patch.object(web_ui, "get_project_conversation", return_value={"project_name": "test", "memory": {}, "messages": []}), \
              patch.object(web_ui, "validate_retrieval", return_value=[]), \
              patch.object(web_ui, "extract_formula_lines", return_value=[]), \
             patch.object(web_ui, "llm_label", return_value={"provider": "ollama", "model": "test", "label": "Ollama · test"}):
             if mode == "rust":
                 with patch.object(web_ui, "rust_context", return_value=[context_item("rust")]), \
                      patch.object(web_ui, "rust_generate", return_value="rust answer") as rust:
-                    handler.handle_ask({"question": "Что сказано?"})
+                    handler.handle_ask({"question": "Что сказано?", "chat_id": "test-chat"})
                     self.assertEqual(rust.call_count, 1)
             elif mode == "hybrid":
                 with patch.object(web_ui, "rust_context", return_value=[context_item("rust")]):
-                    handler.handle_ask({"question": "Что сказано?"})
+                    handler.handle_ask({"question": "Что сказано?", "chat_id": "test-chat"})
             else:
-                handler.handle_ask({"question": "Что сказано?"})
+                handler.handle_ask({"question": "Что сказано?", "chat_id": "test-chat"})
         return captured, agent
 
     def test_python_mode_uses_only_python_flow(self):

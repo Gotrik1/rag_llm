@@ -198,6 +198,12 @@ def get_chat(chat_id: str) -> dict | None:
 
 def update_chat(chat_id: str, payload: dict) -> dict | None:
     fields, values = _update_values(payload, ("title", "mode", "provider", "model_name"), ("metadata",))
+    if "project_id" in payload:
+        project_id = str(payload.get("project_id", "")).strip()
+        if not project_id or get_project(project_id) is None:
+            return None
+        fields.append("project_id = %s")
+        values.append(project_id)
     if not fields:
         return get_chat(chat_id)
     return _update_entity("chats", chat_id, fields, values)
@@ -211,6 +217,39 @@ def list_messages(chat_id: str) -> list[dict]:
     with db().cursor() as cur:
         cur.execute("SELECT * FROM messages WHERE chat_id = %s AND deleted_at IS NULL ORDER BY created_at ASC", (chat_id,))
         return [dict(row) for row in cur.fetchall()]
+
+
+def get_project_conversation(chat_id: str, limit: int = 40) -> dict | None:
+    """Return bounded message history from the active chat's project only."""
+    with db().cursor() as cur:
+        cur.execute(
+            """
+            SELECT c.project_id, p.name AS project_name, p.memory
+            FROM chats c
+            JOIN projects p ON p.id = c.project_id
+            WHERE c.id = %s AND c.deleted_at IS NULL AND p.deleted_at IS NULL
+            """,
+            (chat_id,),
+        )
+        scope = cur.fetchone()
+        if scope is None:
+            return None
+        cur.execute(
+            """
+            SELECT c.id AS chat_id, c.title AS chat_title, m.role, m.content, m.created_at
+            FROM messages m
+            JOIN chats c ON c.id = m.chat_id
+            WHERE c.project_id = %s
+              AND c.deleted_at IS NULL
+              AND m.deleted_at IS NULL
+              AND m.status = 'complete'
+            ORDER BY m.created_at DESC
+            LIMIT %s
+            """,
+            (scope["project_id"], max(1, min(limit, 100))),
+        )
+        messages = [dict(row) for row in reversed(cur.fetchall())]
+    return {**dict(scope), "messages": messages}
 
 
 def create_message(chat_id: str, payload: dict) -> dict:

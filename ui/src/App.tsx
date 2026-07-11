@@ -21,6 +21,7 @@ import {
   FileText,
   Files,
   Folder,
+  FolderInput,
   PanelRight,
   PanelLeftClose,
   PanelLeftOpen,
@@ -529,6 +530,21 @@ export function App() {
     }
   }, [chats]);
 
+  const moveChat = useCallback(async (chatId: string, projectId: string) => {
+    const chat = chats.find((item) => item.id === chatId);
+    if (!chat || chat.projectId === projectId) return;
+    try {
+      const record = await patchJson<ChatRecord>(`/api/chats/${chatId}`, { project_id: projectId }, API_TIMEOUT_MS);
+      setChats((current) => current.map((item) => item.id === chatId ? chatFromRecord(record) : item));
+      if (activeChatId === chatId) {
+        setActiveProjectId(projectId);
+        await syncWorkspace(projectId, chatId);
+      }
+    } catch (error) {
+      setWorkspaceError(error instanceof Error ? error.message : "Не удалось перенести чат в проект");
+    }
+  }, [activeChatId, chats, syncWorkspace]);
+
   const onNew = useCallback(async (message: AppendMessage) => {
     const question = extractText(message);
     if (!question || !activeChatId) return;
@@ -557,7 +573,7 @@ export function App() {
 
     try {
       await postJson<MessageRecord>(`/api/chats/${activeChatId}/messages`, { role: "user", content: question }, API_TIMEOUT_MS);
-      const data = await postJson<AskResponse>("/api/ask", { question }, ASK_TIMEOUT_MS);
+      const data = await postJson<AskResponse>("/api/ask", { question, chat_id: activeChatId }, ASK_TIMEOUT_MS);
       await postJson<MessageRecord>(`/api/chats/${activeChatId}/messages`, {
         role: "assistant",
         content: data.answer || "Пустой ответ.",
@@ -692,8 +708,10 @@ export function App() {
             chats={chats}
             projects={projects}
             onChatChange={(chat) => void openChat(chat)}
+            onChatMove={(chatId, projectId) => void moveChat(chatId, projectId)}
             onChatRename={(chatId) => void renameChat(chatId)}
             onProjectChange={(projectId) => void selectProject(projectId)}
+            onProjectChatCreate={(projectId) => void createChat(projectId)}
             onProjectCreate={() => void createProject()}
             onProjectRename={(projectId) => void renameProject(projectId)}
           />
@@ -744,8 +762,10 @@ function NavigationSidebar({
   chats,
   projects,
   onChatChange,
+  onChatMove,
   onChatRename,
   onProjectChange,
+  onProjectChatCreate,
   onProjectCreate,
   onProjectRename
 }: {
@@ -753,12 +773,15 @@ function NavigationSidebar({
   chats: ChatSummary[];
   projects: Project[];
   onChatChange: (chat: ChatSummary) => void;
+  onChatMove: (chatId: string, projectId: string) => void;
   onChatRename: (chatId: string) => void;
   onProjectChange: (projectId: string) => void;
+  onProjectChatCreate: (projectId: string) => void;
   onProjectCreate: () => void;
   onProjectRename: (projectId: string) => void;
 }) {
   const [showAllProjects, setShowAllProjects] = useState(false);
+  const [movingChatId, setMovingChatId] = useState<string | null>(null);
   const visibleProjects = showAllProjects ? projects : projects.slice(0, 5);
   const pinnedProjects = projects.slice(0, 2);
 
@@ -773,6 +796,7 @@ function NavigationSidebar({
               icon={<Folder size={17} />}
               key={project.id}
               label={project.name}
+              onCreateChat={() => onProjectChatCreate(project.id)}
               onOpen={() => onProjectChange(project.id)}
               onRename={() => onProjectRename(project.id)}
             />
@@ -792,6 +816,7 @@ function NavigationSidebar({
               icon={<Folder size={17} />}
               key={project.id}
               label={project.name}
+              onCreateChat={() => onProjectChatCreate(project.id)}
               onOpen={() => onProjectChange(project.id)}
               onRename={() => onProjectRename(project.id)}
             />
@@ -808,14 +833,35 @@ function NavigationSidebar({
         <div className="nav-section-title">Чаты</div>
         <div className="sidebar-chat-list">
           {chats.length ? chats.map((chat) => (
-            <NavigationItem
-              chat
-              icon={<MessageSquare size={16} />}
-              key={chat.id}
-              label={chat.title}
-              onOpen={() => onChatChange(chat)}
-              onRename={() => onChatRename(chat.id)}
-            />
+            <div className="nav-chat-group" key={chat.id}>
+              <NavigationItem
+                chat
+                icon={<MessageSquare size={16} />}
+                label={chat.title}
+                onMove={() => setMovingChatId((current) => current === chat.id ? null : chat.id)}
+                onOpen={() => onChatChange(chat)}
+                onRename={() => onChatRename(chat.id)}
+              />
+              {movingChatId === chat.id ? (
+                <div className="nav-move-menu">
+                  <div className="nav-move-title">Перенести в проект</div>
+                  {projects.map((project) => (
+                    <button
+                      disabled={project.id === chat.projectId}
+                      key={project.id}
+                      onClick={() => {
+                        onChatMove(chat.id, project.id);
+                        setMovingChatId(null);
+                      }}
+                      type="button"
+                    >
+                      <Folder size={14} />
+                      <span>{project.name}</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
           )) : <div className="sidebar-empty">История появится после первого вопроса.</div>}
         </div>
       </section>
@@ -828,6 +874,8 @@ function NavigationItem({
   chat = false,
   icon,
   label,
+  onCreateChat,
+  onMove,
   onOpen,
   onRename
 }: {
@@ -835,6 +883,8 @@ function NavigationItem({
   chat?: boolean;
   icon: ReactNode;
   label: string;
+  onCreateChat?: () => void;
+  onMove?: () => void;
   onOpen: () => void;
   onRename: () => void;
 }) {
@@ -845,9 +895,11 @@ function NavigationItem({
         <span>{label}</span>
         <span className="nav-pin" title="Закрепить"><Pin size={15} /></span>
       </button>
-      <button className="nav-rename" onClick={onRename} title="Переименовать" type="button">
-        <Pencil size={14} />
-      </button>
+      <div className="nav-actions">
+        {onCreateChat ? <button className="nav-action" onClick={onCreateChat} title="Новый чат в проекте" type="button"><Plus size={14} /></button> : null}
+        {onMove ? <button className="nav-action" onClick={onMove} title="Перенести в проект" type="button"><FolderInput size={14} /></button> : null}
+        <button className="nav-action" onClick={onRename} title="Переименовать" type="button"><Pencil size={14} /></button>
+      </div>
     </div>
   );
 }

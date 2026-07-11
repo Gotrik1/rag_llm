@@ -24,6 +24,7 @@ from db_store import (
     delete_message,
     delete_project,
     get_chat,
+    get_project_conversation,
     get_message,
     get_project,
     get_workspace,
@@ -135,6 +136,36 @@ def storage_defaults() -> tuple[str, str, str]:
     )
 
 
+def project_context_prompt(scope: dict) -> str:
+    """Format only the current project's persisted conversation for generation."""
+    memory = scope.get("memory") if isinstance(scope.get("memory"), dict) else {}
+    memory_text = str(memory.get("text", "")).strip()
+    entries: list[str] = []
+    used = 0
+    for message in reversed(scope.get("messages", [])):
+        content = str(message.get("content", "")).strip()
+        if not content:
+            continue
+        title = str(message.get("chat_title", "Чат"))[:120]
+        role = str(message.get("role", "user"))
+        entry = f"[{title} | {role}] {content[:1800]}"
+        if used + len(entry) > 12_000:
+            break
+        entries.append(entry)
+        used += len(entry)
+    entries.reverse()
+    parts = [
+        f"КОНТЕКСТ ПРОЕКТА: {scope.get('project_name', 'Проект')}",
+        "Используй этот контекст только для продолжения работы в проекте. "
+        "Он не заменяет доказательства из регламентов и не содержит данных других проектов.",
+    ]
+    if memory_text:
+        parts.append(f"ПАМЯТЬ ПРОЕКТА:\n{memory_text[:4000]}")
+    if entries:
+        parts.append("ИСТОРИЯ ЧАТОВ ПРОЕКТА:\n" + "\n".join(entries))
+    return "\n\n".join(parts)
+
+
 def save_flow_mode(mode: str) -> None:
     FLOW_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     FLOW_CONFIG_PATH.write_text(json.dumps({"mode": mode}), encoding="utf-8")
@@ -234,11 +265,13 @@ def filter_rust_context(question: str, items: list[dict]) -> list[dict]:
     return filtered
 
 
-def rust_generate(question: str, context: list[dict]) -> str:
+def rust_generate(question: str, context: list[dict], project_context: str = "") -> str:
     context_text = "\n\n---\n\n".join(
         f"[Источник: {item.get('file', '?')}, Раздел: {item.get('section_path', '')}]\n{item.get('text', '')}"
         for item in context
     )
+    if project_context:
+        context_text = f"{context_text}\n\n---\n\n{project_context}"
     config = load_provider_config()
     model = str(config.get("model", "")).strip() if config.get("provider", "ollama") == "ollama" else ""
     request = json.dumps(
@@ -589,7 +622,10 @@ $("askBtn").onclick = async () => {
   const question = $("question").value.trim();
   if (!question) return;
   try {
-    const data = await post("/api/ask", {question});
+    const workspaceResponse = await fetch("/api/workspace", {cache: "no-store"});
+    const workspace = await workspaceResponse.json();
+    if (!workspaceResponse.ok || !workspace.active_chat_id) throw new Error(workspace.error || "Нет активного чата");
+    const data = await post("/api/ask", {question, chat_id: workspace.active_chat_id});
     $("answer").innerHTML = data.html_answer;
     $("formulas").innerHTML = renderFormulas(data.formulas);
     $("warnings").innerHTML = renderWarnings(data.warnings);
@@ -908,20 +944,26 @@ class Handler(BaseHTTPRequestHandler):
         if not question:
             self.send_json({"error": "empty question"}, 400)
             return
+        chat_id = str(body.get("chat_id", "")).strip()
+        scope = get_project_conversation(chat_id)
+        if scope is None:
+            self.send_json({"error": "chat not found"}, 404)
+            return
 
         mode = load_flow_mode()
         agent = get_agent()
         t0 = time.time()
         with _request_lock:
             profile = get_profile(load_system_prompt_id(), GROUNDED_SYSTEM_PROMPT)
+            scoped_prompt = f"{profile['prompt']}\n\n{project_context_prompt(scope)}"
             if mode == "python":
-                answer, sources, from_cache = agent.ask(question, profile["prompt"], profile["id"])
+                answer, sources, from_cache = agent.ask(question, scoped_prompt, profile["id"])
                 context = agent.retrieve_context(question, TOP_K)
             elif mode == "rust":
                 python_items = agent.retrieve_context(question, TOP_K)
                 rust_items = filter_rust_context(question, rust_context(question))
                 context = fuse_contexts(python_items, rust_items, TOP_K)
-                answer = rust_generate(question, context)
+                answer = rust_generate(question, context, project_context_prompt(scope))
                 from_cache = False
                 sources = [{
                     "file": item["file"], "section": item.get("section_path", ""), "score": item["score"],
@@ -933,7 +975,7 @@ class Handler(BaseHTTPRequestHandler):
                 context = fuse_contexts(python_items, rust_items, TOP_K)
                 spec = refine_prism_query(question)
                 calculations = extract_formula_lines(context, question)
-                answer = agent._generate_grounded_answer(question, context, calculations, spec, profile["prompt"])
+                answer = agent._generate_grounded_answer(question, context, calculations, spec, scoped_prompt)
                 from_cache = False
                 sources = [{"file": item["file"], "section": item.get("section_path", ""), "score": item["score"], "text_preview": item["text"][:120]} for item in context]
         formulas = extract_formula_lines(context, question)

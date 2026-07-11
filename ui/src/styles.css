@@ -227,11 +227,16 @@ textarea {
   flex: 1 1 auto;
 }
 
-.nav-rename {
+.nav-actions {
   display: none;
+  align-items: center;
+  gap: 2px;
+}
+
+.nav-action {
+  display: grid;
   width: 26px;
   height: 26px;
-  flex: 0 0 auto;
   place-items: center;
   border: 0;
   border-radius: 5px;
@@ -240,14 +245,60 @@ textarea {
   cursor: pointer;
 }
 
-.nav-row:hover .nav-rename,
-.nav-rename:focus-visible {
-  display: grid;
+.nav-row:hover .nav-actions,
+.nav-actions:focus-within {
+  display: flex;
 }
 
-.nav-rename:hover {
+.nav-action:hover {
   background: #1c1c1c;
   color: #fff;
+}
+
+.nav-move-menu {
+  display: grid;
+  gap: 2px;
+  margin: 2px 0 5px 24px;
+  padding: 7px;
+  border-radius: 6px;
+  background: #1c1c1c;
+}
+
+.nav-move-title {
+  padding: 0 4px 4px;
+  color: #aeb5be;
+  font-size: 11px;
+}
+
+.nav-move-menu button {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #f2f3f5;
+  padding: 6px 4px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+}
+
+.nav-move-menu button:hover:not(:disabled) {
+  background: #292929;
+}
+
+.nav-move-menu button:disabled {
+  color: #6f757d;
+  cursor: default;
+}
+
+.nav-move-menu span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .nav-item {
@@ -1311,13 +1362,26 @@ sub {
   color: #d96548;
 }
 
-.theme-portal .nav-rename {
+.theme-portal .nav-action {
   color: #f28a32;
 }
 
-.theme-portal .nav-rename:hover {
+.theme-portal .nav-action:hover {
   background: var(--sidebar-hover-bg);
   color: var(--sidebar-hover-text);
+}
+
+.theme-portal .nav-move-menu {
+  background: #ffffff;
+  box-shadow: 0 6px 20px rgba(46, 59, 76, 0.14);
+}
+
+.theme-portal .nav-move-menu button {
+  color: #2a3545;
+}
+
+.theme-portal .nav-move-menu button:hover:not(:disabled) {
+  background: var(--sidebar-hover-bg);
 }
 
 .theme-portal .nav-add-project:hover {
@@ -1618,7 +1682,7 @@ sub {
   .app-shell.sidebar-collapsed .new-thread > span:not(.new-thread-icon),
   .app-shell.sidebar-collapsed .nav-section-title,
   .app-shell.sidebar-collapsed .nav-item span,
-  .app-shell.sidebar-collapsed .nav-rename,
+  .app-shell.sidebar-collapsed .nav-actions,
   .app-shell.sidebar-collapsed .show-more,
   .app-shell.sidebar-collapsed .sidebar-empty {
     display: none;

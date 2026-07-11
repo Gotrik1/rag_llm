@@ -145,3 +145,55 @@ class WorkspacePersistenceIntegrationTests(unittest.TestCase):
                     deleted = cursor.fetchone()
                 self.assertIsNotNone(deleted)
                 self.assertIsNotNone(deleted["deleted_at"])
+
+    def test_project_conversation_isolated_and_moves_with_chat(self) -> None:
+        project_ids: list[str] = []
+        chat_ids: list[str] = []
+        message_ids: list[str] = []
+        suffix = uuid.uuid4().hex
+        try:
+            _, first_project = self.request_json("POST", "/api/projects", {"name": f"scope-a-{suffix}"})
+            _, second_project = self.request_json("POST", "/api/projects", {"name": f"scope-b-{suffix}"})
+            project_ids.extend([first_project["id"], second_project["id"]])
+
+            _, first_chat = self.request_json("POST", f"/api/projects/{first_project['id']}/chats", {"title": "chat-a"})
+            _, second_chat = self.request_json("POST", f"/api/projects/{second_project['id']}/chats", {"title": "chat-b"})
+            chat_ids.extend([first_chat["id"], second_chat["id"]])
+
+            _, first_message = self.request_json("POST", f"/api/chats/{first_chat['id']}/messages", {
+                "role": "user", "content": "alpha-only context"
+            })
+            _, second_message = self.request_json("POST", f"/api/chats/{second_chat['id']}/messages", {
+                "role": "user", "content": "beta-only context"
+            })
+            message_ids.extend([first_message["id"], second_message["id"]])
+
+            first_scope = db_store.get_project_conversation(first_chat["id"])
+            self.assertIsNotNone(first_scope)
+            self.assertEqual(str(first_scope["project_id"]), first_project["id"])
+            first_contents = [message["content"] for message in first_scope["messages"]]
+            self.assertIn("alpha-only context", first_contents)
+            self.assertNotIn("beta-only context", first_contents)
+
+            status, moved_chat = self.request_json("PATCH", f"/api/chats/{first_chat['id']}", {
+                "project_id": second_project["id"]
+            })
+            self.assertEqual(status, 200)
+            self.assertEqual(moved_chat["project_id"], second_project["id"])
+
+            moved_scope = db_store.get_project_conversation(first_chat["id"])
+            self.assertIsNotNone(moved_scope)
+            self.assertEqual(str(moved_scope["project_id"]), second_project["id"])
+            moved_contents = [message["content"] for message in moved_scope["messages"]]
+            self.assertIn("alpha-only context", moved_contents)
+            self.assertIn("beta-only context", moved_contents)
+
+            _, first_project_chats = self.request_json("GET", f"/api/projects/{first_project['id']}/chats")
+            self.assertEqual(first_project_chats["items"], [])
+        finally:
+            for message_id in message_ids:
+                self.request_json("DELETE", f"/api/messages/{message_id}")
+            for chat_id in chat_ids:
+                self.request_json("DELETE", f"/api/chats/{chat_id}")
+            for project_id in project_ids:
+                self.request_json("DELETE", f"/api/projects/{project_id}")

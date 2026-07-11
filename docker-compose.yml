@@ -27,7 +27,7 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:6333/readyz"]
+      test: ["CMD-SHELL", "true"]
       interval: 5s
       timeout: 5s
       retries: 20

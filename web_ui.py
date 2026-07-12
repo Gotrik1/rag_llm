@@ -8,18 +8,23 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from html import escape
 from email.parser import BytesParser
 from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any, Iterator
 from urllib.parse import urlparse
 from urllib.request import urlopen
 from urllib.error import URLError
 
+from opentelemetry.trace import Status, StatusCode
+
 from llm_providers import DEFAULTS, ProviderLLM
 from rag_agent import GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, refine_prism_query, validate_retrieval
 from system_prompts import get_profile, profiles
+from telemetry import PIPELINE_SECONDS, tracer
 
 
 HOST = "127.0.0.1"
@@ -34,6 +39,43 @@ FLOW_MODES = {"python", "rust", "hybrid"}
 _agent: RAGAgent | None = None
 _agent_lock = threading.Lock()
 _request_lock = threading.Lock()
+
+
+@contextmanager
+def _pipeline_span(
+    stage: str,
+    *,
+    flow: str,
+    attributes: dict[str, Any] | None = None,
+) -> Iterator[Any]:
+    """Measure a stage without attaching prompts, evidence, answers, or users."""
+    started = time.perf_counter()
+    with tracer().start_as_current_span(
+        f"rag.{stage}",
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as span:
+        span.set_attribute("rag.pipeline.stage", stage)
+        span.set_attribute("rag.flow", flow)
+        for key, value in (attributes or {}).items():
+            span.set_attribute(key, value)
+        try:
+            yield span
+        except BaseException as exc:
+            # Provider/subprocess errors can contain generated text; omit messages.
+            span.set_status(Status(StatusCode.ERROR))
+            span.set_attribute("error.type", type(exc).__name__)
+            raise
+        finally:
+            PIPELINE_SECONDS.labels(stage=stage, flow=flow).observe(time.perf_counter() - started)
+
+
+def _telemetry_flow(flow: str) -> str:
+    return flow if flow in FLOW_MODES else "rust"
+
+
+def _rust_operation(command: str) -> str:
+    return {"retrieve-json": "retrieve", "generate-json": "generate"}.get(command, "other")
 
 
 def load_provider_config() -> dict:
@@ -80,41 +122,57 @@ def _rust_command() -> list[str]:
     return [str(binary)] if binary.exists() else ["cargo", "run", "--quiet"]
 
 
-def _run_rust_json(command: str, question: str) -> dict | list[dict]:
+def _run_rust_json(command: str, question: str, *, flow: str = "rust") -> dict | list[dict]:
     """Call the Rust CLI using its one-line JSON protocol."""
-    try:
-        result = subprocess.run(
-            _rust_command(), input=f":{command} {question}\n:exit\n".encode("utf-8"),
-            capture_output=True, cwd=Path.cwd(), timeout=180, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"Rust flow недоступен: {exc}") from exc
-    stdout = result.stdout.decode("utf-8", errors="replace")
-    stderr = result.stderr.decode("utf-8", errors="replace")
-    for line in reversed(stdout.splitlines()):
-        line = line.strip().removeprefix("> ").strip()
-        if line.startswith("{") or line.startswith("["):
-            try:
-                return json.loads(line)
-            except ValueError:
-                pass
-    detail = stderr.strip() or stdout.strip() or "Rust не вернул JSON"
-    raise RuntimeError(f"Rust flow завершился с ошибкой: {detail[-600:]}")
+    operation = _rust_operation(command)
+    flow = _telemetry_flow(flow)
+    with _pipeline_span(
+        f"rust.subprocess.{operation}",
+        flow=flow,
+        attributes={"rag.rust.operation": operation},
+    ) as span:
+        try:
+            result = subprocess.run(
+                _rust_command(), input=f":{command} {question}\n:exit\n".encode("utf-8"),
+                capture_output=True, cwd=Path.cwd(), timeout=180, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"Rust flow недоступен: {exc}") from exc
+        span.set_attribute("process.exit.code", result.returncode)
+        span.set_attribute("process.stdout.size", len(result.stdout))
+        span.set_attribute("process.stderr.size", len(result.stderr))
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        for line in reversed(stdout.splitlines()):
+            line = line.strip().removeprefix("> ").strip()
+            if line.startswith("{") or line.startswith("["):
+                try:
+                    payload = json.loads(line)
+                    span.set_attribute("rag.rust.response.type", type(payload).__name__)
+                    return payload
+                except ValueError:
+                    pass
+        detail = stderr.strip() or stdout.strip() or "Rust не вернул JSON"
+        raise RuntimeError(f"Rust flow завершился с ошибкой: {detail[-600:]}")
 
 
-def rust_context(question: str) -> list[dict]:
-    payload = _run_rust_json("retrieve-json", question)
-    if not isinstance(payload, list):
-        raise RuntimeError("Некорректный retrieval-ответ Rust flow")
-    return [{
-        "file": str(item.get("file", "?")), "score": float(item.get("score", 0)),
-        "text": str(item.get("text", "")), "section_path": str(item.get("section_path", "")),
-        "section_title": str(item.get("section_title", "")), "status": str(item.get("status", "active")),
-        "chunk_type": str(item.get("chunk_type", "unknown")),
-    } for item in payload if isinstance(item, dict)]
+def rust_context(question: str, *, flow: str = "rust") -> list[dict]:
+    flow = _telemetry_flow(flow)
+    with _pipeline_span("rust.retrieve", flow=flow) as span:
+        payload = _run_rust_json("retrieve-json", question, flow=flow)
+        if not isinstance(payload, list):
+            raise RuntimeError("Некорректный retrieval-ответ Rust flow")
+        results = [{
+            "file": str(item.get("file", "?")), "score": float(item.get("score", 0)),
+            "text": str(item.get("text", "")), "section_path": str(item.get("section_path", "")),
+            "section_title": str(item.get("section_title", "")), "status": str(item.get("status", "active")),
+            "chunk_type": str(item.get("chunk_type", "unknown")),
+        } for item in payload if isinstance(item, dict)]
+        span.set_attribute("rag.results.count", len(results))
+        return results
 
 
-def fuse_contexts(python_items: list[dict], rust_items: list[dict], top_k: int = TOP_K) -> list[dict]:
+def _fuse_contexts_impl(python_items: list[dict], rust_items: list[dict], top_k: int) -> list[dict]:
     """Fuse evidence while treating the current Python index as authoritative.
 
     The Rust index may be older or contain only part of the corpus.  Keep most
@@ -150,38 +208,82 @@ def fuse_contexts(python_items: list[dict], rust_items: list[dict], top_k: int =
     return selected[:top_k]
 
 
-def filter_rust_context(question: str, items: list[dict]) -> list[dict]:
+def fuse_contexts(
+    python_items: list[dict],
+    rust_items: list[dict],
+    top_k: int = TOP_K,
+    *,
+    flow: str = "hybrid",
+) -> list[dict]:
+    """Fuse Python/Rust evidence and expose only aggregate telemetry."""
+    flow = _telemetry_flow(flow)
+    with _pipeline_span(
+        "retrieval.cross_runtime_fusion",
+        flow=flow,
+        attributes={
+            "rag.results.python_count": len(python_items),
+            "rag.results.rust_count": len(rust_items),
+            "rag.retrieval.top_k": top_k,
+        },
+    ) as span:
+        selected = _fuse_contexts_impl(python_items, rust_items, top_k)
+        span.set_attribute("rag.results.count", len(selected))
+        return selected
+
+
+def filter_rust_context(question: str, items: list[dict], *, flow: str = "rust") -> list[dict]:
     """Reject Rust evidence that matches a word but not the requested operation."""
-    normalized = question.lower().replace("ё", "е")
-    asks_parameter = "параметр" in normalized
-    asks_creation = any(marker in normalized for marker in ("добав", "созда", "новый", "завест"))
-    filtered: list[dict] = []
-    for item in items:
-        haystack = f"{item.get('section_path', '')}\n{item.get('text', '')}".lower().replace("ё", "е")
-        if asks_parameter and "параметр" not in haystack:
-            continue
-        if asks_creation and not any(marker in haystack for marker in ("добав", "созда", "создание")):
-            continue
-        filtered.append(item)
-    return filtered
+    flow = _telemetry_flow(flow)
+    with _pipeline_span(
+        "rust.filter",
+        flow=flow,
+        attributes={"rag.results.input_count": len(items)},
+    ) as span:
+        normalized = question.lower().replace("ё", "е")
+        asks_parameter = "параметр" in normalized
+        asks_creation = any(marker in normalized for marker in ("добав", "созда", "новый", "завест"))
+        filtered: list[dict] = []
+        for item in items:
+            haystack = f"{item.get('section_path', '')}\n{item.get('text', '')}".lower().replace("ё", "е")
+            if asks_parameter and "параметр" not in haystack:
+                continue
+            if asks_creation and not any(marker in haystack for marker in ("добав", "созда", "создание")):
+                continue
+            filtered.append(item)
+        span.set_attribute("rag.results.count", len(filtered))
+        return filtered
 
 
-def rust_generate(question: str, context: list[dict]) -> str:
-    context_text = "\n\n---\n\n".join(
-        f"[Источник: {item.get('file', '?')}, Раздел: {item.get('section_path', '')}]\n{item.get('text', '')}"
-        for item in context
-    )
+def rust_generate(question: str, context: list[dict], *, flow: str = "rust") -> str:
+    flow = _telemetry_flow(flow)
     config = load_provider_config()
-    model = str(config.get("model", "")).strip() if config.get("provider", "ollama") == "ollama" else ""
-    request = json.dumps(
-        {"question": question, "context": context_text, "model": model or None},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    payload = _run_rust_json("generate-json", request)
-    if not isinstance(payload, dict) or not str(payload.get("answer", "")).strip():
-        raise RuntimeError("Rust flow не вернул ответ")
-    return str(payload["answer"]).strip()
+    provider = str(config.get("provider", "ollama"))
+    model = str(config.get("model", "")).strip() if provider == "ollama" else ""
+    with _pipeline_span(
+        "rust.generate",
+        flow=flow,
+        attributes={
+            "gen_ai.operation.name": "generate_content",
+            "gen_ai.provider.name": provider,
+            "gen_ai.request.model": model,
+            "rag.context.count": len(context),
+        },
+    ) as span:
+        context_text = "\n\n---\n\n".join(
+            f"[Источник: {item.get('file', '?')}, Раздел: {item.get('section_path', '')}]\n{item.get('text', '')}"
+            for item in context
+        )
+        request = json.dumps(
+            {"question": question, "context": context_text, "model": model or None},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        payload = _run_rust_json("generate-json", request, flow=flow)
+        if not isinstance(payload, dict) or not str(payload.get("answer", "")).strip():
+            raise RuntimeError("Rust flow не вернул ответ")
+        answer = str(payload["answer"]).strip()
+        span.set_attribute("rag.response.chars", len(answer))
+        return answer
 
 
 def public_provider_config(config: dict) -> dict:
@@ -339,15 +441,23 @@ def ask_payload(question: str) -> dict:
             context = agent.retrieve_context(question, TOP_K)
         elif mode == "rust":
             python_items = agent.retrieve_context(question, TOP_K)
-            rust_items = filter_rust_context(question, rust_context(question))
-            context = fuse_contexts(python_items, rust_items, TOP_K)
-            answer = rust_generate(question, context)
+            rust_items = filter_rust_context(
+                question,
+                rust_context(question, flow=mode),
+                flow=mode,
+            )
+            context = fuse_contexts(python_items, rust_items, TOP_K, flow=mode)
+            answer = rust_generate(question, context, flow=mode)
             from_cache = False
             sources = [{"file": item["file"], "section": item.get("section_path", ""), "score": item["score"], "text_preview": item["text"][:120]} for item in context]
         else:
             python_items = agent.retrieve_context(question, TOP_K)
-            rust_items = filter_rust_context(question, rust_context(question))
-            context = fuse_contexts(python_items, rust_items, TOP_K)
+            rust_items = filter_rust_context(
+                question,
+                rust_context(question, flow=mode),
+                flow=mode,
+            )
+            context = fuse_contexts(python_items, rust_items, TOP_K, flow=mode)
             spec = refine_prism_query(question)
             calculations = extract_formula_lines(context, question)
             answer = agent._generate_grounded_answer(question, context, calculations, spec, profile["prompt"])

@@ -9,12 +9,18 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import os
 import re
 import sqlite3
 import sys
+import time
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Iterator
+
+from opentelemetry.trace import Status, StatusCode
 
 # ─── LlamaIndex ───────────────────────────────────────────────
 from llama_index.core import (
@@ -41,13 +47,14 @@ import qdrant_client
 from ollama import Client as OllamaClient
 from document_ingestion import ingest_document
 from llm_providers import ProviderLLM
+from telemetry import PIPELINE_SECONDS, tracer
 
 # ─── Настройки ────────────────────────────────────────────────
-OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 LLM_MODEL       = "qwen2.5:14b"
 EMBED_MODEL      = "nomic-embed-text"   # лёгкая, быстрая, хорошая для рус/англ
 
-QDRANT_URL       = "http://127.0.0.1:6333"
+QDRANT_URL       = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 QDRANT_COLLECTION = "rag_docs_v10"
 
 CHUNK_SIZE       = 1024
@@ -56,7 +63,7 @@ TOP_K            = 10      # финальных чанков в контекст
 BM25_TOP_K       = 12      # кандидатов от BM25
 VECTOR_TOP_K     = 12      # кандидатов от вектора
 
-CACHE_DB         = "cache.db"
+CACHE_DB         = os.getenv("CACHE_DB", "cache.db")
 BM25_PERSIST_DIR = "bm25_index_v10"   # сохраняем ноды для BM25
 CACHE_VERSION    = "v19-qwen35-profile"
 
@@ -77,6 +84,58 @@ DEFAULT_OLLAMA_PROFILE = {
     "num_predict": 1024,
     "request_timeout": 180.0,
 }
+
+
+@contextmanager
+def _pipeline_span(
+    stage: str,
+    *,
+    flow: str = "python",
+    attributes: dict[str, Any] | None = None,
+) -> Iterator[Any]:
+    """Measure one content-free RAG stage in Prometheus and OpenTelemetry."""
+    started = time.perf_counter()
+    with tracer().start_as_current_span(
+        f"rag.{stage}",
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as span:
+        span.set_attribute("rag.pipeline.stage", stage)
+        span.set_attribute("rag.flow", flow)
+        for key, value in (attributes or {}).items():
+            span.set_attribute(key, value)
+        try:
+            yield span
+        except BaseException as exc:
+            # Exception messages may contain provider output. Keep only the type.
+            span.set_status(Status(StatusCode.ERROR))
+            span.set_attribute("error.type", type(exc).__name__)
+            raise
+        finally:
+            PIPELINE_SECONDS.labels(stage=stage, flow=flow).observe(time.perf_counter() - started)
+
+
+class _TracedRetriever:
+    """Transparent retriever proxy that exposes vector/BM25 child timings."""
+
+    def __init__(self, retriever: Any, stage: str):
+        self._retriever = retriever
+        self._stage = stage
+
+    def retrieve(self, *args: Any, **kwargs: Any):
+        with _pipeline_span(self._stage) as span:
+            results = self._retriever.retrieve(*args, **kwargs)
+            span.set_attribute("rag.results.count", len(results))
+            return results
+
+    async def aretrieve(self, *args: Any, **kwargs: Any):
+        with _pipeline_span(self._stage) as span:
+            results = await self._retriever.aretrieve(*args, **kwargs)
+            span.set_attribute("rag.results.count", len(results))
+            return results
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._retriever, name)
 
 
 SYSTEM_PROMPT = """\
@@ -1147,13 +1206,19 @@ class RAGAgent:
 
     def _build_query_engine(self, top_k: int = TOP_K):
         """Строим гибридный query engine с текущими нодами."""
-        vector_retriever = self.index.as_retriever(similarity_top_k=max(VECTOR_TOP_K, top_k))
+        vector_retriever = _TracedRetriever(
+            self.index.as_retriever(similarity_top_k=max(VECTOR_TOP_K, top_k)),
+            "retrieval.vector",
+        )
 
         retrievers = [vector_retriever]
         if self._all_nodes:
-            bm25_retriever = BM25Retriever.from_defaults(
-                nodes=self._all_nodes,
-                similarity_top_k=max(BM25_TOP_K, top_k),
+            bm25_retriever = _TracedRetriever(
+                BM25Retriever.from_defaults(
+                    nodes=self._all_nodes,
+                    similarity_top_k=max(BM25_TOP_K, top_k),
+                ),
+                "retrieval.bm25",
             )
             retrievers.append(bm25_retriever)
 
@@ -1232,11 +1297,19 @@ class RAGAgent:
         """
         qhash = _question_hash(f"{prompt_id}\n{system_prompt or GROUNDED_SYSTEM_PROMPT}\n{question}")
 
-        # Проверяем кэш
-        row = self.cache.execute(
-            "SELECT answer, sources FROM answer_cache WHERE question_hash = ?",
-            (qhash,),
-        ).fetchone()
+        # Проверяем кэш. Хэш, вопрос и ответ намеренно не попадают в telemetry.
+        with _pipeline_span("cache.lookup") as span:
+            row = self.cache.execute(
+                "SELECT answer, sources FROM answer_cache WHERE question_hash = ?",
+                (qhash,),
+            ).fetchone()
+            cache_hit = row is not None
+            span.set_attribute("rag.cache.hit", cache_hit)
+            # Histogram's _count provides a low-cardinality hit/miss counter.
+            PIPELINE_SECONDS.labels(
+                stage="cache.hit" if cache_hit else "cache.miss",
+                flow="python",
+            ).observe(0.0)
         if row:
             answer, sources_json = row
             return answer, json.loads(sources_json), True
@@ -1261,11 +1334,12 @@ class RAGAgent:
         } for item in context]
 
         # Кэшируем
-        self.cache.execute(
-            "INSERT OR REPLACE INTO answer_cache (question_hash, question, answer, sources) VALUES (?,?,?,?)",
-            (qhash, question, answer, json.dumps(sources, ensure_ascii=False)),
-        )
-        self.cache.commit()
+        with _pipeline_span("cache.write"):
+            self.cache.execute(
+                "INSERT OR REPLACE INTO answer_cache (question_hash, question, answer, sources) VALUES (?,?,?,?)",
+                (qhash, question, answer, json.dumps(sources, ensure_ascii=False)),
+            )
+            self.cache.commit()
 
         return answer, sources, False
 
@@ -1279,8 +1353,17 @@ class RAGAgent:
     ) -> str:
         spec = spec or refine_prism_query(question)
         if spec.answer_mode == "formulas_only":
-            return generate_formula_only_answer(question, context, calculations, spec)
-        extractive = generate_extractive_value_answer(question, context)
+            with _pipeline_span(
+                "generation.formula",
+                attributes={"rag.context.count": len(context)},
+            ):
+                return generate_formula_only_answer(question, context, calculations, spec)
+        with _pipeline_span(
+            "generation.extractive",
+            attributes={"rag.context.count": len(context)},
+        ) as extractive_span:
+            extractive = generate_extractive_value_answer(question, context)
+            extractive_span.set_attribute("rag.generation.matched", bool(extractive))
         if extractive:
             return extractive
 
@@ -1313,7 +1396,18 @@ class RAGAgent:
 
 ОТВЕТ:
 """
-        response = self.llm.complete(prompt)
+        provider = str(getattr(self.llm, "provider", "ollama") or "ollama")
+        with _pipeline_span(
+            "llm.generate",
+            attributes={
+                "gen_ai.operation.name": "generate_content",
+                "gen_ai.provider.name": provider,
+                "gen_ai.request.model": self.llm_model,
+                "rag.context.count": len(context),
+            },
+        ) as llm_span:
+            response = self.llm.complete(prompt)
+            llm_span.set_attribute("rag.response.chars", len(str(response)))
         return sanitize_grounded_answer(str(response).strip(), question, calculations)
 
     def debug_retrieval(self, question: str, top_k: int = 10):
@@ -1490,7 +1584,11 @@ class RAGAgent:
         """Вернуть найденные чанки без вызова LLM."""
         spec = spec or refine_prism_query(question)
         candidate_k = max(top_k * 5, 40)
-        qe = self._build_query_engine(candidate_k)
+        with _pipeline_span(
+            "retrieval.setup",
+            attributes={"rag.retrieval.candidate_k": candidate_k},
+        ):
+            qe = self._build_query_engine(candidate_k)
         merged: dict[str, dict] = {}
         for item in self._procedural_seed_results(question):
             key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
@@ -1501,8 +1599,17 @@ class RAGAgent:
         for item in self._section_seed_results(question):
             key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
             merged[key] = item
-        for query in build_targeted_queries(question):
-            nodes = qe.retriever.retrieve(QueryBundle(query_str=query))
+        targeted_queries = build_targeted_queries(question)
+        for query_index, query in enumerate(targeted_queries):
+            with _pipeline_span(
+                "retrieval.fusion",
+                attributes={
+                    "rag.query.index": query_index,
+                    "rag.query.count": len(targeted_queries),
+                },
+            ) as fusion_span:
+                nodes = qe.retriever.retrieve(QueryBundle(query_str=query))
+                fusion_span.set_attribute("rag.results.count", len(nodes))
             for item in nodes:
                 meta = item.node.metadata or {}
                 text = item.node.text or ""
@@ -1534,9 +1641,24 @@ class RAGAgent:
                     current["score"] = round(score, 4)
                     current.update(chunk_meta)
         results = list(merged.values())
-        ranked = rerank_context_results(results, question)
-        diversified = diversify_context_results(ranked, question, top_k)
-        selected = select_prism_evidence(diversified, spec, top_k)
+        with _pipeline_span(
+            "retrieval.rerank",
+            attributes={"rag.results.input_count": len(results)},
+        ) as rerank_span:
+            ranked = rerank_context_results(results, question)
+            rerank_span.set_attribute("rag.results.count", len(ranked))
+        with _pipeline_span(
+            "retrieval.diversify",
+            attributes={"rag.results.input_count": len(ranked)},
+        ) as diversify_span:
+            diversified = diversify_context_results(ranked, question, top_k)
+            diversify_span.set_attribute("rag.results.count", len(diversified))
+        with _pipeline_span(
+            "retrieval.select",
+            attributes={"rag.results.input_count": len(diversified)},
+        ) as select_span:
+            selected = select_prism_evidence(diversified, spec, top_k)
+            select_span.set_attribute("rag.results.count", len(selected))
         normalized = question.lower().replace("ё", "е")
         if "параметр" in normalized and any(
             marker in normalized for marker in ("добав", "созда", "новый", "завест")
@@ -1572,7 +1694,12 @@ class RAGAgent:
             nodes=self._all_nodes,
             similarity_top_k=top_k,
         )
-        results = retriever.retrieve(QueryBundle(query_str=query))
+        with _pipeline_span(
+            "retrieval.bm25",
+            attributes={"rag.retrieval.top_k": top_k, "rag.diagnostic": True},
+        ) as span:
+            results = retriever.retrieve(QueryBundle(query_str=query))
+            span.set_attribute("rag.results.count", len(results))
         print(f"BM25 топ-{top_k} для «{query}»:")
         for i, r in enumerate(results, 1):
             meta = r.node.metadata or {}

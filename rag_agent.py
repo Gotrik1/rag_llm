@@ -66,6 +66,15 @@ BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", "bm25_index_v10")
 CACHE_VERSION    = "v21-redis-exact-response-cache"
 MAX_OUTPUT_TOKENS = 4056
 
+PROMPT_INJECTION_MARKERS = (
+    "ignore all instructions",
+    "ignore previous instructions",
+    "system prompt",
+    "суперпароль",
+    "пароль root",
+    "api key",
+)
+
 
 @contextmanager
 def _pipeline_span(
@@ -114,6 +123,15 @@ class _TracedRetriever:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._retriever, name)
+
+
+def contains_prompt_injection(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (text or "").lower())
+    return any(marker in normalized for marker in PROMPT_INJECTION_MARKERS)
+
+
+def refusal_answer() -> str:
+    return "Я не знаю: в базе знаний нет подтверждённой информации для ответа."
 
 # Model-specific generation budgets. Qwen 3.5 enables long reasoning by default
 # and advertises a 262k context window; neither is appropriate for this local RAG
@@ -1025,6 +1043,8 @@ def rerank_context_results(results: list[dict], question: str) -> list[dict]:
 
 
 def sanitize_grounded_answer(answer: str, question: str, allowed_calculations: list[str]) -> str:
+    if contains_prompt_injection(answer):
+        return refusal_answer()
     requested = requested_formula_terms(question)
     unrequested = [term for term in known_formula_terms() if term not in requested]
     cleaned_lines: list[str] = []
@@ -1606,7 +1626,7 @@ class RAGAgent:
                 if score > float(current.get("score", 0.0)):
                     current["score"] = round(score, 4)
                     current.update(chunk_meta)
-        results = list(merged.values())
+        results = [item for item in merged.values() if not contains_prompt_injection(str(item.get("text", "")))]
         ranked = rerank_context_results(results, question)
         diversified = diversify_context_results(ranked, question, top_k)
         selected = select_prism_evidence(diversified, spec, top_k)

@@ -1,0 +1,94 @@
+name: rag-rbac-preview
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: rag_preview
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - preview_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag_preview"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["sh", "-ec", "alembic upgrade head && uvicorn asgi_app:app --host 0.0.0.0 --port 8080"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: rag_preview
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      REDIS_PASSWORD_FILE: /run/secrets/redis_password
+      RAG_SECRET_KEY_FILE: /run/secrets/app_secret_key
+      RAG_REDIS_URL: redis://redis:6379/0
+      RAG_REDIS_REQUIRED: "false"
+      RAG_AUTH_MODE: development
+      BOOTSTRAP_SUPERADMIN_SUBJECT: rag-superadmin
+      RAG_CORS_ORIGINS: http://127.0.0.1:5174
+      QDRANT_URL: http://host.docker.internal:6333
+      QDRANT_GRPC_URL: http://host.docker.internal:6334
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      BM25_PERSIST_DIR: /app/.ingestion_cache/bm25_index_v10
+      RUST_DATA_DIR: /app/.ingestion_cache/rust
+      RUST_CLI_PATH: /app/target/debug/llm-rust
+    secrets:
+      - postgres_password
+      - redis_password
+      - app_secret_key
+    ports:
+      - "8081:8080"
+    volumes:
+      - preview_backend_data:/app/.ingestion_cache
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"from urllib.request import urlopen; assert urlopen('http://127.0.0.1:8080/healthz', timeout=3).status == 200\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    ports:
+      - "5174:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  preview_backend_data:
+  preview_postgres_data:
+
+secrets:
+  postgres_password:
+    file: ./deploy/secrets/postgres_password.example
+  redis_password:
+    file: ./deploy/secrets/redis_password.example
+  app_secret_key:
+    file: ./deploy/secrets/app_secret_key.example

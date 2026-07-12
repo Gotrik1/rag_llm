@@ -12,9 +12,12 @@ import json
 import os
 import re
 import sys
+import time
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Iterator
 
 # ─── LlamaIndex ───────────────────────────────────────────────
 from llama_index.core import (
@@ -42,6 +45,8 @@ from ollama import Client as OllamaClient
 from document_ingestion import ingest_document
 from llm_providers import ProviderLLM
 from response_cache import ResponseCache
+from opentelemetry.trace import Status, StatusCode
+from telemetry import PIPELINE_SECONDS, tracer
 
 # ─── Настройки ────────────────────────────────────────────────
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
@@ -60,6 +65,55 @@ VECTOR_TOP_K     = 12      # кандидатов от вектора
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", "bm25_index_v10")
 CACHE_VERSION    = "v21-redis-exact-response-cache"
 MAX_OUTPUT_TOKENS = 4056
+
+
+@contextmanager
+def _pipeline_span(
+    stage: str,
+    *,
+    flow: str = "python",
+    attributes: dict[str, Any] | None = None,
+) -> Iterator[Any]:
+    """Record content-free pipeline telemetry without retaining prompts or evidence."""
+    started = time.perf_counter()
+    with tracer().start_as_current_span(
+        f"rag.{stage}", record_exception=False, set_status_on_exception=False
+    ) as span:
+        span.set_attribute("rag.pipeline.stage", stage)
+        span.set_attribute("rag.flow", flow)
+        for key, value in (attributes or {}).items():
+            span.set_attribute(key, value)
+        try:
+            yield span
+        except BaseException as exc:
+            span.set_status(Status(StatusCode.ERROR))
+            span.set_attribute("error.type", type(exc).__name__)
+            raise
+        finally:
+            PIPELINE_SECONDS.labels(stage=stage, flow=flow).observe(time.perf_counter() - started)
+
+
+class _TracedRetriever:
+    """Proxy vector and BM25 retrievers while exposing aggregate timings only."""
+
+    def __init__(self, retriever: Any, stage: str):
+        self._retriever = retriever
+        self._stage = stage
+
+    def retrieve(self, *args: Any, **kwargs: Any):
+        with _pipeline_span(self._stage) as span:
+            results = self._retriever.retrieve(*args, **kwargs)
+            span.set_attribute("rag.results.count", len(results))
+            return results
+
+    async def aretrieve(self, *args: Any, **kwargs: Any):
+        with _pipeline_span(self._stage) as span:
+            results = await self._retriever.aretrieve(*args, **kwargs)
+            span.set_attribute("rag.results.count", len(results))
+            return results
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._retriever, name)
 
 # Model-specific generation budgets. Qwen 3.5 enables long reasoning by default
 # and advertises a 262k context window; neither is appropriate for this local RAG
@@ -1141,7 +1195,10 @@ class RAGAgent:
 
     def _build_query_engine(self, top_k: int = TOP_K):
         """Строим гибридный query engine с текущими нодами."""
-        vector_retriever = self.index.as_retriever(similarity_top_k=max(VECTOR_TOP_K, top_k))
+        vector_retriever = _TracedRetriever(
+            self.index.as_retriever(similarity_top_k=max(VECTOR_TOP_K, top_k)),
+            "retrieval.vector",
+        )
 
         retrievers = [vector_retriever]
         if self._all_nodes:
@@ -1149,7 +1206,7 @@ class RAGAgent:
                 nodes=self._all_nodes,
                 similarity_top_k=max(BM25_TOP_K, top_k),
             )
-            retrievers.append(bm25_retriever)
+            retrievers.append(_TracedRetriever(bm25_retriever, "retrieval.bm25"))
 
         retriever = QueryFusionRetriever(
             retrievers=retrievers,
@@ -1230,11 +1287,15 @@ class RAGAgent:
         """
         qhash = _question_hash(f"{prompt_id}\n{system_prompt or GROUNDED_SYSTEM_PROMPT}\n{question}")
 
-        cached = self.response_cache.get(qhash)
+        with _pipeline_span("cache.lookup") as span:
+            cached = self.response_cache.get(qhash)
+            span.set_attribute("rag.cache.hit", bool(cached))
         if cached:
             answer = cached.get("answer")
             sources = cached.get("sources")
             if isinstance(answer, str) and isinstance(sources, list):
+                with _pipeline_span("cache.hit"):
+                    pass
                 return answer, sources, True
 
         if not self._all_nodes:
@@ -1314,8 +1375,17 @@ class RAGAgent:
         if isinstance(cached, dict) and isinstance(cached.get("answer"), str):
             self._last_generation_from_cache = True
             return str(cached["answer"])
-        response = self.llm.complete(prompt)
-        answer = sanitize_grounded_answer(str(response).strip(), question, calculations)
+        with _pipeline_span(
+            "llm.generate",
+            attributes={
+                "gen_ai.operation.name": "generate_content",
+                "gen_ai.request.model": self.llm_model,
+                "rag.context.count": len(context),
+            },
+        ) as span:
+            response = self.llm.complete(prompt)
+            answer = sanitize_grounded_answer(str(response).strip(), question, calculations)
+            span.set_attribute("rag.response.chars", len(answer))
         self.response_cache.set(generation_key, {"answer": answer})
         return answer
 

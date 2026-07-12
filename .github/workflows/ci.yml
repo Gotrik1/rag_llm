@@ -27,10 +27,13 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Check Python syntax
-        run: python -m py_compile web_ui.py db_store.py rag_agent.py document_ingestion.py docx_parser.py
+        run: python -m py_compile web_ui.py db_store.py rag_agent.py response_cache.py document_ingestion.py docx_parser.py
 
       - name: Run Python tests
-        run: python -m unittest test_flow_modes.py test_prism.py
+        run: python -m unittest test_response_cache.py test_flow_modes.py test_prism.py
+
+      - name: Validate Compose configuration
+        run: docker compose config -q
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -60,8 +63,8 @@ jobs:
         working-directory: ui
         run: npm run build
 
-  postgres-smoke:
-    name: postgres-smoke
+  infrastructure-smoke:
+    name: infrastructure-smoke
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -77,8 +80,18 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
     env:
       DATABASE_URL: postgresql://rag:ragpassword@127.0.0.1:5432/rag_assistant
+      RESPONSE_CACHE_URL: redis://127.0.0.1:6379/0
     steps:
       - uses: actions/checkout@v4
 
@@ -99,6 +112,12 @@ jobs:
           names={r['table_name'] for r in c.execute(\"select table_name from information_schema.tables where table_schema='public'\").fetchall()};
           required={'projects','chats','messages','documents','evidence_sources','request_errors','workspace_settings'};
           assert required <= names, required-names"
+
+      - name: Verify Redis response cache
+        run: >-
+          python -c "from response_cache import ResponseCache;
+          c=ResponseCache(); c.set('ci-smoke', {'answer':'ok','sources':[]});
+          assert c.get('ci-smoke')['answer']=='ok'; c.clear()"
 
       - name: Run workspace API integration tests
         run: python -m unittest test_workspace_integration.py

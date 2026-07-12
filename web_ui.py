@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import cgi
+import hashlib
 import json
 import os
 import re
@@ -31,6 +32,7 @@ from db_store import (
     list_chats,
     list_messages,
     list_projects,
+    rollback_transaction,
     run_migrations,
     update_chat,
     update_message,
@@ -38,7 +40,7 @@ from db_store import (
     update_workspace,
 )
 from llm_providers import DEFAULTS, ProviderLLM
-from rag_agent import GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, refine_prism_query, validate_retrieval
+from rag_agent import CACHE_VERSION, GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, refine_prism_query, validate_retrieval
 from system_prompts import get_profile, profiles
 
 
@@ -265,7 +267,7 @@ def filter_rust_context(question: str, items: list[dict]) -> list[dict]:
     return filtered
 
 
-def rust_generate(question: str, context: list[dict], project_context: str = "") -> str:
+def rust_generate(question: str, context: list[dict], project_context: str = "") -> tuple[str, bool]:
     context_text = "\n\n---\n\n".join(
         f"[Источник: {item.get('file', '?')}, Раздел: {item.get('section_path', '')}]\n{item.get('text', '')}"
         for item in context
@@ -274,6 +276,13 @@ def rust_generate(question: str, context: list[dict], project_context: str = "")
         context_text = f"{context_text}\n\n---\n\n{project_context}"
     config = load_provider_config()
     model = str(config.get("model", "")).strip() if config.get("provider", "ollama") == "ollama" else ""
+    cache_key = hashlib.sha256(
+        f"{CACHE_VERSION}\nrust-generation\n{model}\n{question}\n{context_text}".encode("utf-8")
+    ).hexdigest()
+    response_cache = get_agent().response_cache
+    cached = response_cache.get(cache_key)
+    if isinstance(cached, dict) and isinstance(cached.get("answer"), str):
+        return str(cached["answer"]), True
     request = json.dumps(
         {"question": question, "context": context_text, "model": model or None},
         ensure_ascii=False,
@@ -282,7 +291,9 @@ def rust_generate(question: str, context: list[dict], project_context: str = "")
     payload = _run_rust_json("generate-json", request)
     if not isinstance(payload, dict) or not str(payload.get("answer", "")).strip():
         raise RuntimeError("Rust flow не вернул ответ")
-    return str(payload["answer"]).strip()
+    answer = str(payload["answer"]).strip()
+    response_cache.set(cache_key, {"answer": answer})
+    return answer, False
 
 
 def public_provider_config(config: dict) -> dict:
@@ -396,6 +407,7 @@ def render_text(value: str) -> str:
 
 def cleanup_llm_markup(value: str) -> str:
     """Remove Markdown/LaTeX wrappers the model adds around already-normalized formulas."""
+    value = re.sub(r"\\?<(?:/)?br\s*/?>|&lt;/?br\s*/?&gt;", "\n", value, flags=re.IGNORECASE)
     value = value.replace("\\[", "").replace("\\]", "")
     value = value.replace("\\(", "").replace("\\)", "")
     value = value.replace("**", "")
@@ -806,6 +818,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_json({"error": "not found"}, 404)
         except Exception as exc:
+            rollback_transaction()
             self.send_json({"error": str(exc)}, 500)
 
     def do_PATCH(self) -> None:
@@ -823,6 +836,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json(updated or {"error": "not found"}, 200 if updated else 404)
         except Exception as exc:
+            rollback_transaction()
             self.send_json({"error": str(exc)}, 500)
 
     def do_DELETE(self) -> None:
@@ -839,6 +853,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json({"deleted": deleted}, 200 if deleted else 404)
         except Exception as exc:
+            rollback_transaction()
             self.send_json({"error": str(exc)}, 500)
 
     def handle_models(self) -> None:
@@ -963,8 +978,11 @@ class Handler(BaseHTTPRequestHandler):
                 python_items = agent.retrieve_context(question, TOP_K)
                 rust_items = filter_rust_context(question, rust_context(question))
                 context = fuse_contexts(python_items, rust_items, TOP_K)
-                answer = rust_generate(question, context, project_context_prompt(scope))
-                from_cache = False
+                rust_result = rust_generate(question, context, project_context_prompt(scope))
+                if isinstance(rust_result, tuple):
+                    answer, from_cache = rust_result
+                else:  # Keeps the callable easy to mock in contract tests.
+                    answer, from_cache = str(rust_result), False
                 sources = [{
                     "file": item["file"], "section": item.get("section_path", ""), "score": item["score"],
                     "text_preview": item["text"][:120],
@@ -976,7 +994,7 @@ class Handler(BaseHTTPRequestHandler):
                 spec = refine_prism_query(question)
                 calculations = extract_formula_lines(context, question)
                 answer = agent._generate_grounded_answer(question, context, calculations, spec, scoped_prompt)
-                from_cache = False
+                from_cache = bool(getattr(agent, "_last_generation_from_cache", False))
                 sources = [{"file": item["file"], "section": item.get("section_path", ""), "score": item["score"], "text_preview": item["text"][:120]} for item in context]
         formulas = extract_formula_lines(context, question)
         warnings = validate_retrieval(question, context, answer)

@@ -2,6 +2,17 @@ type ApiErrorPayload = {
   error?: string;
 };
 
+async function readApiResponse<T>(response: Response): Promise<T & ApiErrorPayload> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    return (await response.json()) as T & ApiErrorPayload;
+  }
+
+  const body = (await response.text()).replace(/\s+/g, " ").trim();
+  const details = body && !body.startsWith("<!") ? `: ${body.slice(0, 240)}` : "";
+  throw new Error(`Сервер вернул некорректный ответ (${response.status} ${response.statusText})${details}`);
+}
+
 function isTimedOut(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
@@ -17,7 +28,7 @@ async function request<T>(
 
   try {
     const response = await fetch(path, { ...options, signal: controller.signal });
-    const data = (await response.json()) as T & ApiErrorPayload;
+    const data = await readApiResponse<T>(response);
     if (!response.ok) {
       throw new Error(data.error || response.statusText);
     }

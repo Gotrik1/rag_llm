@@ -9,7 +9,19 @@ function jsonResponse(data: unknown, ok = true, statusText = "OK") {
   return {
     ok,
     statusText,
+    status: ok ? 200 : 500,
+    headers: new Headers({ "content-type": "application/json" }),
     json: vi.fn().mockResolvedValue(data)
+  };
+}
+
+function htmlResponse(status = 413, statusText = "Request Entity Too Large") {
+  return {
+    ok: false,
+    status,
+    statusText,
+    headers: new Headers({ "content-type": "text/html" }),
+    text: vi.fn().mockResolvedValue("<!doctype html><html><body>Request too large</body></html>")
   };
 }
 
@@ -86,6 +98,13 @@ describe("HTTP client", () => {
       body
     }));
     expect(fetchMock.mock.calls[0][1]?.headers).toBeUndefined();
+  });
+
+  it("reports a server error instead of attempting to parse an HTML error page as JSON", async () => {
+    fetchMock.mockResolvedValue(htmlResponse());
+
+    await expect(postFormData("/api/upload", new FormData(), 1_000))
+      .rejects.toThrow("Сервер вернул некорректный ответ (413 Request Entity Too Large)");
   });
 
   it("reports a readable timeout for file uploads", async () => {

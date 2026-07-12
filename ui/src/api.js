@@ -1,3 +1,12 @@
+async function readApiResponse(response) {
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) {
+        return (await response.json());
+    }
+    const body = (await response.text()).replace(/\s+/g, " ").trim();
+    const details = body && !body.startsWith("<!") ? `: ${body.slice(0, 240)}` : "";
+    throw new Error(`Сервер вернул некорректный ответ (${response.status} ${response.statusText})${details}`);
+}
 function isTimedOut(error) {
     return error instanceof DOMException && error.name === "AbortError";
 }
@@ -6,7 +15,7 @@ async function request(path, options, timeoutMs, timeoutMessage) {
     const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
     try {
         const response = await fetch(path, { ...options, signal: controller.signal });
-        const data = (await response.json());
+        const data = await readApiResponse(response);
         if (!response.ok) {
             throw new Error(data.error || response.statusText);
         }

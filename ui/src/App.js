@@ -1,6 +1,10 @@
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
-import { ActionBarPrimitive, AssistantRuntimeProvider, ComposerPrimitive, MessagePrimitive, ThreadPrimitive, useExternalStoreRuntime, useMessage } from "@assistant-ui/react";
-import { AlertTriangle, Bot, Bug, CheckCircle2, Copy, Database, Cpu, FileText, Files, Folder, FolderInput, PanelRight, PanelLeftClose, PanelLeftOpen, Paintbrush, Pencil, Pin, Plus, RefreshCw, Save, Send, Settings2, Sigma, Sparkles, TestTube2, Trash2, UploadCloud, User, X } from "lucide-react";
+import { AssistantRuntimeProvider, ComposerPrimitive, MessagePrimitive, ThreadPrimitive, useExternalStoreRuntime, useMessage } from "@assistant-ui/react";
+import ReactMarkdown from "react-markdown";
+import rehypeRaw from "rehype-raw";
+import rehypeSanitize from "rehype-sanitize";
+import remarkGfm from "remark-gfm";
+import { AlertTriangle, Bot, Bug, CheckCircle2, Copy, Database, Cpu, FileText, Files, Folder, FolderInput, Maximize2, PanelRight, PanelLeftClose, PanelLeftOpen, Paintbrush, Pencil, Pin, Plus, RefreshCw, Save, Send, Settings2, Sigma, Sparkles, TestTube2, Trash2, UploadCloud, User, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { deleteJson, getJson, patchJson, postFormData, postJson } from "./api";
@@ -756,10 +760,72 @@ function Thread() {
 }
 function Message() {
     const role = useMessage((state) => state.role);
-    const html = useMessage((state) => state.metadata.custom.html);
     const modelLabel = useMessage((state) => state.metadata.custom.modelLabel);
+    const text = useMessage((state) => state.content.map((part) => part.type === "text" ? part.text : "").join(""));
     const isAssistant = role === "assistant";
-    return (_jsxs(MessagePrimitive.Root, { className: `message-row ${isAssistant ? "assistant" : "user"}`, children: [_jsx("div", { className: "message-avatar", children: isAssistant ? _jsx(Bot, { size: 16 }) : _jsx(User, { size: 16 }) }), _jsxs("div", { className: "message-body", children: [isAssistant && typeof modelLabel === "string" && modelLabel ? (_jsxs("div", { className: "model-badge", children: ["\u041E\u0442\u0432\u0435\u0442\u0438\u043B: ", modelLabel] })) : null, isAssistant && typeof html === "string" && html ? (_jsx(HtmlBlock, { className: "answer-html", html: html })) : (_jsx(MessagePrimitive.Content, {})), _jsx(ActionBarPrimitive.Root, { className: "message-actions", children: _jsx(ActionBarPrimitive.Copy, { className: "icon-button", title: "\u041A\u043E\u043F\u0438\u0440\u043E\u0432\u0430\u0442\u044C", "aria-label": "\u041A\u043E\u043F\u0438\u0440\u043E\u0432\u0430\u0442\u044C", children: _jsx(Copy, { size: 14 }) }) })] })] }));
+    const [copied, setCopied] = useState(false);
+    const copyMessage = async () => {
+        await copyText(text);
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1600);
+    };
+    return (_jsxs(MessagePrimitive.Root, { className: `message-row ${isAssistant ? "assistant" : "user"}`, children: [_jsx("div", { className: "message-avatar", children: isAssistant ? _jsx(Bot, { size: 16 }) : _jsx(User, { size: 16 }) }), _jsxs("div", { className: "message-body", children: [isAssistant && typeof modelLabel === "string" && modelLabel ? (_jsxs("div", { className: "model-badge", children: ["\u041E\u0442\u0432\u0435\u0442\u0438\u043B: ", modelLabel] })) : null, isAssistant ? (_jsx(MarkdownAnswer, { markdown: text })) : (_jsx(MessagePrimitive.Content, {})), _jsxs("div", { className: "message-actions", children: [_jsx("button", { className: "icon-button", type: "button", onClick: () => void copyMessage(), title: "\u041A\u043E\u043F\u0438\u0440\u043E\u0432\u0430\u0442\u044C \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435", "aria-label": "\u041A\u043E\u043F\u0438\u0440\u043E\u0432\u0430\u0442\u044C \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435", children: _jsx(Copy, { size: 14 }) }), _jsx("span", { className: `message-copy-feedback ${copied ? "visible" : ""}`, "aria-live": "polite", children: "\u0421\u043A\u043E\u043F\u0438\u0440\u043E\u0432\u0430\u043D\u043E" })] })] })] }));
+}
+function MarkdownAnswer({ markdown }) {
+    return (_jsx(ReactMarkdown, { className: "answer-markdown", remarkPlugins: [remarkGfm], rehypePlugins: [rehypeRaw, rehypeSanitize], components: { table: ({ children }) => _jsx(MarkdownTable, { children: children }) }, children: normalizeMarkdown(markdown) }));
+}
+function normalizeMarkdown(markdown) {
+    const normalized = markdown
+        .replace(/\\?<(?:\/)?br\s*\/?>|&lt;\/?br\s*\/?&gt;/gi, (tag, offset, source) => {
+        const lineStart = source.lastIndexOf("\n", offset) + 1;
+        const lineEnd = source.indexOf("\n", offset);
+        const line = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+        return line.includes("|") ? "<br />" : "\n";
+    })
+        .replace(/&nbsp;/gi, " ")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+    return normalized.split("\n").map((line) => (line.includes("|")
+        ? line.replace(/(\S)\s+•\s*/g, "$1<br />• ")
+        : line)).join("\n");
+}
+function tableToTsv(table) {
+    if (!table)
+        return "";
+    return Array.from(table.rows)
+        .map((row) => Array.from(row.cells)
+        .map((cell) => (cell.textContent || "").replace(/\s+/g, " ").trim())
+        .join("\t"))
+        .join("\n");
+}
+async function copyText(value) {
+    try {
+        await navigator.clipboard.writeText(value);
+    }
+    catch {
+        const textarea = document.createElement("textarea");
+        textarea.value = value;
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.append(textarea);
+        textarea.select();
+        document.execCommand("copy");
+        textarea.remove();
+    }
+}
+function MarkdownTable({ children }) {
+    const tableRef = useRef(null);
+    const [isOpen, setIsOpen] = useState(false);
+    const [copied, setCopied] = useState(false);
+    const copy = async () => {
+        const tsv = tableToTsv(tableRef.current);
+        if (!tsv)
+            return;
+        await copyText(tsv);
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1600);
+    };
+    return (_jsxs(_Fragment, { children: [_jsxs("section", { className: "markdown-table", children: [_jsxs("div", { className: "markdown-table-toolbar", children: [_jsx("span", { children: "\u0422\u0430\u0431\u043B\u0438\u0446\u0430" }), _jsxs("div", { children: [_jsx("button", { type: "button", onClick: () => setIsOpen(true), title: "\u041E\u0442\u043A\u0440\u044B\u0442\u044C \u0442\u0430\u0431\u043B\u0438\u0446\u0443 \u043F\u043E\u043B\u043D\u043E\u0441\u0442\u044C\u044E", "aria-label": "\u041E\u0442\u043A\u0440\u044B\u0442\u044C \u0442\u0430\u0431\u043B\u0438\u0446\u0443 \u043F\u043E\u043B\u043D\u043E\u0441\u0442\u044C\u044E", children: _jsx(Maximize2, { size: 14, "aria-hidden": "true" }) }), _jsx("button", { type: "button", onClick: () => void copy(), title: copied ? "Скопировано" : "Скопировать таблицу", "aria-label": copied ? "Скопировано" : "Скопировать таблицу", children: copied ? _jsx(CheckCircle2, { size: 14, "aria-hidden": "true" }) : _jsx(Copy, { size: 14, "aria-hidden": "true" }) })] })] }), _jsx("div", { className: "markdown-table-scroll", children: _jsx("table", { ref: tableRef, children: children }) })] }), isOpen ? createPortal(_jsx("div", { className: "markdown-table-modal-backdrop", role: "presentation", onMouseDown: () => setIsOpen(false), children: _jsxs("section", { className: "markdown-table-modal", role: "dialog", "aria-modal": "true", "aria-label": "\u0422\u0430\u0431\u043B\u0438\u0446\u0430", onMouseDown: (event) => event.stopPropagation(), children: [_jsxs("div", { className: "markdown-table-modal-heading", children: [_jsx("h2", { children: "\u0422\u0430\u0431\u043B\u0438\u0446\u0430" }), _jsxs("div", { children: [_jsx("button", { type: "button", onClick: () => void copy(), title: copied ? "Скопировано" : "Скопировать таблицу", "aria-label": copied ? "Скопировано" : "Скопировать таблицу", children: copied ? _jsx(CheckCircle2, { size: 15, "aria-hidden": "true" }) : _jsx(Copy, { size: 15, "aria-hidden": "true" }) }), _jsx("button", { type: "button", onClick: () => setIsOpen(false), "aria-label": "\u0417\u0430\u043A\u0440\u044B\u0442\u044C", title: "\u0417\u0430\u043A\u0440\u044B\u0442\u044C", children: _jsx(X, { size: 17 }) })] })] }), _jsx("div", { className: "markdown-table-modal-content", children: _jsx("table", { children: children }) })] }) }), document.body) : null] }));
 }
 function HtmlBlock({ className, html }) {
     const ref = useMathTypeset(html);

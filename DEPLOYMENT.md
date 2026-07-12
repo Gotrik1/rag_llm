@@ -1,6 +1,6 @@
 # Docker Runtime
 
-The default stack starts PostgreSQL, Qdrant, the Python backend, and the React frontend:
+The default stack starts PostgreSQL, Qdrant, Redis response cache, the Python backend, and the React frontend:
 
 ```powershell
 Copy-Item .env.example .env
@@ -18,7 +18,9 @@ Endpoints:
 | Backend API | `http://127.0.0.1:8080/api/...` |
 | Qdrant dashboard | `http://127.0.0.1:6333/dashboard` |
 
-The backend waits for healthy PostgreSQL and Qdrant, then applies `migrations/*.sql` and creates the default workspace. Runtime state is kept in named Docker volumes. Inspect service logs with `docker compose logs -f backend`.
+Redis is internal to Docker Compose and intentionally has no published host port. It stores exact generated responses for seven days, is limited to 128 MB with LRU eviction, and does not persist data to disk.
+
+The backend waits for healthy PostgreSQL, Qdrant and Redis, then applies `migrations/*.sql` and creates the default workspace. Runtime state is kept in named Docker volumes. Inspect service logs with `docker compose logs -f backend`.
 
 ## Ollama
 

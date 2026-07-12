@@ -11,7 +11,6 @@ import html
 import json
 import os
 import re
-import sqlite3
 import sys
 import zipfile
 from dataclasses import dataclass
@@ -42,6 +41,7 @@ import qdrant_client
 from ollama import Client as OllamaClient
 from document_ingestion import ingest_document
 from llm_providers import ProviderLLM
+from response_cache import ResponseCache
 
 # ─── Настройки ────────────────────────────────────────────────
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
@@ -57,9 +57,9 @@ TOP_K            = 10      # финальных чанков в контекст
 BM25_TOP_K       = 12      # кандидатов от BM25
 VECTOR_TOP_K     = 12      # кандидатов от вектора
 
-CACHE_DB         = os.environ.get("CACHE_DB", "cache.db")
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", "bm25_index_v10")
-CACHE_VERSION    = "v19-qwen35-profile"
+CACHE_VERSION    = "v21-redis-exact-response-cache"
+MAX_OUTPUT_TOKENS = 4056
 
 # Model-specific generation budgets. Qwen 3.5 enables long reasoning by default
 # and advertises a 262k context window; neither is appropriate for this local RAG
@@ -68,14 +68,14 @@ OLLAMA_MODEL_PROFILES: dict[str, dict] = {
     "qwen3.5:9b": {
         "context_window": 8192,
         "thinking": False,
-        "num_predict": 768,
+        "num_predict": MAX_OUTPUT_TOKENS,
         "request_timeout": 120.0,
     },
 }
 DEFAULT_OLLAMA_PROFILE = {
     "context_window": 16384,
     "thinking": None,
-    "num_predict": 1024,
+    "num_predict": MAX_OUTPUT_TOKENS,
     "request_timeout": 180.0,
 }
 
@@ -90,6 +90,7 @@ SYSTEM_PROMPT = """\
 4. Аббревиатуры (ИВ0, ИВ1, ИВ0-1, ИС и т.п.) — используй только те определения, которые явно указаны в контексте.
 5. Не смешивай определения разных разделов.
 6. Если в контексте формулы даны в маркерах вида [С_sub(...)] или [ΔО_sub(...)], сохраняй этот формат и не раскладывай его на отдельные токены вроде [EQ], [s], [].
+7. Форматируй ответ в CommonMark Markdown: отделяй абзацы одной пустой строкой, используй корректные списки и не используй HTML.
 """
 
 
@@ -107,6 +108,7 @@ GROUNDED_SYSTEM_PROMPT = """\
 8. Не делай предположений и не используй формулировки «или в аналогичных интерфейсах», «вероятно», «обычно» или «по всей видимости», если этого нет в источнике.
 9. Не показывай внутренние сообщения RAG, сведения о нехватке контекста, retrieval, reranking или технических блоках. Если дополнительная информация не найдена, просто не добавляй её.
 10. Игнорируй нерелевантные фрагменты контекста, даже если они фактически верны. Перед ответом проверь: речь идёт об одной сущности, сценарий завершён, нет сведений из соседних разделов и пустых искусственных секций.
+11. Форматируй ответ строго в CommonMark Markdown. Абзацы разделяй одной пустой строкой. Для перечислений используй `- пункт` или `1. пункт`; заголовки `##` и `###` — только для длинных ответов. Таблицы GFM используй только для сравнения однотипных сущностей с короткими значениями; если ячейка требует несколько пунктов, вместо таблицы используй подзаголовок и маркированный список. Не используй HTML и не оставляй незакрытые Markdown-маркеры.
 """
 
 
@@ -1067,18 +1069,9 @@ class RAGAgent:
             storage_context=storage_ctx,
         )
 
-        # ── SQLite кэш ───────────────────────────────────────
-        self.cache = sqlite3.connect(CACHE_DB, check_same_thread=False)
-        self.cache.execute(
-            """CREATE TABLE IF NOT EXISTS answer_cache (
-                question_hash TEXT PRIMARY KEY,
-                question      TEXT,
-                answer        TEXT,
-                sources       TEXT,
-                created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
-            )"""
-        )
-        self.cache.commit()
+        # ── Exact response cache ──────────────────────────────
+        self.response_cache = ResponseCache()
+        self._last_generation_from_cache = False
 
         # ── Ноды для BM25 (в памяти) ─────────────────────────
         self._all_nodes: list = []
@@ -1223,6 +1216,10 @@ class RAGAgent:
             n for n in self._all_nodes if n.id_ not in {nd.id_ for nd in nodes}
         ]
 
+        # A changed corpus invalidates every generated answer, even when the
+        # question itself is identical.
+        self.clear_cache()
+
         print(f"✓ Проиндексировано {len(nodes)} чанков из {p.name}")
         return len(nodes)
 
@@ -1233,14 +1230,12 @@ class RAGAgent:
         """
         qhash = _question_hash(f"{prompt_id}\n{system_prompt or GROUNDED_SYSTEM_PROMPT}\n{question}")
 
-        # Проверяем кэш
-        row = self.cache.execute(
-            "SELECT answer, sources FROM answer_cache WHERE question_hash = ?",
-            (qhash,),
-        ).fetchone()
-        if row:
-            answer, sources_json = row
-            return answer, json.loads(sources_json), True
+        cached = self.response_cache.get(qhash)
+        if cached:
+            answer = cached.get("answer")
+            sources = cached.get("sources")
+            if isinstance(answer, str) and isinstance(sources, list):
+                return answer, sources, True
 
         if not self._all_nodes:
             return (
@@ -1261,12 +1256,11 @@ class RAGAgent:
             "text_preview": item["text"][:120],
         } for item in context]
 
-        # Кэшируем
-        self.cache.execute(
-            "INSERT OR REPLACE INTO answer_cache (question_hash, question, answer, sources) VALUES (?,?,?,?)",
-            (qhash, question, answer, json.dumps(sources, ensure_ascii=False)),
-        )
-        self.cache.commit()
+        cached_sources = [
+            {key: source[key] for key in ("file", "section", "score") if key in source}
+            for source in sources
+        ]
+        self.response_cache.set(qhash, {"answer": answer, "sources": cached_sources})
 
         return answer, sources, False
 
@@ -1278,6 +1272,7 @@ class RAGAgent:
         spec: PrismQuery | None = None,
         system_prompt: str | None = None,
     ) -> str:
+        self._last_generation_from_cache = False
         spec = spec or refine_prism_query(question)
         if spec.answer_mode == "formulas_only":
             return generate_formula_only_answer(question, context, calculations, spec)
@@ -1314,8 +1309,15 @@ class RAGAgent:
 
 ОТВЕТ:
 """
+        generation_key = _question_hash(f"generation\n{self.llm_model}\n{prompt}")
+        cached = self.response_cache.get(generation_key)
+        if isinstance(cached, dict) and isinstance(cached.get("answer"), str):
+            self._last_generation_from_cache = True
+            return str(cached["answer"])
         response = self.llm.complete(prompt)
-        return sanitize_grounded_answer(str(response).strip(), question, calculations)
+        answer = sanitize_grounded_answer(str(response).strip(), question, calculations)
+        self.response_cache.set(generation_key, {"answer": answer})
+        return answer
 
     def debug_retrieval(self, question: str, top_k: int = 10):
         """Показать найденные чанки без вызова LLM."""
@@ -1560,8 +1562,7 @@ class RAGAgent:
         return selected
 
     def clear_cache(self):
-        self.cache.execute("DELETE FROM answer_cache")
-        self.cache.commit()
+        self.response_cache.clear()
         print("✓ Кэш очищен")
 
     def bm25_search(self, query: str, top_k: int = 10):

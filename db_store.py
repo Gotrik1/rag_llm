@@ -51,7 +51,19 @@ def db() -> psycopg.Connection:
     with _db_lock:
         if _db_conn is None or _db_conn.closed:
             _db_conn = psycopg.connect(database_url(), row_factory=dict_row, autocommit=False)
+        elif _db_conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
+            # PostgreSQL refuses every subsequent query after a failed statement
+            # until the transaction is rolled back. The HTTP handlers reuse this
+            # connection, so recover it before serving the next request.
+            _db_conn.rollback()
         return _db_conn
+
+
+def rollback_transaction() -> None:
+    """Clear a failed transaction before returning an HTTP error response."""
+    with _db_lock:
+        if _db_conn is not None and not _db_conn.closed:
+            _db_conn.rollback()
 
 
 def run_migrations() -> None:

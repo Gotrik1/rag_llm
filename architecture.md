@@ -1,320 +1,261 @@
-# Фактическая архитектура RAG-проекта
+# Архитектура RAG Assistant
 
-> Состояние исходного кода после добавления переключателя режимов. Web backend объединяет Python- и Rust-реализации и предоставляет три маршрута обработки вопроса: `python`, `rust`, `hybrid`.
+Документ описывает фактическую архитектуру Docker-стека. C3-схемы разделяют контекст системы, контейнеры и компоненты backend-сервера. Пользовательские сценарии, технические pipeline и CI вынесены отдельно, чтобы не смешивать уровни абстракции.
 
-## Runtime-схема: три режима рядом
+## Принципы
+
+- Python-индекс является основным источником доказательств для Web UI.
+- Rust-индекс дополняет Python evidence в режимах `rust` и `hybrid`, но не заменяет его.
+- Кэш ответов точный, а не семантический: похожие вопросы по нормативным документам могут требовать разных ответов.
+- PostgreSQL хранит состояние продукта и историю чатов. Redis хранит только временные результаты генерации.
+
+## C1. Контекст системы
+
+```mermaid
+flowchart LR
+    U["Пользователь"]
+    S["RAG Assistant\nВеб-приложение для поиска по документам"]
+    O["Ollama или облачный LLM-провайдер\nГенерация и эмбеддинги"]
+    D["Документы пользователя\nDOCX, PDF, MD, TXT"]
+
+    U -->|"Вопросы, проекты, загрузка документов"| S
+    S -->|"LLM и embeddings API"| O
+    D -->|"Индексация"| S
+```
+
+| Элемент | Назначение | Технологии |
+| --- | --- | --- |
+| Пользователь | Работает с чатами, проектами и базой знаний | Браузер |
+| RAG Assistant | Ищет evidence и формирует проверяемые ответы | React, Python, Rust, PostgreSQL, Qdrant, Redis |
+| LLM-провайдер | Формирует ответы и эмбеддинги | Ollama, OpenAI-compatible API, GigaChat, YandexGPT |
+| Документы | Источник знаний для поиска | DOCX, PDF, Markdown, text |
+
+## C2. Контейнеры
+
+```mermaid
+flowchart LR
+    B["Браузер\nReact + TypeScript"]
+    F["Контейнер frontend\nNginx 1.27\nСтатическая сборка Vite"]
+    A["Контейнер backend\nPython 3.12\nweb_ui.py"]
+    P[("PostgreSQL 16\nДанные workspace и чатов")]
+    R[("Redis 7.4\nТочный кэш ответов")]
+    Q[("Qdrant 1.13\nВекторные коллекции")]
+    C["Rust CLI\nПроцесс llm-rust"]
+    L["Ollama или облачный провайдер\nLLM и эмбеддинги"]
+
+    B -->|"HTTP или HTTPS"| F
+    F -->|"Прокси /api"| A
+    A -->|"SQL через psycopg"| P
+    A -->|"RESP через redis-py"| R
+    A -->|"HTTP и gRPC"| Q
+    A -->|"JSON через stdin/stdout"| C
+    A -->|"HTTP"| L
+    C -->|"HTTP"| L
+```
+
+| Контейнер или процесс | Ответственность | Постоянное состояние |
+| --- | --- | --- |
+| `frontend` | Отдаёт React UI и проксирует API-вызовы | Нет |
+| `backend` | API, RAG-оркестрация, индексация, контекст проекта и рендеринг | Том `.ingestion_cache` |
+| `postgres` | Проекты, чаты, сообщения, настройки workspace и миграции | Том `postgres_data` |
+| `qdrant` | Коллекции векторов `rag_docs_v10` и `knowledge_base` | Том `qdrant_data` |
+| `response-cache` | Точный кэш сгенерированных ответов | Нет, намеренно временный |
+| `llm-rust` | Rust CLI поиска и генерации, запускаемый backend | Qdrant и Ollama; опциональный CLI-том |
+| Ollama | Локальные модели и модель эмбеддингов, опциональный Compose-профиль | Том `ollama_data` при включённом профиле |
+
+`response-cache` доступен только во внутренней сети Compose и не публикует порт на хост.
+
+### Доступные интерфейсы
+
+| Интерфейс | Ссылка | Назначение |
+| --- | --- | --- |
+| Frontend | [http://127.0.0.1:5173](http://127.0.0.1:5173) | Пользовательский интерфейс чатов, проектов и базы знаний |
+| Swagger UI | [http://127.0.0.1:8080/docs](http://127.0.0.1:8080/docs) | Интерактивная документация backend API |
+| OpenAPI | [http://127.0.0.1:8080/api/openapi.json](http://127.0.0.1:8080/api/openapi.json) | Машиночитаемая спецификация API |
+| Backend API | [http://127.0.0.1:8080/api/](http://127.0.0.1:8080/api/) | HTTP API для frontend и интеграций |
+| Qdrant Dashboard | [http://127.0.0.1:6333/dashboard](http://127.0.0.1:6333/dashboard) | Просмотр коллекций и состояния Qdrant |
+| Qdrant HTTP API | [http://127.0.0.1:6333](http://127.0.0.1:6333) | Векторный API Qdrant |
+
+Redis и PostgreSQL не имеют веб-интерфейса и не публикуют административные порты для браузера.
+
+## C3. Компоненты backend
 
 ```mermaid
 flowchart TB
-    USER["Пользователь"] --> UI["Web UI<br/>TypeScript · React · Vite<br/>Выбор Python / Rust / Hybrid"]
-    UI -->|"Workspace / Projects / Chats / Messages API"| CRUD["Backend storage API<br/>Python · web_ui.py · psycopg 3"]
-    CRUD --> PG[("PostgreSQL 16<br/>projects · chats · messages<br/>workspace_settings")]
-    UI -->|"GET / POST /api/flow-mode"| CONFIG[(".ingestion_cache/flow_mode.json<br/>JSON · сохранённый режим")]
-    UI -->|"POST /api/ask"| API["web_ui.py<br/>Python · ThreadingHTTPServer<br/>Маршрутизация запроса по flow_mode"]
-    CONFIG --> API
+    H["HTTP-обработчик\nweb_ui.py"]
+    W["Хранилище workspace\ndb_store.py"]
+    O["RAG-оркестратор\nrag_agent.py"]
+    I["Сервис индексации\ndocument_ingestion.py"]
+    K["Точный кэш ответов\nresponse_cache.py"]
+    L["LLM-адаптеры\nllm_providers.py и Ollama client"]
+    X["Rust-мост\nJSON-протокол subprocess"]
 
-    subgraph P["FLOW 1 — PYTHON"]
-        direction LR
-        P_Q["Вопрос"] --> P_SPEC["PrismQuery + targeted queries<br/>Python · проектные правила"]
-        P_SPEC --> P_VEC["Vector retrieval<br/>LlamaIndex + Qdrant<br/>rag_docs_v10"]
-        P_SPEC --> P_BM["BM25 retrieval<br/>LlamaIndex BM25Retriever<br/>bm25_index_v10/docstore.json"]
-        P_VEC --> P_FUSE["QueryFusionRetriever<br/>reciprocal_rerank"]
-        P_BM --> P_FUSE
-        P_FUSE --> P_RANK["Rule-based reranking<br/>dedup · diversification · PRISM selection"]
-        P_RANK --> P_CTX["Python context<br/>top 10 чанков"]
-        P_CTX --> P_GEN["Python generation<br/>LlamaIndex Ollama client<br/>LLM по выбранному provider/profile"]
-        P_GEN --> P_VAL["Python validation<br/>формулы · термины · retrieval warnings"]
-        P_VAL --> P_OUT["Ответ + context + sources"]
-    end
-
-    subgraph R["FLOW 2 — RUST"]
-        direction LR
-        R_Q["Вопрос"] --> R_PYRET["Python retrieval<br/>актуальный rag_docs_v10"]
-        R_Q --> R_BRIDGE["Python → Rust bridge<br/>subprocess.run · timeout 180 s"]
-        R_BRIDGE -->|":retrieve-json"| R_RSRET["Rust retrieval<br/>knowledge_base · Tantivy"]
-        R_RSRET --> R_FILTER["Rust relevance filter<br/>соответствие сущности и операции"]
-        R_PYRET --> R_FUSE["Evidence fusion<br/>Python authoritative: до 8 слотов<br/>Rust complement: до 2 слотов"]
-        R_FILTER --> R_FUSE
-        R_FUSE --> R_CONTEXT["Объединённый актуальный context<br/>dedup · без deleted · top 10"]
-        R_CONTEXT --> R_BRIDGE2["Python → Rust :generate-json<br/>question + context + выбранная Ollama model"]
-        R_BRIDGE2 --> R_GEN["Rust fresh generation<br/>reqwest → Ollama<br/>cache bypass"]
-        R_GEN --> R_POST["Python presentation validation<br/>формулы · warnings · HTML rendering"]
-        R_POST --> R_OUT["Ответ Rust + context + sources"]
-    end
-
-    subgraph H["FLOW 3 — HYBRID"]
-        direction LR
-        H_Q["Вопрос"] --> H_PYRET["Python retrieval<br/>актуальный rag_docs_v10"]
-        H_Q --> H_BRIDGE["Python → Rust :retrieve-json"]
-        H_BRIDGE --> H_RSRET["Rust retrieval + relevance filter"]
-        H_PYRET --> H_FUSE["Evidence fusion<br/>Python-first · Rust complement"]
-        H_RSRET --> H_FUSE
-        H_FUSE --> H_CTX["Объединённый context<br/>top 10"]
-        H_CTX --> H_SPEC["Python preparation<br/>PrismQuery + извлечение расчётных правил"]
-        H_SPEC --> H_GEN["Python generation<br/>RAGAgent._generate_grounded_answer<br/>выбранный system prompt/provider/model"]
-        H_GEN --> H_VAL["Python validation<br/>validate_retrieval + formula processing"]
-        H_VAL --> H_OUT["Гибридный ответ + fused context + sources"]
-    end
-
-    API -->|"mode = python"| P_Q
-    API -->|"mode = rust"| R_Q
-    API -->|"mode = hybrid"| H_Q
-
-    P_OUT --> RESPONSE["JSON response → Web UI"]
-    R_OUT --> RESPONSE
-    H_OUT --> RESPONSE
+    H --> W
+    H --> O
+    H --> I
+    H --> X
+    O --> K
+    O --> L
+    X --> K
 ```
 
-## PostgreSQL и backend-хранилище UI
+| Компонент | Ответственность | Основные зависимости |
+| --- | --- | --- |
+| `web_ui.py` | HTTP API, маршрутизация flow, промт с контекстом проекта, payload ответа | `ThreadingHTTPServer`, subprocess-мост |
+| `db_store.py` | Транзакции, миграции и CRUD workspace | `psycopg 3`, PostgreSQL |
+| `rag_agent.py` | Python-поиск, выбор evidence, генерация и валидация | LlamaIndex, Qdrant, BM25, Ollama или provider adapter |
+| `document_ingestion.py` | Извлечение текста и метаданных документа | XML parser, Mammoth, PDF readers |
+| `response_cache.py` | Точный кэш с TTL и безопасной деградацией при недоступности Redis | `redis-py`, Redis |
+| `llm_providers.py` | Адаптеры OpenAI-compatible и региональных провайдеров | `requests`, HTTP API провайдеров |
+| Rust-мост | Вызывает `llm-rust` JSON-командами | `subprocess.run`, Rust CLI |
 
-React-клиент больше не использует `localStorage` как основное хранилище проектов и истории чатов. Состояние workspace, проекты, чаты и сообщения загружаются и изменяются через Python API, а данные сохраняются в PostgreSQL через `psycopg 3`.
+## Пользовательский baseline
 
 ```mermaid
 flowchart LR
-    REACT["App.tsx<br/>React · TypeScript"] -->|"GET /api/workspace<br/>GET /api/projects"| API["web_ui.py<br/>Python storage API"]
-    REACT -->|"Projects / chats / messages commands"| API
-    API --> DRIVER["psycopg[binary] >= 3.2<br/>dict_row · transactions"]
-    DRIVER --> PG[("PostgreSQL 16")]
-    MIG["migrations/*.sql<br/>schema_migrations"] --> PG
-    COMPOSE["docker-compose.yml<br/>postgres:16-alpine"] --> PG
+    U["Пользователь"] --> F["Открывает Frontend"]
+    F --> W["Выбирает проект и чат"]
+    W --> Q["Задаёт вопрос или загружает документ"]
+    Q --> R["Получает ответ или результат индексации"]
+    R --> E["Просматривает источники, контекст и таблицы"]
+    E --> W
 ```
 
-При запуске `web_ui.py`:
+Baseline описывает действия пользователя. Внутренние контейнеры и алгоритмы не показаны здесь намеренно: они описаны на уровнях C2/C3 и в технических pipeline ниже.
 
-1. читается обязательная переменная `DATABASE_URL`;
-2. открывается одно переиспользуемое соединение `psycopg` с `autocommit=False`;
-3. `run_migrations()` применяет ещё не зарегистрированные SQL-файлы из `migrations/` и пишет версии в `schema_migrations`;
-4. `ensure_default_workspace()` создаёт начальные project, chat и workspace settings, если workspace отсутствует;
-5. только после этого запускается `ThreadingHTTPServer`.
-
-### API хранения
-
-| Операция | Endpoint | Хранение |
-|---|---|---|
-| Получить workspace | `GET /api/workspace`, `GET /api/settings` | `workspace_settings` |
-| Изменить active project/chat и settings | `POST /api/settings` | `workspace_settings` |
-| Список/создание проектов | `GET /api/projects`, `POST /api/projects` | `projects` |
-| Получить/изменить/удалить проект | `GET /api/projects/{id}`, `POST /api/projects/{id}` | `projects` |
-| Чаты проекта | `GET/POST /api/projects/{id}/chats` | `chats` |
-| Все чаты/создание чата | `GET/POST /api/chats` | `chats` |
-| Получить/изменить/удалить чат | `GET /api/chats/{id}`, `POST /api/chats/{id}` | `chats` |
-| Сообщения чата | `GET/POST /api/chats/{id}/messages` | `messages` |
-| Изменить/удалить сообщение | `POST /api/messages/{id}` | `messages` |
-
-Обновление и soft-delete пока передаются через `POST`; удаление обозначается полем `"_delete": true`. Отдельные HTTP-методы `PATCH` и `DELETE` в текущем handler не реализованы.
-
-React при старте параллельно загружает workspace и проекты, восстанавливает `active_project_id`/`active_chat_id`, затем загружает сообщения выбранного чата. Команда нового чата создаёт запись через backend API. Пользовательские и assistant-сообщения отправляются в `/api/chats/{chat_id}/messages`.
-
-### Схема данных
-
-| Таблица | Фактическое назначение |
-|---|---|
-| `workspace_settings` | Активные project/chat и JSONB-настройки UI |
-| `projects` | Проекты, описание, JSONB settings и memory |
-| `chats` | Чаты проекта, flow mode, provider, model и metadata |
-| `messages` | Роли user/assistant/system/tool, текст, HTML, status и metadata |
-| `documents` | Задел для привязки загруженных документов к project/chat |
-| `evidence_sources` | Задел для сохранения evidence конкретного сообщения |
-| `request_errors` | Задел для структурированных ошибок запросов |
-| `rbac_roles`, `rbac_permissions`, `rbac_role_permissions`, `rbac_user_roles` | Схема-задел под RBAC |
-
-CRUD в `web_ui.py` сейчас реализован для `projects`, `chats`, `messages` и `workspace_settings`. Запись в `documents`, `evidence_sources`, `request_errors` и применение RBAC/SSO в runtime пока не реализованы. Поля `tenant_id` и `user_id` существуют в схеме, но аутентификация, tenant isolation и проверка разрешений отсутствуют.
-
-### Конфигурация PostgreSQL
-
-`.env.example` содержит:
-
-```text
-DATABASE_URL=postgresql://rag:ragpassword@127.0.0.1:5432/rag_assistant
-POSTGRES_DB=rag_assistant
-POSTGRES_USER=rag
-POSTGRES_PASSWORD=ragpassword
-POSTGRES_PORT=5432
-BACKEND_HOST=127.0.0.1
-BACKEND_PORT=8080
-```
-
-`docker-compose.yml` поднимает только PostgreSQL 16 Alpine, создаёт named volume `postgres_data`, публикует порт и проверяет готовность через `pg_isready`. SQL-миграции применяет Python backend, а не контейнер PostgreSQL.
-
-Важно: `web_ui.py` читает `os.environ`, но сам не загружает `.env` через `python-dotenv`. Перед запуском `DATABASE_URL` должен находиться в окружении процесса. `POSTGRES_*` используются Compose. `BACKEND_HOST` и `BACKEND_PORT` пока не читаются backend: адрес и порт заданы константами `127.0.0.1:8080`.
-
-## Семантика режимов
-
-| Режим | Retrieval | Генерация | Финальная обработка |
-|---|---|---|---|
-| `python` | Python: LlamaIndex, Qdrant `rag_docs_v10`, BM25Retriever, проектный reranking | Python `RAGAgent` через настроенный LLM provider | Python: формулы, источники, validation warnings, HTML |
-| `rust` | Python retrieval + отфильтрованный Rust retrieval; Python evidence приоритетен | Rust `generate_from_context()` по объединённому актуальному context | Python: формулы, источники, validation warnings, HTML |
-| `hybrid` | Тот же Python-first fusion двух индексов | Python `_generate_grounded_answer()` по объединённому context | Python: PRISM, расчётные правила, validation warnings, HTML |
-
-## Переключение режима
-
-React-компонент предлагает три значения:
-
-```text
-python  — Python retrieval + Python generation
-rust    — Python/Rust evidence fusion + Rust generation
-hybrid  — Python/Rust evidence fusion + Python generation/validation
-```
-
-Web UI читает режим через `GET /api/flow-mode` и изменяет через `POST /api/flow-mode`. Backend принимает только `python`, `rust` и `hybrid`. Выбор сохраняется в `.ingestion_cache/flow_mode.json`, поэтому восстанавливается после перезапуска UI/backend. Если режим действительно изменился, перед сохранением нового значения очищается общая таблица `answer_cache` в `cache.db`.
-
-## Python → Rust bridge
-
-Интеграция реализована не через FFI и не через отдельный сетевой сервис. Python запускает Rust CLI как дочерний процесс:
-
-```text
-готовый binary: target/debug/llm-rust[.exe]
-fallback:       cargo run --quiet
-stdin:          :<command> <question>\n:exit\n
-stdout:         одна строка JSON
-timeout:        180 секунд
-```
-
-Машинные команды Rust:
-
-| Команда | Метод Rust | Результат | Использование |
-|---|---|---|---|
-| `:retrieve-json` | `Agent::retrieve_evidence()` | Массив `RetrievalEvidence` | Hybrid flow и debug context |
-| `:ask-json` | `Agent::ask()` | `AgentResponse` | Полный Rust flow |
-| `:generate-json` | `Agent::generate_from_context()` | Новый ответ по переданным `question`, `context` и `model` | Текущий Web Rust flow |
-
-Команда `:ask-json` остаётся доступна в CLI, но текущий Web Rust flow её не использует. Backend получает Rust evidence через `:retrieve-json`, объединяет его с актуальным Python evidence и вызывает `:generate-json`. Этот путь намеренно обходит Rust answer cache и всегда генерирует ответ по переданному context.
-
-## Объединение evidence и защита от рассинхронизации индексов
-
-Python- и Rust-индексы физически раздельны и могут содержать разные версии корпуса. Web backend поэтому не считает Rust-индекс единственным источником даже в режиме `rust`:
-
-Зафиксированный дефект возник именно из-за рассинхронизации: Python retrieval работал по актуальному `ruk.docx`, а Rust `knowledge_base` содержал старые чанки из `D:\LLM Rust\r12.docx`. Из-за нерелевантного Rust-контекста Hybrid корректно отказывался формировать неподтверждённый ответ. Исправление выполнено на уровне orchestration и не требует считать два индекса синхронными.
-
-1. Выполняется retrieval в актуальном Python-индексе.
-2. Выполняется Rust `:retrieve-json`.
-3. Rust evidence фильтруется по сущности и запрошенной операции.
-4. `fuse_contexts()` сначала резервирует до `top_k - 2` позиций для Python evidence, затем дополняет Rust evidence.
-5. Удаляются точные дубликаты и evidence со статусом `deleted`.
-6. Итог ограничивается `TOP_K = 10`.
-
-При наличии десяти Python-кандидатов стандартное распределение — 8 Python + 2 Rust. Поле `flow_origin` показывает происхождение каждого фрагмента.
-
-Для запроса о создании параметра Python reranker и procedural selection приоритетно отбирают разделы:
-
-- `Создание параметра`;
-- `Вкладка «Общее»`;
-- `Вкладка «Принадлежность»`;
-- `Панель инструментов`.
-
-Соседние сценарии получают штрафы или исключаются: создание документов, назначение формул, добавление версии, удаление, макросы, копирование и редактирование параметров.
-
-## Python pipeline
+## Pipeline поиска и генерации
 
 ### Индексация
 
 ```mermaid
 flowchart LR
-    DOC["DOCX / PDF / MD / TXT"] --> ING["document_ingestion.py<br/>Python"]
-    ING --> XML["DOCX XML parser"]
-    ING --> DOCLING["Docling"]
-    ING --> UNSTRUCT["Unstructured fallback"]
-    ING --> MAMMOTH["Mammoth fallback"]
-    XML --> SECTIONS["Section documents + metadata"]
-    DOCLING --> SECTIONS
-    UNSTRUCT --> SECTIONS
-    MAMMOTH --> SECTIONS
-    SECTIONS --> SPLIT["LlamaIndex SentenceSplitter<br/>1024 токена · overlap 128"]
-    SPLIT --> EMB["OllamaEmbedding<br/>nomic-embed-text"]
-    EMB --> QD[("Qdrant HTTP :6333<br/>rag_docs_v10")]
-    SPLIT --> DS[("SimpleDocumentStore<br/>bm25_index_v10/docstore.json")]
+    D["Документ"] --> E["Извлечение текста\ndocument_ingestion.py"]
+    E --> S["Построение разделов и метаданных\nrag_agent.py"]
+    S --> C["SentenceSplitter\n1024 токена, overlap 128"]
+    C --> V["Эмбеддинги\nnomic-embed-text через Ollama"]
+    V --> Q[("Qdrant\nrag_docs_v10")]
+    C --> B[("Хранилище BM25\nbm25_index_v10")]
+    Q --> I["Инвалидация Redis-кэша ответов"]
+    B --> I
 ```
 
-### Запрос
+### Сценарий: пользователь задаёт вопрос
 
-- Vector candidates: `12`.
-- BM25 candidates: `12`.
-- Fusion: `QueryFusionRetriever(mode="reciprocal_rerank", num_queries=1)`.
-- Расширенный candidate pool: `max(top_k × 5, 40)`; при `top_k=10` — 50.
-- После fusion применяются проектный reranking, deduplication, diversification и PRISM evidence selection.
-- Финальный контекст: `top 10`.
-- Answer cache: SQLite `cache.db`, версия ключа задаётся `CACHE_VERSION`.
+```mermaid
+sequenceDiagram
+    participant U as Пользователь
+    participant UI as React UI
+    participant API as web_ui.py
+    participant Cache as Redis
+    participant RAG as rag_agent.py
+    participant Index as Qdrant и BM25
+    participant LLM as Ollama или провайдер
 
-## Rust pipeline
+    U->>UI: Вводит и отправляет вопрос
+    UI->>API: POST /api/ask
+    API->>RAG: Выбранный flow и контекст проекта
+    RAG->>Cache: Точный поиск ответа
+    alt Есть запись в кэше
+        Cache-->>RAG: Ответ и метаданные источников
+    else Записи нет
+        RAG->>Index: Поиск evidence
+        Index-->>RAG: Отобранный контекст
+        RAG->>LLM: Запрос на генерацию
+        LLM-->>RAG: Ответ модели
+        RAG->>Cache: Сохранение записи с TTL
+    end
+    RAG-->>API: Ответ, источники, предупреждения
+    API-->>UI: JSON-ответ
+    UI-->>U: Рендерит Markdown, источники и контекст
+```
 
-### Индексация
+### Сценарий: пользователь загружает документ
+
+```mermaid
+sequenceDiagram
+    participant U as Пользователь
+    participant UI as React UI
+    participant API as web_ui.py
+    participant ING as Сервис индексации
+    participant IDX as Qdrant и BM25
+    participant Cache as Redis
+
+    U->>UI: Выбирает файл и отправляет загрузку
+    UI->>API: POST /api/upload
+    API->>ING: Извлечение текста и разбиение на разделы
+    ING->>IDX: Обновление векторов и BM25-узлов
+    ING->>Cache: Очистка кэша ответов
+    API-->>UI: Результат индексации
+    UI-->>U: Показывает число обработанных фрагментов
+```
+
+### Режимы обработки
+
+| Режим | Доказательства | Генерация | Область кэша |
+| --- | --- | --- | --- |
+| `python` | Python Qdrant и BM25, выбор PRISM | Python LLM adapter | Полный ответ и генерация |
+| `rust` | Python-first fusion с Rust retrieval | Rust CLI и Ollama | Точная Rust-генерация |
+| `hybrid` | Python-first fusion с Rust retrieval | Python LLM adapter | Точная Python-генерация |
+
+Python и Rust используют разные физические индексы. Fusion резервирует большинство слотов для Python evidence и использует Rust evidence как дополнение. Это исключает использование устаревшей Rust-коллекции как единственного источника фактов.
+
+## Владение данными и политика кэша
+
+| Хранилище | Данные | Хранение и инвалидация |
+| --- | --- | --- |
+| PostgreSQL | Проекты, чаты, сообщения, настройки workspace | Постоянный Docker-том; миграции применяет backend |
+| Qdrant | Эмбеддинги и метаданные Python- и Rust-коллекций | Постоянный Docker-том; обновляется при индексации |
+| Хранилище BM25 | Узлы Python retrieval | Том backend; перестраивается или обновляется при индексации |
+| Redis | Хэш ключа, ответ модели, метаданные источника `file`, `section`, `score` | TTL 7 дней, 128 МБ, `allkeys-lru`, без записи на диск |
+| `.ingestion_cache` | Выбор провайдера, flow, uploads и локальные артефакты | Том backend |
+
+Redis не хранит API-ключи, полные промты, вопросы, историю чатов и текстовые превью источников. Обновление корпуса, явная очистка кэша, смена провайдера/модели и смена flow инвалидируют кэш ответов.
+
+## Pipeline доставки
 
 ```mermaid
 flowchart LR
-    DOC["DOCX / PDF / MD / TXT"] --> PARSE["src/ingest.rs<br/>Rust · ZIP/XML · lopdf · filesystem"]
-    PARSE --> CHUNK["Section chunker<br/>1500 символов · overlap 200"]
-    CHUNK --> EMB["fastembed<br/>ParaphraseMLMiniLML12V2<br/>384 dimensions"]
-    EMB --> QD[("Qdrant gRPC :6334<br/>knowledge_base · cosine")]
-    CHUNK --> TAN[("Tantivy 0.22<br/>BM25 fields: text + section")]
+    T["Push или pull request\ndev, test, prod, main"] --> Q["Задача quality"]
+    Q --> PY["Синтаксис и unit-тесты Python"]
+    Q --> RS["Проверка и тесты Rust"]
+    Q --> UI["Тесты UI и production-сборка"]
+    T --> IS["Задача infrastructure-smoke"]
+    IS --> PG["Миграции PostgreSQL и тест workspace"]
+    IS --> RC["Smoke-тест Redis response-cache"]
+    PY --> OK["Результат CI"]
+    RS --> OK
+    UI --> OK
+    PG --> OK
+    RC --> OK
+    OK --> REL["Тег v*\nrelease-артефакт"]
 ```
 
-### Запрос
+Release workflow упаковывает backend, Rust-исходники, Compose-файлы, миграции, архитектуру и production-сборку Vite. В артефакт входит `response_cache.py`, поэтому реализация runtime-кэша сохраняется в релизе.
 
-```mermaid
-flowchart LR
-    Q["Вопрос"] --> VE["fastembed query embedding"]
-    VE --> VS["Qdrant vector search<br/>30 кандидатов · RRF ×1"]
-    Q --> BT["Tantivy text + section<br/>15 кандидатов · RRF ×1.5"]
-    Q --> AB["Извлечение аббревиатур<br/>2–8 символов"]
-    AB --> BS["Tantivy section only<br/>5 на аббревиатуру · RRF ×5"]
-    VS --> RRF["Weighted RRF · k=60"]
-    BT --> RRF
-    BS --> RRF
-    RRF --> TOP["Top 10"]
-    TOP --> LLM["reqwest → Ollama<br/>model может быть передана из Web config<br/>temperature 0 · seed 42 · top_k 1"]
-    LLM --> CACHE[("rusqlite · cache.db")]
+## Команды эксплуатации
+
+```powershell
+# Запуск полного стека
+docker compose up --build -d
+
+# Проверка состояния сервисов
+docker compose ps
+
+# Метрики и логи кэша
+docker compose logs -f response-cache
+docker compose exec response-cache redis-cli INFO memory
+
+# Очистка кэша сгенерированных ответов через API приложения
+Invoke-RestMethod -Method Post http://127.0.0.1:8080/api/cache/clear
 ```
 
-Параметры Rust Ollama generation для текущего запроса:
+## Карта исходного кода
 
-```text
-think       = false
-num_ctx     = 8192
-num_predict = 768
-temperature = 0.0
-seed        = 42
-top_k       = 1
-top_p       = 1.0
-```
-
-`qwen3.5:9b` передаётся из сохранённой Web-конфигурации в `:generate-json`. Thinking отключён на уровне Rust Ollama request. В Python для `qwen3.5:9b` также задан отдельный профиль: `context_window=8192`, `thinking=false`, `num_predict=768`, timeout 120 секунд. Для остальных Ollama-моделей действует Python default profile: окно 16384, `num_predict=1024`, timeout 180 секунд.
-
-## Web-операции, не переключаемые режимом
-
-Текущий selector маршрутизирует обработку вопроса и debug retrieval. Он не маршрутизирует ingestion:
-
-- `/api/load` всегда вызывает Python `RAGAgent.ingest()`;
-- `/api/upload` всегда индексирует через Python `RAGAgent`;
-- `/api/cache/clear` очищает общую таблицу `answer_cache` через Python connection;
-- при фактическом переключении режима эта же таблица очищается автоматически;
-- debug в `python` показывает Python retrieval, а в `rust` и `hybrid` — объединённый Python/Rust evidence.
-
-Следствие: документы, загруженные только через Web UI, попадают в Python-индекс. Rust-индекс `knowledge_base` по-прежнему заполняется Rust-командой `:load` отдельно, но его устаревшее или нерелевантное содержимое больше не является единственным context для режимов `rust` и `hybrid`: Web backend объединяет его с актуальным Python evidence.
-
-## Проверки
-
-Повторно выполнено по текущему workspace:
-
-| Проверка | Команда | Результат |
-|---|---|---|
-| Python routing + PRISM tests | `.venv\\Scripts\\python.exe -m unittest test_flow_modes.py test_prism.py` | 11/11 успешно |
-| Rust compile check | `cargo check` | успешно |
-| Rust tests | `cargo test` | успешно; в crate сейчас 0 unit tests |
-| React production build | `npm run build` в `ui/` | успешно; TypeScript + Vite build |
-
-`test_flow_modes.py` проверяет контракт маршрутизации с mock-объектами: Python flow, fused evidence в Rust/Hybrid, приоритет Python-индекса 8/2, отсечение нерелевантного Rust evidence и очистку кэша при переключении. Это unit/contract-тест, а не запуск реальных Qdrant и Ollama.
-
-## Источники в коде
-
-- Выбор режима и React UI: `ui/src/App.tsx`, `ui/src/styles.css`
-- Backend router и subprocess bridge: `web_ui.py`
-- Python RAG: `rag_agent.py`
-- Python ingestion: `document_ingestion.py`, `docx_parser.py`
-- Rust JSON CLI: `src/main.rs`
-- Rust orchestration и DTO: `src/agent.rs`
-- Rust ingestion: `src/ingest.rs`
-- Rust embeddings: `src/embed.rs`
-- Rust vector store: `src/store.rs`
-- Rust BM25 и retrieval: `src/bm25.rs`, `src/retrieval.rs`
-- Rust LLM client: `src/llm.rs`
-- Routing tests: `test_flow_modes.py`
+- UI: `ui/src/App.tsx`, `ui/src/styles.css`
+- API и маршрутизация: `web_ui.py`
+- Постоянное состояние workspace: `db_store.py`, `migrations/`
+- Python RAG: `rag_agent.py`, `document_ingestion.py`, `docx_parser.py`
+- Кэш ответов: `response_cache.py`
+- Адаптеры провайдеров: `llm_providers.py`
+- Rust CLI: `src/main.rs`, `src/agent.rs`, `src/retrieval.rs`, `src/llm.rs`
+- CI и релиз: `.github/workflows/ci.yml`, `.github/workflows/release.yml`

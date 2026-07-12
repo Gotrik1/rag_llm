@@ -1,5 +1,4 @@
 import {
-  ActionBarPrimitive,
   AssistantRuntimeProvider,
   ComposerPrimitive,
   MessagePrimitive,
@@ -10,6 +9,10 @@ import {
   type ExternalStoreAdapter,
   type ThreadMessageLike
 } from "@assistant-ui/react";
+import ReactMarkdown from "react-markdown";
+import rehypeRaw from "rehype-raw";
+import rehypeSanitize from "rehype-sanitize";
+import remarkGfm from "remark-gfm";
 import {
   AlertTriangle,
   Bot,
@@ -22,6 +25,7 @@ import {
   Files,
   Folder,
   FolderInput,
+  Maximize2,
   PanelRight,
   PanelLeftClose,
   PanelLeftOpen,
@@ -38,7 +42,6 @@ import {
   TestTube2,
   Trash2,
   UploadCloud,
-  User,
   X
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
@@ -1499,31 +1502,147 @@ function Thread() {
 
 function Message() {
   const role = useMessage((state) => state.role);
-  const html = useMessage((state) => state.metadata.custom.html);
   const modelLabel = useMessage((state) => state.metadata.custom.modelLabel);
+  const text = useMessage((state) => state.content.map((part) => part.type === "text" ? part.text : "").join(""));
   const isAssistant = role === "assistant";
+  const [copied, setCopied] = useState(false);
+
+  const copyMessage = async () => {
+    await copyText(text);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1600);
+  };
 
   return (
     <MessagePrimitive.Root className={`message-row ${isAssistant ? "assistant" : "user"}`}>
-      <div className="message-avatar">
-        {isAssistant ? <Bot size={16} /> : <User size={16} />}
-      </div>
       <div className="message-body">
         {isAssistant && typeof modelLabel === "string" && modelLabel ? (
           <div className="model-badge">Ответил: {modelLabel}</div>
         ) : null}
-        {isAssistant && typeof html === "string" && html ? (
-          <HtmlBlock className="answer-html" html={html} />
+        {isAssistant ? (
+          <MarkdownAnswer markdown={text} />
         ) : (
           <MessagePrimitive.Content />
         )}
-        <ActionBarPrimitive.Root className="message-actions">
-          <ActionBarPrimitive.Copy className="icon-button" title="Копировать" aria-label="Копировать">
+        <div className="message-actions">
+          <button className="icon-button" type="button" onClick={() => void copyMessage()} title="Копировать сообщение" aria-label="Копировать сообщение">
             <Copy size={14} />
-          </ActionBarPrimitive.Copy>
-        </ActionBarPrimitive.Root>
+          </button>
+          <span className={`message-copy-feedback ${copied ? "visible" : ""}`} aria-live="polite">Скопировано</span>
+        </div>
       </div>
     </MessagePrimitive.Root>
+  );
+}
+
+function MarkdownAnswer({ markdown }: { markdown: string }) {
+  return (
+    <ReactMarkdown
+      className="answer-markdown"
+      remarkPlugins={[remarkGfm]}
+      rehypePlugins={[rehypeRaw, rehypeSanitize]}
+      components={{ table: ({ children }) => <MarkdownTable>{children}</MarkdownTable> }}
+    >
+      {normalizeMarkdown(markdown)}
+    </ReactMarkdown>
+  );
+}
+
+function normalizeMarkdown(markdown: string): string {
+  const normalized = markdown
+    .replace(/\\?<(?:\/)?br\s*\/?>|&lt;\/?br\s*\/?&gt;/gi, (tag, offset, source) => {
+      const lineStart = source.lastIndexOf("\n", offset) + 1;
+      const lineEnd = source.indexOf("\n", offset);
+      const line = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+      return line.includes("|") ? "<br />" : "\n";
+    })
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return normalized.split("\n").map((line) => (
+    line.includes("|")
+      ? line.replace(/(\S)\s+•\s*/g, "$1<br />• ")
+      : line
+  )).join("\n");
+}
+
+function tableToTsv(table: HTMLTableElement | null): string {
+  if (!table) return "";
+  return Array.from(table.rows)
+    .map((row) => Array.from(row.cells)
+      .map((cell) => (cell.textContent || "").replace(/\s+/g, " ").trim())
+      .join("\t"))
+    .join("\n");
+}
+
+async function copyText(value: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch {
+    const textarea = document.createElement("textarea");
+    textarea.value = value;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.append(textarea);
+    textarea.select();
+    document.execCommand("copy");
+    textarea.remove();
+  }
+}
+
+function MarkdownTable({ children }: { children: ReactNode }) {
+  const tableRef = useRef<HTMLTableElement>(null);
+  const [isOpen, setIsOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const copy = async () => {
+    const tsv = tableToTsv(tableRef.current);
+    if (!tsv) return;
+    await copyText(tsv);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1600);
+  };
+
+  return (
+    <>
+      <section className="markdown-table">
+        <div className="markdown-table-toolbar">
+          <span>Таблица</span>
+          <div>
+            <button type="button" onClick={() => setIsOpen(true)} title="Открыть таблицу полностью" aria-label="Открыть таблицу полностью">
+              <Maximize2 size={14} aria-hidden="true" />
+            </button>
+            <button type="button" onClick={() => void copy()} title={copied ? "Скопировано" : "Скопировать таблицу"} aria-label={copied ? "Скопировано" : "Скопировать таблицу"}>
+              {copied ? <CheckCircle2 size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
+            </button>
+          </div>
+        </div>
+        <div className="markdown-table-scroll">
+          <table ref={tableRef}>{children}</table>
+        </div>
+      </section>
+
+      {isOpen ? createPortal(
+        <div className="markdown-table-modal-backdrop" role="presentation" onMouseDown={() => setIsOpen(false)}>
+          <section className="markdown-table-modal" role="dialog" aria-modal="true" aria-label="Таблица" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="markdown-table-modal-heading">
+              <h2>Таблица</h2>
+              <div>
+                <button type="button" onClick={() => void copy()} title={copied ? "Скопировано" : "Скопировать таблицу"} aria-label={copied ? "Скопировано" : "Скопировать таблицу"}>
+                  {copied ? <CheckCircle2 size={15} aria-hidden="true" /> : <Copy size={15} aria-hidden="true" />}
+                </button>
+                <button type="button" onClick={() => setIsOpen(false)} aria-label="Закрыть" title="Закрыть"><X size={17} /></button>
+              </div>
+            </div>
+            <div className="markdown-table-modal-content">
+              <table>{children}</table>
+            </div>
+          </section>
+        </div>,
+        document.body,
+      ) : null}
+    </>
   );
 }
 

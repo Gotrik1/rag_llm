@@ -29,6 +29,7 @@ GIGACHAT_CA_ARCHIVES = (
     Path.home() / "Downloads" / "windows_russian_trusted_root_ca.zip",
 )
 GIGACHAT_CA_BUNDLE = Path(".ingestion_cache") / "certificates" / "gigachat-russian-ca.pem"
+MAX_OUTPUT_TOKENS = 4056
 
 
 def gigachat_ca_bundle() -> str | bool:
@@ -71,7 +72,7 @@ class ProviderLLM(CustomLLM):
 
     @property
     def metadata(self) -> LLMMetadata:
-        return LLMMetadata(context_window=32768, num_output=2048, is_chat_model=True, model_name=self.model)
+        return LLMMetadata(context_window=32768, num_output=MAX_OUTPUT_TOKENS, is_chat_model=True, model_name=self.model)
 
     def _post(self, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
         response = requests.post(
@@ -90,7 +91,7 @@ class ProviderLLM(CustomLLM):
         data = self._post(
             "/chat/completions",
             {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-            {"model": self.model, "messages": [{"role": "user", "content": prompt}], "temperature": self.temperature},
+            {"model": self.model, "messages": [{"role": "user", "content": prompt}], "temperature": self.temperature, "max_tokens": MAX_OUTPUT_TOKENS},
         )
         return str(data["choices"][0]["message"]["content"])
 
@@ -126,7 +127,7 @@ class ProviderLLM(CustomLLM):
         data = self._post(
             "/v1/chat/completions",
             {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            {"model": self.model, "messages": [{"role": "user", "content": prompt}], "temperature": self.temperature},
+            {"model": self.model, "messages": [{"role": "user", "content": prompt}], "temperature": self.temperature, "max_tokens": MAX_OUTPUT_TOKENS},
         )
         return str(data["choices"][0]["message"]["content"])
 
@@ -138,7 +139,7 @@ class ProviderLLM(CustomLLM):
         data = self._post(
             "/completion",
             {"Authorization": f"{scheme} {self.api_key}", "Content-Type": "application/json"},
-            {"modelUri": model_uri, "completionOptions": {"stream": False, "temperature": self.temperature, "maxTokens": "2048"}, "messages": [{"role": "user", "text": prompt}]},
+            {"modelUri": model_uri, "completionOptions": {"stream": False, "temperature": self.temperature, "maxTokens": str(MAX_OUTPUT_TOKENS)}, "messages": [{"role": "user", "text": prompt}]},
         )
         return str(data["result"]["alternatives"][0]["message"]["text"])
 

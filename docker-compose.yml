@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-rag}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ragpassword}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${POSTGRES_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -34,6 +34,16 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  response-cache:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
   backend:
     build:
       context: .
@@ -46,7 +56,8 @@ services:
       QDRANT_GRPC_URL: http://qdrant:6334
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       LLM_MODEL: ${LLM_MODEL:-qwen2.5:14b}
-      CACHE_DB: /app/.ingestion_cache/cache.db
+      RESPONSE_CACHE_URL: redis://response-cache:6379/0
+      RESPONSE_CACHE_TTL_SECONDS: ${RESPONSE_CACHE_TTL_SECONDS:-604800}
       BM25_PERSIST_DIR: /app/.ingestion_cache/bm25_index_v10
       RUST_DATA_DIR: /app/.ingestion_cache/rust
       RUST_CLI_PATH: /usr/local/bin/llm-rust
@@ -60,6 +71,8 @@ services:
       postgres:
         condition: service_healthy
       qdrant:
+        condition: service_healthy
+      response-cache:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"from urllib.request import urlopen; assert urlopen('http://127.0.0.1:8080/api/openapi.json', timeout=3).status == 200\""]

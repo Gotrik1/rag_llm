@@ -9,6 +9,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from opentelemetry.trace import format_trace_id, get_current_span
@@ -267,4 +268,4 @@ async def legacy_api(operation: str, request: Request, _: Principal = Depends(cu
     payload, status = await asyncio.to_thread(
         legacy_operation, request.method, path, body, content_type=content_type, raw_body=raw_body
     )
-    return JSONResponse(payload, status_code=status)
+    return JSONResponse(jsonable_encoder(payload), status_code=status)

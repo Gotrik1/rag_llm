@@ -2,48 +2,75 @@
 
 > Состояние исходного кода после добавления переключателя режимов. Web backend объединяет Python- и Rust-реализации и предоставляет три маршрута обработки вопроса: `python`, `rust`, `hybrid`.
 
-## ASGI, безопасность и телеметрия (инкремент миграции)
+## Production-контур: ASGI, доступ, очередь и telemetry
 
-Новый входной контур — `asgi_app.py`, запускаемый командой:
+Внешний backend — `asgi_app.py` на FastAPI/ASGI. `python web_ui.py` и
+`python -m uvicorn asgi_app:app` запускают тот же защищённый сервис. Старый
+`Handler` не слушает порт: он временно вызывается через `legacy_adapter.py`,
+поэтому прежние API-контракты работают, но больше не обходят authorization,
+audit и request telemetry.
 
-```powershell
-python -m uvicorn asgi_app:app --host 127.0.0.1 --port 8080
+```text
+Microfrontend → Nginx → FastAPI → RBAC + ABAC → RAG / Qdrant / LLM
+                                 ↘ PostgreSQL (identity, policies, audit, jobs)
+                                  ↘ Redis/ARQ → ingestion worker → subprocess
 ```
 
-`python web_ui.py` запускает тот же ASGI-контур. `Handler` больше не является
-внешним сервером: он сохранён только как временный compatibility adapter, пока
-его операции не будут вынесены из `web_ui.py` в отдельные сервисы.
+### Identity, RBAC и ABAC
 
-На первом инкременте в ASGI перенесён `POST /api/ask`; его синхронный RAG
-pipeline исполняется через worker thread, поэтому event loop не блокируется.
-Остальные существующие `/api/*` endpoint'ы проходят через защищённый ASGI
-facade `legacy_adapter.py`: контракт UI не меняется, но auth, trace и метрики
-уже не обходятся. Долгая индексация доступна как job через
-`POST /api/jobs/ingestion` и опрашивается `GET /api/jobs/{id}`. Реестр jobs
-пока in-memory — при рестарте задача не сохраняется; для production следующим
-шагом нужна внешняя очередь и БД.
+`security.py` преобразует dev или OIDC identity в `Principal`. OIDC проверяет
+подпись JWT по JWKS, issuer, audience и сроки токена; mapping ролей,
+permissions и атрибутов задаётся `RAG_OIDC_*` переменными. При запуске
+идемпотентно создаётся bootstrap superadmin с subject из
+`BOOTSTRAP_SUPERADMIN_SUBJECT`; пароль локального пользователя не хранится.
 
-Контур identity изолирован в `security.py`: route получает `Principal`, а
-проверка доступа происходит через `authorize(principal, "rag.access")`.
-Режим по умолчанию — `RAG_AUTH_MODE=development`, создающий bootstrap
-superadmin с subject из `BOOTSTRAP_SUPERADMIN_SUBJECT` (по умолчанию
-`rag-superadmin`). Не задавайте постоянные секреты или пароли в коде. Для
-production предназначен `RAG_AUTH_MODE=oidc`; `OidcIdentityProvider` —
-выделенная точка для будущей проверки JWT/JWKS, issuer и audience.
+PostgreSQL содержит principals, roles, permissions, связи ролей, ABAC policies,
+audit events и jobs. Миграция `0001_security_audit_jobs` применяется командой
+`alembic upgrade head`. Проверка `authorize()` сначала применяет superadmin и
+RBAC, затем ABAC: явный `deny` policy имеет приоритет над role permission.
+Policy поддерживает `all`, `any`, `not`, `eq`, `ne`, `in`, `contains`, `exists`
+над `principal.*`, `resource.*` и `context.*`. Администрирование доступно через
+`POST /api/admin/policies` и `POST /api/admin/principals/{subject}/roles` и
+требует `rag.admin`/superadmin.
 
-`context` в `authorize()` намеренно является частью контракта: текущая
-проверка RBAC использует только permission `rag.access`, а будущий ABAC сможет
-оценивать атрибуты пользователя и ресурса без изменения route handlers.
+### Очередь и streaming
 
-Телеметрия задаётся в `telemetry.py`. Доступны `/healthz`, `/readyz` и
-`/metrics`; middleware выдаёт `X-Request-ID` и `X-Trace-ID`. Prometheus
-метрики покрывают HTTP, решения авторизации и длительность RAG pipeline.
-При настройке `OTEL_EXPORTER_OTLP_ENDPOINT` spans экспортируются в OTLP
-Collector. В labels не передаются вопрос, subject, токен, document ID или
-содержимое ответа — это не допускает high-cardinality и утечки данных.
-Технические и audit-события выводятся JSON-строками в stdout. Audit фиксирует
-успешные и отклонённые попытки аутентификации/авторизации и mutating API calls,
-но намеренно не содержит токены, prompt, answer или текст документов.
+`POST /api/jobs/ingestion` создаёт persistent job в PostgreSQL и ставит его в
+Redis/ARQ. `python -m ingestion_worker` выполняет ingestion в отдельном
+subprocess: `GET /api/jobs/{id}` возвращает state/progress/result, а
+`DELETE /api/jobs/{id}` ставит отмену и завершает subprocess. Это важно: отмена
+не оставляет блокирующий ingestion в API worker.
+
+`POST /api/ask/stream` — SSE endpoint. Он немедленно отдаёт `started` и
+heartbeats, передаёт LLM deltas как `delta`, затем итоговый metadata event
+`completed`; microfrontend использует его по умолчанию. Cache и детерминированные
+ответы отдаются одним delta, Rust generation пока возвращает один final delta.
+
+### Observability и безопасность данных
+
+Доступны `/healthz`, `/readyz` и `/metrics`; response содержит `X-Request-ID`
+и `X-Trace-ID`. OTLP spans покрывают HTTP, authorization, cache, vector/BM25,
+fusion/rerank, Rust bridge, LLM generation и ingestion. JSON technical/audit
+events пишутся в stdout и PostgreSQL; prompt, ответ, токен, document text,
+subject и document ID не становятся Prometheus labels или span attributes.
+Retention audit настраивается `RAG_AUDIT_RETENTION_DAYS` (default 90 в worker,
+production Compose override — 365 дней).
+
+Полный production stack, secrets, reverse proxy/CORS/TLS guidance, Collector,
+Prometheus, Tempo, Loki, Grafana dashboards и alerts описаны в
+[`deploy/README.md`](deploy/README.md). Быстрый запуск: скопировать `.env.example`
+и secret examples, затем `docker compose --env-file .env up -d`.
+
+### Проверки
+
+Python runtime проекта — **3.12**: актуальный LlamaIndex/Qdrant adapter не
+поддерживает Python 3.14. После `py -3.12 -m venv .venv` и
+`.venv\Scripts\python -m pip install -r requirements.txt` запускаются unit и
+contract тесты. `test_rag_integration.py` намеренно требует
+`RAG_LIVE_E2E=1`, отдельный Qdrant, collection/BM25/cache и Ollama с моделями
+`qwen2.5:14b` и `nomic-embed-text`; он проверяет ingest → retrieval → LLM и
+отдельно фильтрацию prompt-injection fixture. Не направляйте этот тест на
+`localhost:6333` другого проекта.
 
 ## Runtime-схема: три режима рядом
 
@@ -51,7 +78,7 @@ Collector. В labels не передаются вопрос, subject, токен
 flowchart TB
     USER["Пользователь"] --> UI["Web UI<br/>TypeScript · React · Vite<br/>Выбор Python / Rust / Hybrid"]
     UI -->|"GET / POST /api/flow-mode"| CONFIG[(".ingestion_cache/flow_mode.json<br/>JSON · сохранённый режим")]
-    UI -->|"POST /api/ask"| API["web_ui.py<br/>Python · ThreadingHTTPServer<br/>Маршрутизация запроса по flow_mode"]
+    UI -->|"POST /api/ask/stream"| API["asgi_app.py<br/>FastAPI · ASGI · RBAC/ABAC · SSE<br/>Маршрутизация по flow_mode"]
     CONFIG --> API
 
     subgraph P["FLOW 1 — PYTHON"]

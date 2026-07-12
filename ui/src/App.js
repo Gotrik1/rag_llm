@@ -2,7 +2,6 @@ import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-run
 import { ActionBarPrimitive, AssistantRuntimeProvider, ComposerPrimitive, MessagePrimitive, ThreadPrimitive, useExternalStoreRuntime, useMessage } from "@assistant-ui/react";
 import { AlertTriangle, Bot, Bug, CheckCircle2, Copy, Database, Cpu, FileText, Files, PanelRight, RefreshCw, RotateCcw, Save, Send, Sigma, Sparkles, TestTube2, UploadCloud, User } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-const ASK_TIMEOUT_MS = 180000;
 const DEBUG_TIMEOUT_MS = 60000;
 const UPLOAD_TIMEOUT_MS = 300000;
 const createId = () => crypto.randomUUID();
@@ -14,6 +13,7 @@ async function postJson(path, body, timeoutMs) {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
+            credentials: "include",
             signal: controller.signal
         });
         const data = (await response.json());
@@ -39,6 +39,7 @@ async function postFormData(path, body, timeoutMs) {
         const response = await fetch(path, {
             method: "POST",
             body,
+            credentials: "include",
             signal: controller.signal
         });
         const data = (await response.json());
@@ -56,6 +57,44 @@ async function postFormData(path, body, timeoutMs) {
     finally {
         window.clearTimeout(timeoutId);
     }
+}
+async function postSse(path, body, onDelta) {
+    const response = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+        body: JSON.stringify(body),
+        credentials: "include"
+    });
+    if (!response.ok || !response.body)
+        throw new Error(response.statusText || "SSE недоступен");
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let completed = null;
+    while (true) {
+        const { done, value } = await reader.read();
+        buffer += decoder.decode(value, { stream: !done });
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary >= 0) {
+            const block = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+            const event = block.split("\n").find((line) => line.startsWith("event:"))?.slice(6).trim();
+            const dataText = block.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+            const data = dataText ? JSON.parse(dataText) : {};
+            if (event === "delta")
+                onDelta(String(data.text || ""));
+            if (event === "completed")
+                completed = data;
+            if (event === "error")
+                throw new Error(String(data.message || "Ошибка генерации"));
+            boundary = buffer.indexOf("\n\n");
+        }
+        if (done)
+            break;
+    }
+    if (!completed)
+        throw new Error("SSE завершился без результата");
+    return completed;
 }
 const extractText = (message) => {
     const content = message.content;
@@ -150,7 +189,7 @@ export function App() {
         setIsLoadingModels(true);
         setModelError("");
         try {
-            const response = await fetch("/api/models", { cache: "no-store" });
+            const response = await fetch("/api/models", { cache: "no-store", credentials: "include" });
             const data = (await response.json());
             if (!response.ok)
                 throw new Error(data.error || response.statusText);
@@ -208,12 +247,16 @@ export function App() {
         setDebugError("");
         setActiveTab("evidence");
         try {
-            const data = await postJson("/api/ask", { question }, ASK_TIMEOUT_MS);
+            let streamedText = "";
+            const data = await postSse("/api/ask/stream", { question }, (delta) => {
+                streamedText += delta;
+                setMessages((current) => current.map((item) => item.id === assistantId ? { ...item, text: streamedText } : item));
+            });
             setLastResult(data);
             setMessages((current) => current.map((item) => item.id === assistantId
                 ? {
                     ...item,
-                    text: data.answer || "Пустой ответ.",
+                    text: data.answer || streamedText || "Пустой ответ.",
                     html: data.html_answer,
                     modelLabel: data.llm?.label,
                     status: "complete"
@@ -292,7 +335,7 @@ function FlowModeSelector({ isRunning }) {
     const [mode, setMode] = useState("python");
     const [status, setStatus] = useState("");
     useEffect(() => {
-        fetch("/api/flow-mode", { cache: "no-store" })
+        fetch("/api/flow-mode", { cache: "no-store", credentials: "include" })
             .then(async (response) => {
             const data = (await response.json());
             if (!response.ok)
@@ -323,7 +366,7 @@ function SystemPromptSelector({ isRunning }) {
     const [status, setStatus] = useState("");
     const load = useCallback(async () => {
         try {
-            const response = await fetch("/api/system-prompts", { cache: "no-store" });
+            const response = await fetch("/api/system-prompts", { cache: "no-store", credentials: "include" });
             const data = (await response.json());
             if (!response.ok)
                 throw new Error(data.error || response.statusText);
@@ -359,7 +402,7 @@ function ProviderSettings({ models, onProviderChange }) {
     const [isSaving, setIsSaving] = useState(false);
     const load = useCallback(async () => {
         try {
-            const response = await fetch("/api/providers", { cache: "no-store" });
+            const response = await fetch("/api/providers", { cache: "no-store", credentials: "include" });
             const data = (await response.json());
             if (!response.ok)
                 throw new Error(data.error || response.statusText);

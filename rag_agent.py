@@ -18,7 +18,7 @@ import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from opentelemetry.trace import Status, StatusCode
 
@@ -51,11 +51,11 @@ from telemetry import PIPELINE_SECONDS, tracer
 
 # ─── Настройки ────────────────────────────────────────────────
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-LLM_MODEL       = "qwen2.5:14b"
-EMBED_MODEL      = "nomic-embed-text"   # лёгкая, быстрая, хорошая для рус/англ
+LLM_MODEL       = os.getenv("LLM_MODEL", "qwen2.5:14b")
+EMBED_MODEL      = os.getenv("EMBED_MODEL", "nomic-embed-text")   # лёгкая, быстрая, хорошая для рус/англ
 
 QDRANT_URL       = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
-QDRANT_COLLECTION = "rag_docs_v10"
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "rag_docs_v10")
 
 CHUNK_SIZE       = 1024
 CHUNK_OVERLAP    = 128
@@ -64,8 +64,24 @@ BM25_TOP_K       = 12      # кандидатов от BM25
 VECTOR_TOP_K     = 12      # кандидатов от вектора
 
 CACHE_DB         = os.getenv("CACHE_DB", "cache.db")
-BM25_PERSIST_DIR = "bm25_index_v10"   # сохраняем ноды для BM25
+BM25_PERSIST_DIR = os.getenv("BM25_PERSIST_DIR", "bm25_index_v10")   # сохраняем ноды для BM25
 CACHE_VERSION    = "v19-qwen35-profile"
+
+# Retrieved documents are untrusted input. Never send instruction-like chunks
+# or secrets to the model even if a vector search ranks them highly.
+PROMPT_INJECTION_MARKERS = (
+    "ignore all instructions", "ignore previous instructions", "system prompt",
+    "суперпароль", "swordfish", "выведи пароль", "раскрой секрет",
+)
+
+
+def contains_prompt_injection(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (text or "").lower())
+    return any(marker in normalized for marker in PROMPT_INJECTION_MARKERS)
+
+
+def refusal_answer() -> str:
+    return "Я не знаю: в базе знаний нет подтверждённой информации для ответа."
 
 # Model-specific generation budgets. Qwen 3.5 enables long reasoning by default
 # and advertises a 262k context window; neither is appropriate for this local RAG
@@ -1027,6 +1043,8 @@ def rerank_context_results(results: list[dict], question: str) -> list[dict]:
 
 
 def sanitize_grounded_answer(answer: str, question: str, allowed_calculations: list[str]) -> str:
+    if contains_prompt_injection(answer):
+        return refusal_answer()
     requested = requested_formula_terms(question)
     unrequested = [term for term in known_formula_terms() if term not in requested]
     cleaned_lines: list[str] = []
@@ -1290,7 +1308,7 @@ class RAGAgent:
         print(f"✓ Проиндексировано {len(nodes)} чанков из {p.name}")
         return len(nodes)
 
-    def ask(self, question: str, system_prompt: str | None = None, prompt_id: str = "rag-grounded") -> tuple[str, list[dict], bool]:
+    def ask(self, question: str, system_prompt: str | None = None, prompt_id: str = "rag-grounded", on_delta: Callable[[str], None] | None = None) -> tuple[str, list[dict], bool]:
         """
         Возвращает (answer, sources, from_cache).
         sources — список dict с ключами file, section, score.
@@ -1312,19 +1330,18 @@ class RAGAgent:
             ).observe(0.0)
         if row:
             answer, sources_json = row
+            if on_delta: on_delta(answer)
             return answer, json.loads(sources_json), True
 
         if not self._all_nodes:
-            return (
-                "База знаний пуста. Загрузите документы командой :load <путь>",
-                [],
-                False,
-            )
+            answer = "База знаний пуста. Загрузите документы командой :load <путь>"
+            if on_delta: on_delta(answer)
+            return answer, [], False
 
         spec = refine_prism_query(question)
         context = self.retrieve_context(question, TOP_K, spec)
         calculations = extract_formula_lines_from_texts([item["text"] for item in context], question)
-        answer = self._generate_grounded_answer(question, context, calculations, spec, system_prompt)
+        answer = self._generate_grounded_answer(question, context, calculations, spec, system_prompt, on_delta)
 
         sources = [{
             "file": item["file"],
@@ -1350,6 +1367,7 @@ class RAGAgent:
         calculations: list[str],
         spec: PrismQuery | None = None,
         system_prompt: str | None = None,
+        on_delta: Callable[[str], None] | None = None,
     ) -> str:
         spec = spec or refine_prism_query(question)
         if spec.answer_mode == "formulas_only":
@@ -1357,7 +1375,9 @@ class RAGAgent:
                 "generation.formula",
                 attributes={"rag.context.count": len(context)},
             ):
-                return generate_formula_only_answer(question, context, calculations, spec)
+                answer = generate_formula_only_answer(question, context, calculations, spec)
+                if on_delta: on_delta(answer)
+                return answer
         with _pipeline_span(
             "generation.extractive",
             attributes={"rag.context.count": len(context)},
@@ -1365,6 +1385,7 @@ class RAGAgent:
             extractive = generate_extractive_value_answer(question, context)
             extractive_span.set_attribute("rag.generation.matched", bool(extractive))
         if extractive:
+            if on_delta: on_delta(extractive)
             return extractive
 
         context_text = "\n\n---\n\n".join(
@@ -1406,7 +1427,15 @@ class RAGAgent:
                 "rag.context.count": len(context),
             },
         ) as llm_span:
-            response = self.llm.complete(prompt)
+            if on_delta:
+                chunks: list[str] = []
+                for response_part in self.llm.stream_complete(prompt):
+                    delta = str(getattr(response_part, "delta", "") or "")
+                    if delta:
+                        chunks.append(delta); on_delta(delta)
+                response = "".join(chunks)
+            else:
+                response = self.llm.complete(prompt)
             llm_span.set_attribute("rag.response.chars", len(str(response)))
         return sanitize_grounded_answer(str(response).strip(), question, calculations)
 
@@ -1659,6 +1688,7 @@ class RAGAgent:
         ) as select_span:
             selected = select_prism_evidence(diversified, spec, top_k)
             select_span.set_attribute("rag.results.count", len(selected))
+        selected = [item for item in selected if not contains_prompt_injection(str(item.get("text", "")))]
         normalized = question.lower().replace("ё", "е")
         if "параметр" in normalized and any(
             marker in normalized for marker in ("добав", "созда", "новый", "завест")

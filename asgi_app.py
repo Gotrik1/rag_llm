@@ -2,19 +2,23 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from opentelemetry.trace import format_trace_id, get_current_span
 from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from audit import record as audit_record
-from jobs import JobRegistry
+from jobs import JobQueue
 from legacy_adapter import invoke_legacy
+from persistence import get_store
 from security import AuthenticationError, AuthorizationError, Principal, RAG_ACCESS, authorize, configured_identity_provider
 from telemetry import AUTH_DECISIONS, JOBS, PIPELINE_SECONDS, REQUESTS, REQUEST_SECONDS, configure_logging, configure_telemetry, tracer
 
@@ -27,6 +31,11 @@ def run_ask(question: str) -> dict:
     """Lazy import keeps health/auth endpoints available during dependency outages."""
     from web_ui import ask_payload
     return ask_payload(question)
+
+
+def run_ask_stream(question: str, on_delta) -> dict:
+    from web_ui import ask_payload
+    return ask_payload(question, on_delta)
 
 
 def qdrant_readiness_error() -> str | None:
@@ -48,7 +57,8 @@ def run_ingestion_job(payload: dict) -> dict:
 def current_principal(request: Request) -> Principal:
     try:
         principal = configured_identity_provider().authenticate(request.headers.get("Authorization"))
-        authorize(principal, RAG_ACCESS)
+        principal = get_store().enrich_principal(principal)
+        authorize(principal, RAG_ACCESS, request.url.path, {"request": {"method": request.method}})
         request.state.principal = principal
         AUTH_DECISIONS.labels(RAG_ACCESS, "allow", principal.provider).inc()
         return principal
@@ -66,11 +76,15 @@ def current_principal(request: Request) -> Principal:
 async def lifespan(_: FastAPI):
     configure_logging()
     configure_telemetry()
+    await asyncio.to_thread(get_store().bootstrap_superadmin, os.getenv("BOOTSTRAP_SUPERADMIN_SUBJECT", "rag-superadmin"))
     yield
+    await jobs.close()
 
 
 app = FastAPI(title="RAG service", version="0.1.0", lifespan=lifespan)
-jobs = JobRegistry()
+jobs = JobQueue()
+cors_origins = [origin.strip() for origin in os.getenv("RAG_CORS_ORIGINS", "http://127.0.0.1:5173").split(",") if origin.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials=True, allow_methods=["GET", "POST", "DELETE", "OPTIONS"], allow_headers=["Authorization", "Content-Type", "X-Request-ID"], expose_headers=["X-Request-ID", "X-Trace-ID"])
 
 
 @app.middleware("http")
@@ -109,6 +123,15 @@ async def readyz():
     problem = await asyncio.to_thread(qdrant_readiness_error)
     if problem:
         raise HTTPException(503, problem)
+    try:
+        await asyncio.to_thread(get_store().ping)
+    except Exception as exc:
+        raise HTTPException(503, "PostgreSQL is unavailable") from exc
+    if os.getenv("RAG_REDIS_REQUIRED", "false").lower() == "true":
+        try:
+            await jobs.ping()
+        except Exception as exc:
+            raise HTTPException(503, "Redis is unavailable") from exc
     return {"status": "ready"}
 
 
@@ -120,6 +143,28 @@ async def metrics():
 @app.get("/api/me")
 async def me(principal: Principal = Depends(current_principal)):
     return {"subject": principal.subject, "roles": sorted(principal.roles), "permissions": sorted(principal.permissions), "provider": principal.provider}
+
+
+def require_admin(principal: Principal, path: str) -> None:
+    authorize(principal, "rag.admin", path)
+
+
+@app.post("/api/admin/policies")
+async def save_policy(payload: dict, principal: Principal = Depends(current_principal)):
+    require_admin(principal, "/api/admin/policies")
+    if payload.get("effect") not in {"allow", "deny"} or not payload.get("name") or not payload.get("action"):
+        raise HTTPException(400, "name, action and allow/deny effect are required")
+    return await asyncio.to_thread(get_store().upsert_policy, payload)
+
+
+@app.post("/api/admin/principals/{subject}/roles")
+async def grant_principal_role(subject: str, payload: dict, principal: Principal = Depends(current_principal)):
+    require_admin(principal, "/api/admin/principals/*/roles")
+    role = str(payload.get("role", "")).strip()
+    permissions = [str(item) for item in payload.get("permissions", [])]
+    if not role: raise HTTPException(400, "role is required")
+    await asyncio.to_thread(get_store().grant_role, subject, role, permissions)
+    return {"subject": subject, "role": role, "permissions": permissions}
 
 
 @app.post("/api/ask")
@@ -137,22 +182,63 @@ async def ask(payload: AskRequest, principal: Principal = Depends(current_princi
         return JSONResponse(result)
 
 
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n"
+
+
+@app.post("/api/ask/stream")
+async def ask_stream(payload: AskRequest, request: Request, principal: Principal = Depends(current_principal)):
+    """SSE contract with immediate progress, heartbeats and incremental answer chunks."""
+    async def events():
+        yield _sse("started", {"flow": "pending"})
+        loop = asyncio.get_running_loop()
+        deltas: asyncio.Queue[str] = asyncio.Queue()
+        callback = lambda text: loop.call_soon_threadsafe(deltas.put_nowait, text)
+        task = asyncio.create_task(asyncio.to_thread(run_ask_stream, payload.question.strip(), callback))
+        while not task.done() or not deltas.empty():
+            if await request.is_disconnected():
+                task.cancel()
+                return
+            try:
+                delta = await asyncio.wait_for(deltas.get(), timeout=10)
+                yield _sse("delta", {"text": delta})
+            except TimeoutError:
+                yield _sse("heartbeat", {"status": "running"})
+        try:
+            result = task.result()
+            result.pop("html_answer", None)
+            yield _sse("completed", result)
+        except Exception:
+            yield _sse("error", {"message": "RAG generation failed"})
+    return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @app.post("/api/jobs/ingestion")
 async def submit_ingestion(payload: dict, _: Principal = Depends(current_principal)):
     """Start long ingestion without holding an HTTP connection open."""
-    job = jobs.submit("ingestion", lambda: run_ingestion_job(payload))
+    try:
+        job = await jobs.submit("ingestion", payload)
+    except Exception as exc:
+        raise HTTPException(503, str(exc)) from exc
     JOBS.labels("ingestion", "queued").inc()
-    return JSONResponse(job.public(), status_code=202)
+    return JSONResponse(job, status_code=202)
 
 
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str, _: Principal = Depends(current_principal)):
-    job = jobs.get(job_id)
+    job = await jobs.get(job_id)
     if job is None:
         raise HTTPException(404, "job not found")
-    if job.status in {"completed", "failed"}:
-        JOBS.labels(job.kind, job.status).inc()
-    return job.public()
+    if job["status"] in {"completed", "failed", "cancelled"}:
+        JOBS.labels(job["kind"], job["status"]).inc()
+    return job
+
+
+@app.delete("/api/jobs/{job_id}")
+async def cancel_job(job_id: str, _: Principal = Depends(current_principal)):
+    if not await jobs.cancel(job_id):
+        raise HTTPException(409, "job cannot be cancelled")
+    return {"id": job_id, "status": "cancelled"}
 
 
 @app.api_route("/api/{operation:path}", methods=["GET", "POST"])

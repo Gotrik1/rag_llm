@@ -139,7 +139,6 @@ type FlowMode = "python" | "rust" | "hybrid";
 
 type PanelTab = "evidence" | "sources" | "debug";
 
-const ASK_TIMEOUT_MS = 180_000;
 const DEBUG_TIMEOUT_MS = 60_000;
 const UPLOAD_TIMEOUT_MS = 300_000;
 
@@ -168,6 +167,7 @@ async function postJson<T>(path: string, body: unknown, timeoutMs: number): Prom
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      credentials: "include",
       signal: controller.signal
     });
     const data = (await response.json()) as T & { error?: string };
@@ -193,6 +193,7 @@ async function postFormData<T>(path: string, body: FormData, timeoutMs: number):
     const response = await fetch(path, {
       method: "POST",
       body,
+      credentials: "include",
       signal: controller.signal
     });
     const data = (await response.json()) as T & { error?: string };
@@ -208,6 +209,39 @@ async function postFormData<T>(path: string, body: FormData, timeoutMs: number):
   } finally {
     window.clearTimeout(timeoutId);
   }
+}
+
+async function postSse(path: string, body: unknown, onDelta: (text: string) => void): Promise<AskResponse> {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: JSON.stringify(body),
+    credentials: "include"
+  });
+  if (!response.ok || !response.body) throw new Error(response.statusText || "SSE недоступен");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let completed: AskResponse | null = null;
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const block = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      const event = block.split("\n").find((line) => line.startsWith("event:"))?.slice(6).trim();
+      const dataText = block.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+      const data = dataText ? JSON.parse(dataText) : {};
+      if (event === "delta") onDelta(String(data.text || ""));
+      if (event === "completed") completed = data as AskResponse;
+      if (event === "error") throw new Error(String(data.message || "Ошибка генерации"));
+      boundary = buffer.indexOf("\n\n");
+    }
+    if (done) break;
+  }
+  if (!completed) throw new Error("SSE завершился без результата");
+  return completed;
 }
 
 const extractText = (message: AppendMessage) => {
@@ -310,7 +344,7 @@ export function App() {
     setIsLoadingModels(true);
     setModelError("");
     try {
-      const response = await fetch("/api/models", { cache: "no-store" });
+      const response = await fetch("/api/models", { cache: "no-store", credentials: "include" });
       const data = (await response.json()) as ModelsResponse & { error?: string };
       if (!response.ok) throw new Error(data.error || response.statusText);
       setModels(data.models);
@@ -367,7 +401,11 @@ export function App() {
     setActiveTab("evidence");
 
     try {
-      const data = await postJson<AskResponse>("/api/ask", { question }, ASK_TIMEOUT_MS);
+      let streamedText = "";
+      const data = await postSse("/api/ask/stream", { question }, (delta) => {
+        streamedText += delta;
+        setMessages((current) => current.map((item) => item.id === assistantId ? { ...item, text: streamedText } : item));
+      });
 
       setLastResult(data);
       setMessages((current) =>
@@ -375,7 +413,7 @@ export function App() {
           item.id === assistantId
             ? {
                 ...item,
-                text: data.answer || "Пустой ответ.",
+                text: data.answer || streamedText || "Пустой ответ.",
                 html: data.html_answer,
                 modelLabel: data.llm?.label,
                 status: "complete"
@@ -528,7 +566,7 @@ function FlowModeSelector({ isRunning }: { isRunning: boolean }) {
   const [status, setStatus] = useState("");
 
   useEffect(() => {
-    fetch("/api/flow-mode", { cache: "no-store" })
+    fetch("/api/flow-mode", { cache: "no-store", credentials: "include" })
       .then(async (response) => {
         const data = (await response.json()) as { mode?: FlowMode; error?: string };
         if (!response.ok) throw new Error(data.error || response.statusText);
@@ -570,7 +608,7 @@ function SystemPromptSelector({ isRunning }: { isRunning: boolean }) {
 
   const load = useCallback(async () => {
     try {
-      const response = await fetch("/api/system-prompts", { cache: "no-store" });
+      const response = await fetch("/api/system-prompts", { cache: "no-store", credentials: "include" });
       const data = (await response.json()) as SystemPromptsResponse & { error?: string };
       if (!response.ok) throw new Error(data.error || response.statusText);
       setPrompts(data.prompts);
@@ -622,7 +660,7 @@ function ProviderSettings({
 
   const load = useCallback(async () => {
     try {
-      const response = await fetch("/api/providers", { cache: "no-store" });
+      const response = await fetch("/api/providers", { cache: "no-store", credentials: "include" });
       const data = (await response.json()) as ProvidersResponse & { error?: string };
       if (!response.ok) throw new Error(data.error || response.statusText);
       setConfig(data.config);

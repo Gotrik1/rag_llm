@@ -425,7 +425,7 @@ def usage_stats(answer: str = "", context: list[dict] | None = None) -> dict:
     }
 
 
-def ask_payload(question: str) -> dict:
+def ask_payload(question: str, on_delta=None) -> dict:
     """Run the existing synchronous pipeline and return the public API payload.
 
     Kept framework-free so the legacy HTTP server and the ASGI endpoint have
@@ -437,7 +437,10 @@ def ask_payload(question: str) -> dict:
     with _request_lock:
         profile = get_profile(load_system_prompt_id(), GROUNDED_SYSTEM_PROMPT)
         if mode == "python":
-            answer, sources, from_cache = agent.ask(question, profile["prompt"], profile["id"])
+            answer, sources, from_cache = (
+                agent.ask(question, profile["prompt"], profile["id"], on_delta=on_delta)
+                if on_delta else agent.ask(question, profile["prompt"], profile["id"])
+            )
             context = agent.retrieve_context(question, TOP_K)
         elif mode == "rust":
             python_items = agent.retrieve_context(question, TOP_K)
@@ -448,6 +451,7 @@ def ask_payload(question: str) -> dict:
             )
             context = fuse_contexts(python_items, rust_items, TOP_K, flow=mode)
             answer = rust_generate(question, context, flow=mode)
+            if on_delta: on_delta(answer)
             from_cache = False
             sources = [{"file": item["file"], "section": item.get("section_path", ""), "score": item["score"], "text_preview": item["text"][:120]} for item in context]
         else:
@@ -460,7 +464,10 @@ def ask_payload(question: str) -> dict:
             context = fuse_contexts(python_items, rust_items, TOP_K, flow=mode)
             spec = refine_prism_query(question)
             calculations = extract_formula_lines(context, question)
-            answer = agent._generate_grounded_answer(question, context, calculations, spec, profile["prompt"])
+            answer = (
+                agent._generate_grounded_answer(question, context, calculations, spec, profile["prompt"], on_delta=on_delta)
+                if on_delta else agent._generate_grounded_answer(question, context, calculations, spec, profile["prompt"])
+            )
             from_cache = False
             sources = [{"file": item["file"], "section": item.get("section_path", ""), "score": item["score"], "text_preview": item["text"][:120]} for item in context]
     formulas = extract_formula_lines(context, question)

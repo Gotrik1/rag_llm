@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -39,6 +39,18 @@ class AsgiFoundationTests(unittest.TestCase):
         self.assertEqual(response.json(), payload)
         ask.assert_called_once_with("Test question")
 
+    def test_sse_stream_emits_answer_deltas_and_completion(self):
+        payload = {"answer": "streamed answer", "html_answer": "ignored", "flow_mode": "python"}
+        def streamed(_question, callback):
+            callback("streamed answer")
+            return payload
+        with patch("asgi_app.run_ask_stream", side_effect=streamed):
+            response = self.client.post("/api/ask/stream", json={"question": "Test"})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("event: delta", response.text)
+        self.assertIn("streamed answer", response.text)
+        self.assertIn("event: completed", response.text)
+
     def test_legacy_routes_are_protected_and_keep_response_status(self):
         with patch("asgi_app.legacy_operation", return_value=({"mode": "python"}, 200)) as operation:
             response = self.client.get("/api/flow-mode")
@@ -47,11 +59,13 @@ class AsgiFoundationTests(unittest.TestCase):
         operation.assert_called_once()
 
     def test_ingestion_job_is_accepted_and_exposed(self):
-        with patch("asgi_app.legacy_operation", return_value=({"chunks": 4}, 200)):
+        queued = {"id": "job-1", "kind": "ingestion", "status": "queued", "progress": 0}
+        with patch.object(__import__("asgi_app").jobs, "submit", AsyncMock(return_value=queued)), \
+             patch.object(__import__("asgi_app").jobs, "get", AsyncMock(return_value=queued)):
             created = self.client.post("/api/jobs/ingestion", json={"path": "test.docx"})
             self.assertEqual(created.status_code, 202)
             status = self.client.get(f"/api/jobs/{created.json()['id']}")
-        self.assertIn(status.json()["status"], {"queued", "running", "completed"})
+        self.assertEqual(status.json()["status"], "queued")
 
 
 if __name__ == "__main__":

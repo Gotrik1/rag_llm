@@ -20,3 +20,8 @@ def record(event: str, *, request_id: str | None = None, principal: Principal | 
         **fields,
     }
     logger.info(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    try:
+        from persistence import get_store
+        get_store().record_audit(payload)
+    except Exception:
+        logger.exception("audit_persistence_failed")

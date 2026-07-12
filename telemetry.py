@@ -18,6 +18,18 @@ PIPELINE_SECONDS = Histogram("rag_pipeline_duration_seconds", "RAG pipeline stag
 JOBS = Counter("rag_jobs_total", "Background jobs", ("kind", "status"))
 
 
+def configure_logging() -> None:
+    """Emit JSON logs to stdout; collectors can parse them without SDK coupling."""
+    logger = logging.getLogger("rag")
+    if logger.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(os.getenv("RAG_LOG_LEVEL", "INFO").upper())
+    logger.propagate = False
+
+
 def configure_telemetry() -> None:
     """Configure OTLP only when an endpoint is supplied by deployment."""
     if not os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):

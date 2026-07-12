@@ -12,10 +12,11 @@ from opentelemetry.trace import format_trace_id, get_current_span
 from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
+from audit import record as audit_record
 from jobs import JobRegistry
 from legacy_adapter import invoke_legacy
 from security import AuthenticationError, AuthorizationError, Principal, RAG_ACCESS, authorize, configured_identity_provider
-from telemetry import AUTH_DECISIONS, JOBS, PIPELINE_SECONDS, REQUESTS, REQUEST_SECONDS, configure_telemetry, tracer
+from telemetry import AUTH_DECISIONS, JOBS, PIPELINE_SECONDS, REQUESTS, REQUEST_SECONDS, configure_logging, configure_telemetry, tracer
 
 
 class AskRequest(BaseModel):
@@ -48,18 +49,22 @@ def current_principal(request: Request) -> Principal:
     try:
         principal = configured_identity_provider().authenticate(request.headers.get("Authorization"))
         authorize(principal, RAG_ACCESS)
+        request.state.principal = principal
         AUTH_DECISIONS.labels(RAG_ACCESS, "allow", principal.provider).inc()
         return principal
     except AuthenticationError as exc:
         AUTH_DECISIONS.labels(RAG_ACCESS, "unauthenticated", "unknown").inc()
+        audit_record("authentication", request_id=request.headers.get("X-Request-ID"), outcome="denied")
         raise HTTPException(401, str(exc)) from exc
     except AuthorizationError as exc:
         AUTH_DECISIONS.labels(RAG_ACCESS, "deny", "unknown").inc()
+        audit_record("authorization", request_id=request.headers.get("X-Request-ID"), principal=locals().get("principal"), outcome="denied", action=RAG_ACCESS)
         raise HTTPException(403, str(exc)) from exc
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    configure_logging()
     configure_telemetry()
     yield
 
@@ -84,6 +89,11 @@ async def request_telemetry(request: Request, call_next):
     REQUEST_SECONDS.labels(route_name, request.method).observe(time.perf_counter() - started)
     REQUESTS.labels(route_name, request.method, str(response.status_code)).inc()
     response.headers["X-Request-ID"] = request_id
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path.startswith("/api/"):
+        audit_record(
+            "api_mutation", request_id=request_id, principal=getattr(request.state, "principal", None),
+            outcome="success" if response.status_code < 400 else "failed", path=route_name, status=response.status_code,
+        )
     return response
 
 

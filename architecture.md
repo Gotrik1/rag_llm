@@ -41,6 +41,9 @@ production предназначен `RAG_AUTH_MODE=oidc`; `OidcIdentityProvider`
 При настройке `OTEL_EXPORTER_OTLP_ENDPOINT` spans экспортируются в OTLP
 Collector. В labels не передаются вопрос, subject, токен, document ID или
 содержимое ответа — это не допускает high-cardinality и утечки данных.
+Технические и audit-события выводятся JSON-строками в stdout. Audit фиксирует
+успешные и отклонённые попытки аутентификации/авторизации и mutating API calls,
+но намеренно не содержит токены, prompt, answer или текст документов.
 
 ## Runtime-схема: три режима рядом
 

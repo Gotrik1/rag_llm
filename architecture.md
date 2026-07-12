@@ -12,8 +12,12 @@ python -m uvicorn asgi_app:app --host 127.0.0.1 --port 8080
 
 На первом инкременте в ASGI перенесён `POST /api/ask`; его синхронный RAG
 pipeline исполняется через worker thread, поэтому event loop не блокируется.
-Legacy `web_ui.py` остаётся совместимым сервером до переноса остальных UI API,
-но оба входа используют общий framework-free метод `ask_payload()`.
+Остальные существующие `/api/*` endpoint'ы проходят через защищённый ASGI
+facade `legacy_adapter.py`: контракт UI не меняется, но auth, trace и метрики
+уже не обходятся. Долгая индексация доступна как job через
+`POST /api/jobs/ingestion` и опрашивается `GET /api/jobs/{id}`. Реестр jobs
+пока in-memory — при рестарте задача не сохраняется; для production следующим
+шагом нужна внешняя очередь и БД.
 
 Контур identity изолирован в `security.py`: route получает `Principal`, а
 проверка доступа происходит через `authorize(principal, "rag.access")`.

@@ -39,6 +39,20 @@ class AsgiFoundationTests(unittest.TestCase):
         self.assertEqual(response.json(), payload)
         ask.assert_called_once_with("Test question")
 
+    def test_legacy_routes_are_protected_and_keep_response_status(self):
+        with patch("asgi_app.legacy_operation", return_value=({"mode": "python"}, 200)) as operation:
+            response = self.client.get("/api/flow-mode")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"mode": "python"})
+        operation.assert_called_once()
+
+    def test_ingestion_job_is_accepted_and_exposed(self):
+        with patch("asgi_app.legacy_operation", return_value=({"chunks": 4}, 200)):
+            created = self.client.post("/api/jobs/ingestion", json={"path": "test.docx"})
+            self.assertEqual(created.status_code, 202)
+            status = self.client.get(f"/api/jobs/{created.json()['id']}")
+        self.assertIn(status.json()["status"], {"queued", "running", "completed"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,8 +12,10 @@ from opentelemetry.trace import format_trace_id, get_current_span
 from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
+from jobs import JobRegistry
+from legacy_adapter import invoke_legacy
 from security import AuthenticationError, AuthorizationError, Principal, RAG_ACCESS, authorize, configured_identity_provider
-from telemetry import AUTH_DECISIONS, PIPELINE_SECONDS, REQUESTS, REQUEST_SECONDS, configure_telemetry, tracer
+from telemetry import AUTH_DECISIONS, JOBS, PIPELINE_SECONDS, REQUESTS, REQUEST_SECONDS, configure_telemetry, tracer
 
 
 class AskRequest(BaseModel):
@@ -29,6 +31,17 @@ def run_ask(question: str) -> dict:
 def qdrant_readiness_error() -> str | None:
     from web_ui import Handler
     return Handler.qdrant_error()
+
+
+def legacy_operation(method: str, path: str, body: dict | None = None, *, content_type: str = "", raw_body: bytes = b"") -> tuple[dict, int]:
+    return invoke_legacy(method, path, body, content_type=content_type, raw_body=raw_body)
+
+
+def run_ingestion_job(payload: dict) -> dict:
+    result, status = legacy_operation("POST", "/api/load", payload)
+    if status >= 400:
+        raise RuntimeError(str(result.get("error", "ingestion failed")))
+    return result
 
 
 def current_principal(request: Request) -> Principal:
@@ -52,6 +65,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="RAG service", version="0.1.0", lifespan=lifespan)
+jobs = JobRegistry()
 
 
 @app.middleware("http")
@@ -111,3 +125,39 @@ async def ask(payload: AskRequest, principal: Principal = Depends(current_princi
         result = await asyncio.to_thread(run_ask, question)
         PIPELINE_SECONDS.labels("ask", result["flow_mode"]).observe(time.perf_counter() - started)
         return JSONResponse(result)
+
+
+@app.post("/api/jobs/ingestion")
+async def submit_ingestion(payload: dict, _: Principal = Depends(current_principal)):
+    """Start long ingestion without holding an HTTP connection open."""
+    job = jobs.submit("ingestion", lambda: run_ingestion_job(payload))
+    JOBS.labels("ingestion", "queued").inc()
+    return JSONResponse(job.public(), status_code=202)
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job(job_id: str, _: Principal = Depends(current_principal)):
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if job.status in {"completed", "failed"}:
+        JOBS.labels(job.kind, job.status).inc()
+    return job.public()
+
+
+@app.api_route("/api/{operation:path}", methods=["GET", "POST"])
+async def legacy_api(operation: str, request: Request, _: Principal = Depends(current_principal)):
+    """Protected async facade for remaining legacy API endpoints."""
+    path = f"/api/{operation}"
+    raw_body = await request.body()
+    body: dict | None = None
+    content_type = request.headers.get("content-type", "")
+    if request.method == "POST" and "multipart/form-data" not in content_type:
+        try:
+            body = await request.json() if raw_body else {}
+        except ValueError as exc:
+            raise HTTPException(400, "invalid JSON") from exc
+    payload, status = await asyncio.to_thread(
+        legacy_operation, request.method, path, body, content_type=content_type, raw_body=raw_body
+    )
+    return JSONResponse(payload, status_code=status)

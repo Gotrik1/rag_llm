@@ -15,6 +15,7 @@ REQUESTS = Counter("rag_http_requests_total", "HTTP requests", ("route", "method
 REQUEST_SECONDS = Histogram("rag_http_request_duration_seconds", "HTTP request latency", ("route", "method"))
 AUTH_DECISIONS = Counter("rag_authorization_decisions_total", "Authorization decisions", ("action", "result", "provider"))
 PIPELINE_SECONDS = Histogram("rag_pipeline_duration_seconds", "RAG pipeline stage latency", ("stage", "flow"))
+JOBS = Counter("rag_jobs_total", "Background jobs", ("kind", "status"))
 
 
 def configure_telemetry() -> None:

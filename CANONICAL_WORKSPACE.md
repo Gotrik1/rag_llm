@@ -19,3 +19,10 @@ Current runtime endpoints:
 Before editing, inspect `git status --short`. The checkout currently contains
 staged/uncommitted work from prior tasks; preserve it and coordinate before
 merging another branch.
+
+## Safety snapshot
+
+The staged state present before the RBAC integration assessment is preserved
+locally and on GitHub in `backup/dev-pre-rbac-integration-20260712`, commit
+`95ce5a5096f72c39602ca7eb3962836dfed874f4`. Do not delete this branch until
+the RBAC/async/telemetry integration has been completed and accepted.

@@ -2,6 +2,38 @@
 
 > Состояние исходного кода после добавления переключателя режимов. Web backend объединяет Python- и Rust-реализации и предоставляет три маршрута обработки вопроса: `python`, `rust`, `hybrid`.
 
+## ASGI, безопасность и телеметрия (инкремент миграции)
+
+Новый входной контур — `asgi_app.py`, запускаемый командой:
+
+```powershell
+python -m uvicorn asgi_app:app --host 127.0.0.1 --port 8080
+```
+
+На первом инкременте в ASGI перенесён `POST /api/ask`; его синхронный RAG
+pipeline исполняется через worker thread, поэтому event loop не блокируется.
+Legacy `web_ui.py` остаётся совместимым сервером до переноса остальных UI API,
+но оба входа используют общий framework-free метод `ask_payload()`.
+
+Контур identity изолирован в `security.py`: route получает `Principal`, а
+проверка доступа происходит через `authorize(principal, "rag.access")`.
+Режим по умолчанию — `RAG_AUTH_MODE=development`, создающий bootstrap
+superadmin с subject из `BOOTSTRAP_SUPERADMIN_SUBJECT` (по умолчанию
+`rag-superadmin`). Не задавайте постоянные секреты или пароли в коде. Для
+production предназначен `RAG_AUTH_MODE=oidc`; `OidcIdentityProvider` —
+выделенная точка для будущей проверки JWT/JWKS, issuer и audience.
+
+`context` в `authorize()` намеренно является частью контракта: текущая
+проверка RBAC использует только permission `rag.access`, а будущий ABAC сможет
+оценивать атрибуты пользователя и ресурса без изменения route handlers.
+
+Телеметрия задаётся в `telemetry.py`. Доступны `/healthz`, `/readyz` и
+`/metrics`; middleware выдаёт `X-Request-ID` и `X-Trace-ID`. Prometheus
+метрики покрывают HTTP, решения авторизации и длительность RAG pipeline.
+При настройке `OTEL_EXPORTER_OTLP_ENDPOINT` spans экспортируются в OTLP
+Collector. В labels не передаются вопрос, subject, токен, document ID или
+содержимое ответа — это не допускает high-cardinality и утечки данных.
+
 ## Runtime-схема: три режима рядом
 
 ```mermaid

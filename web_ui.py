@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import cgi
 import json
 import os
 import re
@@ -10,6 +9,8 @@ import threading
 import time
 import uuid
 from html import escape
+from email.parser import BytesParser
+from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -319,6 +320,49 @@ def usage_stats(answer: str = "", context: list[dict] | None = None) -> dict:
         "context_chars": len(context_text),
         "context_tokens_est": estimate_tokens(context_text) if context_text else 0,
         "total_tokens_est": estimate_tokens((answer or "") + context_text),
+    }
+
+
+def ask_payload(question: str) -> dict:
+    """Run the existing synchronous pipeline and return the public API payload.
+
+    Kept framework-free so the legacy HTTP server and the ASGI endpoint have
+    identical RAG behavior during the migration.
+    """
+    mode = load_flow_mode()
+    agent = get_agent()
+    t0 = time.time()
+    with _request_lock:
+        profile = get_profile(load_system_prompt_id(), GROUNDED_SYSTEM_PROMPT)
+        if mode == "python":
+            answer, sources, from_cache = agent.ask(question, profile["prompt"], profile["id"])
+            context = agent.retrieve_context(question, TOP_K)
+        elif mode == "rust":
+            python_items = agent.retrieve_context(question, TOP_K)
+            rust_items = filter_rust_context(question, rust_context(question))
+            context = fuse_contexts(python_items, rust_items, TOP_K)
+            answer = rust_generate(question, context)
+            from_cache = False
+            sources = [{"file": item["file"], "section": item.get("section_path", ""), "score": item["score"], "text_preview": item["text"][:120]} for item in context]
+        else:
+            python_items = agent.retrieve_context(question, TOP_K)
+            rust_items = filter_rust_context(question, rust_context(question))
+            context = fuse_contexts(python_items, rust_items, TOP_K)
+            spec = refine_prism_query(question)
+            calculations = extract_formula_lines(context, question)
+            answer = agent._generate_grounded_answer(question, context, calculations, spec, profile["prompt"])
+            from_cache = False
+            sources = [{"file": item["file"], "section": item.get("section_path", ""), "score": item["score"], "text_preview": item["text"][:120]} for item in context]
+    formulas = extract_formula_lines(context, question)
+    warnings = validate_retrieval(question, context, answer)
+    label = llm_label()
+    return {
+        "answer": answer, "html_answer": render_text(answer),
+        "formulas": [{"text": f, "html": render_text(f)} for f in formulas], "warnings": warnings,
+        "sources": [{**s, "html_preview": render_text(str(s.get("text_preview", "")))} for s in sources],
+        "context": [{**c, "html_text": render_text(c["text"])} for c in context],
+        "from_cache": from_cache, "llm": {**label, "label": f"{mode.title()} flow · {label['label']}"},
+        "flow_mode": mode, "elapsed_s": time.time() - t0, "usage": usage_stats(answer, context),
     }
 
 
@@ -738,55 +782,7 @@ class Handler(BaseHTTPRequestHandler):
         if not question:
             self.send_json({"error": "empty question"}, 400)
             return
-
-        mode = load_flow_mode()
-        agent = get_agent()
-        t0 = time.time()
-        with _request_lock:
-            profile = get_profile(load_system_prompt_id(), GROUNDED_SYSTEM_PROMPT)
-            if mode == "python":
-                answer, sources, from_cache = agent.ask(question, profile["prompt"], profile["id"])
-                context = agent.retrieve_context(question, TOP_K)
-            elif mode == "rust":
-                python_items = agent.retrieve_context(question, TOP_K)
-                rust_items = filter_rust_context(question, rust_context(question))
-                context = fuse_contexts(python_items, rust_items, TOP_K)
-                answer = rust_generate(question, context)
-                from_cache = False
-                sources = [{
-                    "file": item["file"], "section": item.get("section_path", ""), "score": item["score"],
-                    "text_preview": item["text"][:120],
-                } for item in context]
-            else:
-                python_items = agent.retrieve_context(question, TOP_K)
-                rust_items = filter_rust_context(question, rust_context(question))
-                context = fuse_contexts(python_items, rust_items, TOP_K)
-                spec = refine_prism_query(question)
-                calculations = extract_formula_lines(context, question)
-                answer = agent._generate_grounded_answer(question, context, calculations, spec, profile["prompt"])
-                from_cache = False
-                sources = [{"file": item["file"], "section": item.get("section_path", ""), "score": item["score"], "text_preview": item["text"][:120]} for item in context]
-        formulas = extract_formula_lines(context, question)
-        warnings = validate_retrieval(question, context, answer)
-        self.send_json({
-            "answer": answer,
-            "html_answer": render_text(answer),
-            "formulas": [{"text": f, "html": render_text(f)} for f in formulas],
-            "warnings": warnings,
-            "sources": [
-                {**s, "html_preview": render_text(str(s.get("text_preview", "")))}
-                for s in sources
-            ],
-            "context": [
-                {**c, "html_text": render_text(c["text"])}
-                for c in context
-            ],
-            "from_cache": from_cache,
-            "llm": {**llm_label(), "label": f"{mode.title()} flow · {llm_label()['label']}"},
-            "flow_mode": mode,
-            "elapsed_s": time.time() - t0,
-            "usage": usage_stats(answer, context),
-        })
+        self.send_json(ask_payload(question))
 
     def handle_debug(self, body: dict) -> None:
         question = str(body.get("question", "")).strip()
@@ -881,32 +877,19 @@ class Handler(BaseHTTPRequestHandler):
             return []
 
         length = int(self.headers.get("Content-Length", "0"))
-        environ = {
-            "REQUEST_METHOD": "POST",
-            "CONTENT_TYPE": content_type,
-            "CONTENT_LENGTH": str(length),
-        }
-        form = cgi.FieldStorage(
-            fp=self.rfile,
-            headers=self.headers,
-            environ=environ,
-            keep_blank_values=True,
+        body = self.rfile.read(length)
+        message = BytesParser(policy=default).parsebytes(
+            f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + body
         )
         files = []
-
-        for field_name in ("files", "file"):
-            if field_name not in form:
+        for item in message.iter_attachments():
+            field_name = item.get_param("name", header="content-disposition")
+            if field_name not in {"files", "file"}:
                 continue
-            items = form[field_name]
-            if not isinstance(items, list):
-                items = [items]
-            for item in items:
-                filename = getattr(item, "filename", "") or ""
-                if not filename:
-                    continue
-                content = item.file.read()
-                if content:
-                    files.append({"filename": filename, "content": content})
+            filename = item.get_filename() or ""
+            content = item.get_payload(decode=True) or b""
+            if filename and content:
+                files.append({"filename": filename, "content": content})
 
         return files
 

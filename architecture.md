@@ -10,6 +10,10 @@
 python -m uvicorn asgi_app:app --host 127.0.0.1 --port 8080
 ```
 
+`python web_ui.py` запускает тот же ASGI-контур. `Handler` больше не является
+внешним сервером: он сохранён только как временный compatibility adapter, пока
+его операции не будут вынесены из `web_ui.py` в отдельные сервисы.
+
 На первом инкременте в ASGI перенесён `POST /api/ask`; его синхронный RAG
 pipeline исполняется через worker thread, поэтому event loop не блокируется.
 Остальные существующие `/api/*` endpoint'ы проходят через защищённый ASGI

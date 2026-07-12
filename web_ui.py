@@ -926,9 +926,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"Web UI: http://{HOST}:{PORT}")
-    server.serve_forever()
+    """Run the protected ASGI service; Handler remains an internal adapter."""
+    import uvicorn
+    from asgi_app import app
+    uvicorn.run(app, host=HOST, port=PORT)
 
 
 if __name__ == "__main__":

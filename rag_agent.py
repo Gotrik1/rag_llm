@@ -45,6 +45,7 @@ from ollama import Client as OllamaClient
 from document_ingestion import ingest_document
 from llm_providers import ProviderLLM
 from response_cache import ResponseCache
+from runtime_paths import DATA_DIR
 from opentelemetry.trace import Status, StatusCode
 from telemetry import PIPELINE_SECONDS, tracer
 
@@ -62,10 +63,6 @@ TOP_K            = 10      # финальных чанков в контекст
 BM25_TOP_K       = 12      # кандидатов от BM25
 VECTOR_TOP_K     = 12      # кандидатов от вектора
 
-# Runtime artifacts are kept out of the source tree. Set RAG_DATA_DIR to an
-# absolute persistent directory in production.
-PROJECT_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("RAG_DATA_DIR", PROJECT_DIR / ".data")).expanduser()
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25"))
 CACHE_VERSION    = "v21-redis-exact-response-cache"
 MAX_OUTPUT_TOKENS = 4056

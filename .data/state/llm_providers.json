@@ -1,0 +1,1 @@
+{"provider": "ollama", "model": "qwen3.5:9b", "base_url": "https://gigachat.devices.sberbank.ru/api", "folder_id": "", "auth_type": "api_key", "api_key": ""}

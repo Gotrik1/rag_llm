@@ -21,8 +21,10 @@ x-app-environment: &app-environment
   OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
   LLM_MODEL: ${LLM_MODEL:-qwen2.5:14b}
   EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
-  BM25_PERSIST_DIR: ${BM25_PERSIST_DIR:-/app/bm25_index_v10}
-  CACHE_DB: ${CACHE_DB:-/app/.ingestion_cache/cache.db}
+  RAG_DATA_DIR: ${RAG_DATA_DIR:-/app/.data}
+  BM25_PERSIST_DIR: ${BM25_PERSIST_DIR:-/app/.data/bm25}
+  RUST_DATA_DIR: ${RUST_DATA_DIR:-/app/.data/rust}
+  CACHE_DB: ${CACHE_DB:-/app/.data/cache/cache.db}
   RAG_AUTH_MODE: ${RAG_AUTH_MODE:-oidc}
   RAG_OIDC_ISSUER: ${RAG_OIDC_ISSUER:-}
   RAG_OIDC_AUDIENCE: ${RAG_OIDC_AUDIENCE:-}
@@ -152,7 +154,7 @@ services:
       <<: *app-environment
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
     volumes:
-      - ingestion_data:/app/.ingestion_cache
+      - app_data:/app/.data
       - model_cache:/app/.fastembed_cache
     depends_on:
       migrate:
@@ -178,7 +180,7 @@ services:
       <<: *app-environment
       INGESTION_WORKERS: ${INGESTION_WORKERS:-2}
     volumes:
-      - ingestion_data:/app/.ingestion_cache
+      - app_data:/app/.data
       - model_cache:/app/.fastembed_cache
     depends_on:
       migrate:
@@ -442,7 +444,7 @@ volumes:
   postgres_data:
   redis_data:
   qdrant_data:
-  ingestion_data:
+  app_data:
   model_cache:
   prometheus_data:
   tempo_data:

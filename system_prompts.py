@@ -5,8 +5,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from runtime_paths import SYSTEM_PROMPT_STORE
 
-PROMPT_STORE = Path(".ingestion_cache") / "system_prompts"
+
+PROMPT_STORE = SYSTEM_PROMPT_STORE
 CLAUDE_SOURCE = Path.home() / "Downloads" / "Claude-4.1.txt"
 CLAUDE_CLEANED_PATH = PROMPT_STORE / "claude-4-1-cleaned.txt"
 

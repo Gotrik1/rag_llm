@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from docx_parser import read_docx_text as read_docx_xml_text
+from runtime_paths import INGESTION_CACHE_DIR
 
 
-CACHE_DIR = Path(".ingestion_cache")
+CACHE_DIR = INGESTION_CACHE_DIR
 INGESTION_CACHE_VERSION = "v3-omml-mathml-ref"
 
 

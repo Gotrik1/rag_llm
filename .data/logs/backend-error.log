@@ -1,0 +1,2 @@
+C:\Users\gotri\Documents\LLM\web_ui.py:4: DeprecationWarning: 'cgi' is deprecated and slated for removal in Python 3.13
+  import cgi

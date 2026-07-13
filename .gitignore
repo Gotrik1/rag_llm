@@ -5,7 +5,6 @@ ui/.vite/
 ui/node_modules/.tmp/
 .venv
 .env
-.data/
 bm25_index*/
 tantivy_index/
 qdrant_storage/

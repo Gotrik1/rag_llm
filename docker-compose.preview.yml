@@ -50,8 +50,9 @@ services:
       QDRANT_URL: http://host.docker.internal:6333
       QDRANT_GRPC_URL: http://host.docker.internal:6334
       OLLAMA_BASE_URL: http://host.docker.internal:11434
-      BM25_PERSIST_DIR: /app/.ingestion_cache/bm25_index_v10
-      RUST_DATA_DIR: /app/.ingestion_cache/rust
+      RAG_DATA_DIR: /app/.data
+      BM25_PERSIST_DIR: /app/.data/bm25
+      RUST_DATA_DIR: /app/.data/rust
       RUST_CLI_PATH: /app/target/debug/llm-rust
     secrets:
       - postgres_password
@@ -60,7 +61,7 @@ services:
     ports:
       - "8081:8080"
     volumes:
-      - preview_backend_data:/app/.ingestion_cache
+      - preview_backend_data:/app/.data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

@@ -43,6 +43,7 @@ from db_store import (
 )
 from llm_providers import DEFAULTS, ProviderLLM
 from rag_agent import CACHE_VERSION, DATA_DIR, GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, refine_prism_query, validate_retrieval
+from runtime_paths import MATHML_CACHE_DIR, STATE_DIR, UPLOAD_DIR
 from system_prompts import get_profile, profiles
 from opentelemetry.trace import Status, StatusCode
 from telemetry import PIPELINE_SECONDS, tracer
@@ -50,9 +51,6 @@ from telemetry import PIPELINE_SECONDS, tracer
 
 HOST = os.environ.get("BACKEND_HOST", "127.0.0.1")
 PORT = int(os.environ.get("BACKEND_PORT", "8080"))
-STATE_DIR = DATA_DIR / "state"
-MATHML_CACHE_DIR = DATA_DIR / "cache" / "mathml"
-UPLOAD_DIR = DATA_DIR / "uploads"
 PROVIDERS_CONFIG_PATH = STATE_DIR / "llm_providers.json"
 SYSTEM_PROMPT_CONFIG_PATH = STATE_DIR / "system_prompt.json"
 FLOW_CONFIG_PATH = STATE_DIR / "flow_mode.json"

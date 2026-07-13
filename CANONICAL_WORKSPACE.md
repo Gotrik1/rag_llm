@@ -5,9 +5,9 @@ The single source of truth for this RAG service is:
 `C:\Users\gotri\Documents\LLM`
 
 It is the checkout used by the running `rag-assistant` Docker Compose stack.
-Use its current branch (`dev`) for code, tests, documentation, and runtime
-operations. Do not use `.codex\worktrees\e7c6\LLM` or other isolated worktrees
-as a second active copy.
+Use branch `dev` for code, tests, documentation, and runtime operations. The
+only long-lived branches are `dev`, `test`, `prod`, and `main`. Do not use
+Codex worktrees or safety copies as a second active checkout.
 
 Current runtime endpoints:
 
@@ -16,21 +16,13 @@ Current runtime endpoints:
 - Qdrant: `http://127.0.0.1:6333`
 - Ollama: `http://127.0.0.1:11434`
 
-Before editing, inspect `git status --short`. The checkout currently contains
-staged/uncommitted work from prior tasks; preserve it and coordinate before
-merging another branch.
+Before editing, inspect `git status --short`. Runtime files live only under
+`.data/`; code resolves them through `RAG_DATA_DIR` (locally `.data`, in the
+backend container `/app/.data`).
 
-## Safety snapshot
+## Isolated preview
 
-The staged state present before the RBAC integration assessment is preserved
-locally and on GitHub in `backup/dev-pre-rbac-integration-20260712`, commit
-`95ce5a5096f72c39602ca7eb3962836dfed874f4`. Do not delete this branch until
-the RBAC/async/telemetry integration has been completed and accepted.
-
-## RBAC integration preview
-
-The in-progress integration branch is `codex/rbac-integration`. Its local
-preview is deliberately isolated from the current stack:
+An optional local preview can be started without replacing the main stack:
 
 - preview UI: `http://127.0.0.1:5174`
 - preview API: `http://127.0.0.1:8081`

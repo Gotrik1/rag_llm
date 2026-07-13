@@ -55,7 +55,7 @@ RUN groupadd --gid 10001 rag && \
 COPY --chown=rag:rag . .
 COPY --from=rust-builder --chown=rag:rag /tmp/llm-rust /app/target/debug/llm-rust
 RUN install -o rag -g rag -m 0755 deploy/entrypoint.sh /usr/local/bin/rag-entrypoint && \
-    mkdir -p /app/.ingestion_cache /app/.fastembed_cache && \
+    mkdir -p /app/.data /app/.fastembed_cache && \
     chown -R rag:rag /app
 
 USER rag

@@ -16,11 +16,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     RAG_HOST=0.0.0.0 \
-    RAG_PORT=8000
+    RAG_PORT=8000 \
+    GIGACHAT_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 
 RUN apt-get update && apt-get install --yes --no-install-recommends \
         build-essential \
         curl \
+        openssl \
+        ca-certificates \
         libgomp1 \
         libmagic1 \
         postgresql-client \
@@ -28,6 +31,19 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY certs/ /usr/local/share/ca-certificates/gigachat/
+RUN set -eux; \
+    for certificate in /usr/local/share/ca-certificates/gigachat/*.cer; do \
+        case "$certificate" in *gost*) continue ;; esac; \
+        target="${certificate%.cer}.crt"; \
+        if grep -q -- "-----BEGIN CERTIFICATE-----" "$certificate"; then \
+            cp "$certificate" "$target"; \
+        else \
+            openssl x509 -inform DER -in "$certificate" -out "$target"; \
+        fi; \
+    done; \
+    update-ca-certificates; \
+    rm -rf /usr/local/share/ca-certificates/gigachat
 COPY requirements.txt ./
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --upgrade pip && \

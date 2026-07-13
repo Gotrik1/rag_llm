@@ -11,8 +11,22 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     RUST_CLI_PATH=/usr/local/bin/llm-rust
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgomp1 libglib2.0-0 libgl1 ca-certificates \
+    libgomp1 libglib2.0-0 libgl1 ca-certificates openssl \
     && rm -rf /var/lib/apt/lists/*
+COPY certs/ /usr/local/share/ca-certificates/gigachat/
+RUN set -eux; \
+    for certificate in /usr/local/share/ca-certificates/gigachat/*.cer; do \
+        case "$certificate" in *gost*) continue ;; esac; \
+        target="${certificate%.cer}.crt"; \
+        if grep -q -- "-----BEGIN CERTIFICATE-----" "$certificate"; then \
+            cp "$certificate" "$target"; \
+        else \
+            openssl x509 -inform DER -in "$certificate" -out "$target"; \
+        fi; \
+    done; \
+    update-ca-certificates; \
+    rm -rf /usr/local/share/ca-certificates/gigachat
+ENV GIGACHAT_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 COPY requirements.docker.txt ./
 RUN pip install --no-cache-dir -r requirements.docker.txt
 COPY --from=rust-builder /src/target/release/llm-rust /usr/local/bin/llm-rust

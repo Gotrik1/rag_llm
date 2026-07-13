@@ -40,3 +40,14 @@ preview is deliberately isolated from the current stack:
 The stable UI remains on ports `5173/8080`. The preview uses the same UI
 contract through an ASGI compatibility facade, while adding SSO-ready RBAC,
 ABAC policies, audit events, persistent jobs, SSE and telemetry.
+
+## GigaChat certificates
+
+The public Russian trust-chain certificates are kept in `certs/` and are
+installed into both backend images during Docker build. DER `.cer` files are
+converted to PEM `.crt` files and registered with Debian's CA store. The
+RSA chain is installed; GOST-only certificates are retained as source files
+but skipped because stock OpenSSL cannot use them. The images set
+`GIGACHAT_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt`, so the
+GigaChat OAuth and API requests use the packaged trust store. API keys remain
+runtime secrets and are not part of the image or repository.

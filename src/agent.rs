@@ -48,7 +48,7 @@ pub struct Agent {
 
 impl Agent {
     pub async fn new() -> Result<Self> {
-        let data_dir = PathBuf::from(env::var("RUST_DATA_DIR").unwrap_or_else(|_| ".".to_string()));
+        let data_dir = PathBuf::from(env::var("RUST_DATA_DIR").unwrap_or_else(|_| ".data/rust".to_string()));
         std::fs::create_dir_all(&data_dir)?;
         let data_dir_string = data_dir.to_string_lossy().into_owned();
         let embedder = Embedder::new()?;

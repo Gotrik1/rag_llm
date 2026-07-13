@@ -34,7 +34,7 @@ x-app-environment: &app-environment
   RAG_CORS_ORIGINS: ${CORS_ALLOW_ORIGIN:-http://localhost:8080}
   RAG_REDIS_REQUIRED: "true"
   RAG_AUDIT_RETENTION_DAYS: ${RAG_AUDIT_RETENTION_DAYS:-365}
-  BOOTSTRAP_SUPERADMIN_SUBJECT: ${BOOTSTRAP_SUPERADMIN_SUBJECT:-}
+  BOOTSTRAP_SUPERADMIN_SUBJECT: ${BOOTSTRAP_SUPERADMIN_SUBJECT:-rag-superadmin}
   OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
   OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
   OTEL_RESOURCE_ATTRIBUTES: service.namespace=rag,deployment.environment=production
@@ -178,7 +178,7 @@ services:
     command: ["worker"]
     environment:
       <<: *app-environment
-      INGESTION_WORKERS: ${INGESTION_WORKERS:-2}
+      RAG_WORKER_CONCURRENCY: ${RAG_WORKER_CONCURRENCY:-2}
     volumes:
       - app_data:/app/.data
       - model_cache:/app/.fastembed_cache

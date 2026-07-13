@@ -8,6 +8,7 @@ from typing import Any
 
 from arq import create_pool
 from arq.connections import ArqRedis, RedisSettings
+from arq.jobs import Job
 
 from persistence import get_store
 
@@ -46,6 +47,6 @@ class JobQueue:
         accepted = await asyncio.to_thread(get_store().request_cancel, job_id)
         if accepted:
             await self.connect()
-            await self._redis.abort_job(job_id)
+            await Job(job_id, self._redis).abort()
             await asyncio.to_thread(get_store().update_job, job_id, status="cancelled", finished_at=time.time())
         return accepted

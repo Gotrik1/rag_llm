@@ -12,6 +12,16 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 from security import Principal, SUPERADMIN
 
 
+def sqlalchemy_database_url(url: str) -> str:
+    """Select the installed psycopg v3 driver for ordinary PostgreSQL URLs."""
+    value = url.strip()
+    if value.startswith("postgresql://"):
+        return "postgresql+psycopg://" + value.removeprefix("postgresql://")
+    if value.startswith("postgres://"):
+        return "postgresql+psycopg://" + value.removeprefix("postgres://")
+    return value
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -89,7 +99,8 @@ class JobRow(Base):
 
 class Persistence:
     def __init__(self, url: str | None = None) -> None:
-        self.url = url if url is not None else os.getenv("RAG_DATABASE_URL") or os.getenv("DATABASE_URL", "")
+        configured_url = url if url is not None else os.getenv("RAG_DATABASE_URL") or os.getenv("DATABASE_URL", "")
+        self.url = sqlalchemy_database_url(configured_url)
         self.engine = create_engine(self.url, pool_pre_ping=True) if self.url else None
 
     @property

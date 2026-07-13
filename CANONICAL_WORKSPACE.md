@@ -23,6 +23,10 @@ backend container `/app/.data`).
 The local `docker-compose.yml` bind-mounts the committed `./.data` snapshot.
 The production `compose.yaml` intentionally uses a separate `app_data` Docker
 volume at `/app/.data`; production runtime changes do not modify the checkout.
+The local backend starts the ASGI compatibility service, applies Alembic and
+workspace migrations before it becomes ready, and runs a separate ARQ ingestion
+worker. Its `job-queue` Redis uses AOF and `noeviction`; `response-cache`
+remains a separate, disposable answer cache.
 
 ## Isolated preview
 

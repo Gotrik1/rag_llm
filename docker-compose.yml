@@ -44,6 +44,18 @@ services:
       retries: 12
     restart: unless-stopped
 
+  job-queue:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - queue_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
   backend:
     build:
       context: .
@@ -52,11 +64,14 @@ services:
       BACKEND_HOST: 0.0.0.0
       BACKEND_PORT: 8080
       DATABASE_URL: postgresql://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD:-ragpassword}@postgres:5432/${POSTGRES_DB:-rag_assistant}
+      RAG_DATABASE_URL: postgresql://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD:-ragpassword}@postgres:5432/${POSTGRES_DB:-rag_assistant}
       QDRANT_URL: http://qdrant:6333
       QDRANT_GRPC_URL: http://qdrant:6334
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       LLM_MODEL: ${LLM_MODEL:-qwen2.5:14b}
       RESPONSE_CACHE_URL: redis://response-cache:6379/0
+      RAG_REDIS_URL: redis://job-queue:6379/0
+      RAG_REDIS_REQUIRED: "true"
       RESPONSE_CACHE_TTL_SECONDS: ${RESPONSE_CACHE_TTL_SECONDS:-604800}
       RAG_DATA_DIR: /app/.data
       BM25_PERSIST_DIR: /app/.data/bm25
@@ -75,12 +90,44 @@ services:
         condition: service_healthy
       response-cache:
         condition: service_healthy
+      job-queue:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"from urllib.request import urlopen; assert urlopen('http://127.0.0.1:8080/api/openapi.json', timeout=3).status == 200\""]
+      test: ["CMD-SHELL", "python -c \"from urllib.request import urlopen; assert urlopen('http://127.0.0.1:8080/readyz', timeout=3).status == 200\""]
       interval: 10s
       timeout: 5s
       retries: 12
       start_period: 30s
+    restart: unless-stopped
+
+  ingestion-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: ["arq", "ingestion_worker.WorkerSettings"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD:-ragpassword}@postgres:5432/${POSTGRES_DB:-rag_assistant}
+      RAG_DATABASE_URL: postgresql://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD:-ragpassword}@postgres:5432/${POSTGRES_DB:-rag_assistant}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_GRPC_URL: http://qdrant:6334
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:14b}
+      RAG_REDIS_URL: redis://job-queue:6379/0
+      RAG_DATA_DIR: /app/.data
+      BM25_PERSIST_DIR: /app/.data/bm25
+      RUST_DATA_DIR: /app/.data/rust
+      RUST_CLI_PATH: /usr/local/bin/llm-rust
+    volumes:
+      - ./.data:/app/.data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      backend:
+        condition: service_healthy
+      job-queue:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
@@ -135,3 +182,4 @@ services:
 volumes:
   ollama_data:
   postgres_data:
+  queue_data:

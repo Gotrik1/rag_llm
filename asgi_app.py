@@ -86,7 +86,8 @@ def current_principal(request: Request) -> Principal:
 async def lifespan(_: FastAPI):
     configure_logging()
     configure_telemetry()
-    await asyncio.to_thread(get_store().bootstrap_superadmin, os.getenv("BOOTSTRAP_SUPERADMIN_SUBJECT", "rag-superadmin"))
+    bootstrap_subject = os.getenv("BOOTSTRAP_SUPERADMIN_SUBJECT", "").strip() or "rag-superadmin"
+    await asyncio.to_thread(get_store().bootstrap_superadmin, bootstrap_subject)
     yield
     await jobs.close()
 

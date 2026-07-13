@@ -29,10 +29,12 @@ REDIS_PORT="${REDIS_PORT:-6379}"
 
 encoded_postgres_password="$(python -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["POSTGRES_PASSWORD"], safe=""))')"
 encoded_redis_password="$(python -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["REDIS_PASSWORD"], safe=""))')"
+plain_database_url="postgresql://${POSTGRES_USER}:${encoded_postgres_password}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
 export RAG_DATABASE_URL="${RAG_DATABASE_URL:-postgresql+psycopg://${POSTGRES_USER}:${encoded_postgres_password}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}}"
-export DATABASE_URL="${DATABASE_URL:-${RAG_DATABASE_URL}}"
+export DATABASE_URL="${DATABASE_URL:-${plain_database_url}}"
 export RAG_REDIS_URL="${RAG_REDIS_URL:-redis://:${encoded_redis_password}@${REDIS_HOST}:${REDIS_PORT}/0}"
 export REDIS_URL="${REDIS_URL:-${RAG_REDIS_URL}}"
+export RESPONSE_CACHE_URL="${RESPONSE_CACHE_URL:-${RAG_REDIS_URL}}"
 
 case "${1:-api}" in
     api)
@@ -45,10 +47,11 @@ case "${1:-api}" in
             --no-server-header
         ;;
     migrate)
-        exec alembic upgrade head
+        alembic upgrade head
+        exec python -c 'from db_store import run_migrations; run_migrations()'
         ;;
     worker)
-        exec python -m ingestion_worker
+        exec arq ingestion_worker.WorkerSettings
         ;;
     *)
         exec "$@"

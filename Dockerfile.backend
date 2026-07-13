@@ -32,4 +32,4 @@ RUN pip install --no-cache-dir -r requirements.docker.txt
 COPY --from=rust-builder /src/target/release/llm-rust /usr/local/bin/llm-rust
 COPY . ./
 EXPOSE 8080
-CMD ["python", "web_ui.py"]
+CMD ["sh", "-c", "python -m alembic upgrade head && python -c 'from db_store import run_migrations; run_migrations()' && exec uvicorn asgi_app:app --host 0.0.0.0 --port 8080 --no-server-header"]

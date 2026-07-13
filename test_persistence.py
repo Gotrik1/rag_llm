@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from policy import PolicyProvider
-from persistence import Base, Persistence
+from persistence import Base, Persistence, sqlalchemy_database_url
 from security import Principal
 
 
@@ -42,4 +42,17 @@ class PersistenceTests(unittest.TestCase):
             self.assertIsNone(PolicyProvider().decide(Principal("e", attributes={"department": "it"}), "rag.access", "/api/ask"))
 
 
-if __name__ == "__main__": unittest.main()
+class PersistenceConfigurationTests(unittest.TestCase):
+    def test_postgresql_url_uses_installed_psycopg_v3_driver(self) -> None:
+        self.assertEqual(
+            sqlalchemy_database_url("postgresql://rag:secret@postgres:5432/rag"),
+            "postgresql+psycopg://rag:secret@postgres:5432/rag",
+        )
+
+    def test_explicit_sqlalchemy_driver_is_preserved(self) -> None:
+        configured = "postgresql+psycopg://rag:secret@postgres:5432/rag"
+        self.assertEqual(sqlalchemy_database_url(configured), configured)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -2,11 +2,12 @@ from __future__ import annotations
 import os
 from alembic import context
 from sqlalchemy import engine_from_config, pool
-from persistence import Base
+from persistence import Base, sqlalchemy_database_url
 
 config = context.config
-if os.getenv("RAG_DATABASE_URL"):
-    config.set_main_option("sqlalchemy.url", os.environ["RAG_DATABASE_URL"])
+configured_database_url = os.getenv("RAG_DATABASE_URL") or os.getenv("DATABASE_URL")
+if configured_database_url:
+    config.set_main_option("sqlalchemy.url", sqlalchemy_database_url(configured_database_url))
 target_metadata = Base.metadata
 
 def run_migrations_offline():

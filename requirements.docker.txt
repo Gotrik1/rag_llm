@@ -17,3 +17,17 @@ pymupdf>=1.24.0
 nltk>=3.8.0
 psycopg[binary]>=3.2.0
 redis>=5.0,<6.0
+
+# API / security / observability. Keep this section aligned with the runtime
+# dependencies in requirements.txt; only the optional Docling stack is omitted
+# from the container image above.
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+prometheus-client>=0.20.0
+opentelemetry-api>=1.27.0
+opentelemetry-sdk>=1.27.0
+opentelemetry-exporter-otlp-proto-http>=1.27.0
+sqlalchemy>=2.0.36
+alembic>=1.14.0
+arq>=0.26.1
+pyjwt[crypto]>=2.10.0

@@ -7,7 +7,7 @@
 - Python-индекс является основным источником доказательств для Web UI.
 - Rust-индекс дополняет Python evidence в режимах `rust` и `hybrid`, но не заменяет его.
 - Кэш ответов точный, а не семантический: похожие вопросы по нормативным документам могут требовать разных ответов.
-- PostgreSQL хранит состояние продукта и историю чатов. Redis хранит только временные результаты генерации.
+- PostgreSQL хранит состояние продукта, RBAC/ABAC, audit и историю чатов. Redis разделён на временный кэш ответов и устойчивую очередь ingestion-задач.
 
 ## C1. Контекст системы
 
@@ -36,9 +36,11 @@ flowchart LR
 flowchart LR
     B["Браузер\nReact + TypeScript"]
     F["Контейнер frontend\nNginx 1.27\nСтатическая сборка Vite"]
-    A["Контейнер backend\nPython 3.12\nweb_ui.py"]
-    P[("PostgreSQL 16\nДанные workspace и чатов")]
+    A["Контейнер backend\nPython 3.12\nASGI facade"]
+    W["Контейнер ingestion-worker\nARQ worker"]
+    P[("PostgreSQL 16\nWorkspace, RBAC, audit, jobs")]
     R[("Redis 7.4\nТочный кэш ответов")]
+    J[("Redis 7.4\nAOF job queue")]
     Q[("Qdrant 1.13\nВекторные коллекции")]
     C["Rust CLI\nПроцесс llm-rust"]
     L["Ollama или облачный провайдер\nLLM и эмбеддинги"]
@@ -47,19 +49,25 @@ flowchart LR
     F -->|"Прокси /api"| A
     A -->|"SQL через psycopg"| P
     A -->|"RESP через redis-py"| R
+    A -->|"ARQ"| J
     A -->|"HTTP и gRPC"| Q
     A -->|"JSON через stdin/stdout"| C
     A -->|"HTTP"| L
     C -->|"HTTP"| L
+    W -->|"ARQ"| J
+    W -->|"SQL"| P
+    W -->|"HTTP и gRPC"| Q
 ```
 
 | Контейнер или процесс | Ответственность | Постоянное состояние |
 | --- | --- | --- |
 | `frontend` | Отдаёт React UI и проксирует API-вызовы | Нет |
-| `backend` | API, RAG-оркестрация, индексация, контекст проекта и рендеринг | Bind-mount `.data/` |
-| `postgres` | Проекты, чаты, сообщения, настройки workspace и миграции | Том `postgres_data` |
+| `backend` | ASGI API, RBAC/ABAC, SSE, telemetry и compatibility facade для RAG | Bind-mount `.data/` |
+| `ingestion-worker` | Выполнение и отмена долгих ingestion-задач через ARQ | Bind-mount `.data/`, PostgreSQL jobs |
+| `postgres` | Проекты, чаты, RBAC/ABAC, audit, jobs и миграции | Том `postgres_data` |
 | `qdrant` | Коллекции векторов `rag_docs_v10` и `knowledge_base` | `.data/qdrant/` |
 | `response-cache` | Точный кэш сгенерированных ответов | Нет, намеренно временный |
+| `job-queue` | Устойчивая Redis/ARQ доставка ingestion-задач | Том `queue_data`, AOF/noeviction |
 | `llm-rust` | Rust CLI поиска и генерации, запускаемый backend | Qdrant и Ollama; опциональный CLI-том |
 | Ollama | Локальные модели и модель эмбеддингов, опциональный Compose-профиль | Том `ollama_data` при включённом профиле |
 
@@ -82,7 +90,8 @@ Redis и PostgreSQL не имеют веб-интерфейса и не публ
 
 ```mermaid
 flowchart TB
-    H["HTTP-обработчик\nweb_ui.py"]
+    H["ASGI facade\nasgi_app.py"]
+    G["Legacy RAG adapter\nweb_ui.py"]
     W["Хранилище workspace\ndb_store.py"]
     O["RAG-оркестратор\nrag_agent.py"]
     I["Сервис индексации\ndocument_ingestion.py"]
@@ -91,6 +100,7 @@ flowchart TB
     X["Rust-мост\nJSON-протокол subprocess"]
 
     H --> W
+    H --> G
     H --> O
     H --> I
     H --> X
@@ -101,7 +111,8 @@ flowchart TB
 
 | Компонент | Ответственность | Основные зависимости |
 | --- | --- | --- |
-| `web_ui.py` | HTTP API, маршрутизация flow, промт с контекстом проекта, payload ответа | `ThreadingHTTPServer`, subprocess-мост |
+| `asgi_app.py` | HTTP API, RBAC/ABAC, SSE, jobs, metrics и telemetry | FastAPI, OpenTelemetry, ARQ |
+| `web_ui.py` | Legacy RAG-маршруты, flow, промт с контекстом проекта и payload ответа | Compatibility adapter, subprocess-мост |
 | `db_store.py` | Транзакции, миграции и CRUD workspace | `psycopg 3`, PostgreSQL |
 | `rag_agent.py` | Python-поиск, выбор evidence, генерация и валидация | LlamaIndex, Qdrant, BM25, Ollama или provider adapter |
 | `document_ingestion.py` | Извлечение текста и метаданных документа | XML parser, Mammoth, PDF readers |

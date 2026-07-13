@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 import zipfile
@@ -34,6 +35,9 @@ MAX_OUTPUT_TOKENS = 4056
 
 def gigachat_ca_bundle() -> str | bool:
     """Build a local CA bundle from the official Russian CA archives, if supplied."""
+    configured_bundle = os.getenv("GIGACHAT_CA_BUNDLE", "").strip()
+    if configured_bundle and Path(configured_bundle).exists():
+        return configured_bundle
     if GIGACHAT_CA_BUNDLE.exists():
         return str(GIGACHAT_CA_BUNDLE)
     certificates: list[str] = []

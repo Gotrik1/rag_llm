@@ -3,6 +3,7 @@
 .venv
 __pycache__
 .ingestion_cache
+.data
 bm25_index*
 qdrant_storage
 tantivy_index

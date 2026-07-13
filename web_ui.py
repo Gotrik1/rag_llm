@@ -10,9 +10,11 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any, Iterator
 from urllib.parse import urlparse
 from urllib.request import urlopen
 from urllib.error import URLError
@@ -42,6 +44,8 @@ from db_store import (
 from llm_providers import DEFAULTS, ProviderLLM
 from rag_agent import CACHE_VERSION, GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, refine_prism_query, validate_retrieval
 from system_prompts import get_profile, profiles
+from opentelemetry.trace import Status, StatusCode
+from telemetry import PIPELINE_SECONDS, tracer
 
 
 HOST = os.environ.get("BACKEND_HOST", "127.0.0.1")
@@ -53,6 +57,32 @@ SYSTEM_PROMPT_CONFIG_PATH = Path(".ingestion_cache") / "system_prompt.json"
 FLOW_CONFIG_PATH = Path(".ingestion_cache") / "flow_mode.json"
 FLOW_MODES = {"python", "rust", "hybrid"}
 OPENAPI_SPEC_PATH = Path("openapi.json")
+
+
+@contextmanager
+def _pipeline_span(
+    stage: str,
+    *,
+    flow: str,
+    attributes: dict[str, Any] | None = None,
+) -> Iterator[Any]:
+    """Measure a stage without recording prompts, evidence, answers, or identities."""
+    started = time.perf_counter()
+    with tracer().start_as_current_span(
+        f"rag.{stage}", record_exception=False, set_status_on_exception=False
+    ) as span:
+        span.set_attribute("rag.pipeline.stage", stage)
+        span.set_attribute("rag.flow", flow)
+        for key, value in (attributes or {}).items():
+            span.set_attribute(key, value)
+        try:
+            yield span
+        except BaseException as exc:
+            span.set_status(Status(StatusCode.ERROR))
+            span.set_attribute("error.type", type(exc).__name__)
+            raise
+        finally:
+            PIPELINE_SECONDS.labels(stage=stage, flow=flow).observe(time.perf_counter() - started)
 
 _agent: RAGAgent | None = None
 _agent_lock = threading.Lock()
@@ -181,30 +211,36 @@ def _rust_command() -> list[str]:
     return [str(binary)] if binary.exists() else ["cargo", "run", "--quiet"]
 
 
-def _run_rust_json(command: str, question: str) -> dict | list[dict]:
-    """Call the Rust CLI using its one-line JSON protocol."""
-    try:
-        result = subprocess.run(
-            _rust_command(), input=f":{command} {question}\n:exit\n".encode("utf-8"),
-            capture_output=True, cwd=Path.cwd(), timeout=180, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"Rust flow недоступен: {exc}") from exc
-    stdout = result.stdout.decode("utf-8", errors="replace")
-    stderr = result.stderr.decode("utf-8", errors="replace")
-    for line in reversed(stdout.splitlines()):
-        line = line.strip().removeprefix("> ").strip()
-        if line.startswith("{") or line.startswith("["):
-            try:
-                return json.loads(line)
-            except ValueError:
-                pass
-    detail = stderr.strip() or stdout.strip() or "Rust не вернул JSON"
-    raise RuntimeError(f"Rust flow завершился с ошибкой: {detail[-600:]}")
+def _run_rust_json(command: str, question: str, *, flow: str = "rust") -> dict | list[dict]:
+    """Call the Rust CLI and record only operation metadata, never its payload."""
+    operation = command.removesuffix("-json")
+    with _pipeline_span(
+        "rust.subprocess",
+        flow=flow,
+        attributes={"rag.rust.operation": operation},
+    ) as span:
+        try:
+            result = subprocess.run(
+                _rust_command(), input=f":{command} {question}\n:exit\n".encode("utf-8"),
+                capture_output=True, cwd=Path.cwd(), timeout=180, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"Rust flow недоступен: {exc}") from exc
+        span.set_attribute("process.exit.code", result.returncode)
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        for line in reversed(stdout.splitlines()):
+            line = line.strip().removeprefix("> ").strip()
+            if line.startswith("{") or line.startswith("["):
+                try:
+                    return json.loads(line)
+                except ValueError:
+                    pass
+        raise RuntimeError("Rust flow завершился с ошибкой")
 
 
-def rust_context(question: str) -> list[dict]:
-    payload = _run_rust_json("retrieve-json", question)
+def rust_context(question: str, *, flow: str = "rust") -> list[dict]:
+    payload = _run_rust_json("retrieve-json", question, flow=flow)
     if not isinstance(payload, list):
         raise RuntimeError("Некорректный retrieval-ответ Rust flow")
     return [{
@@ -215,7 +251,19 @@ def rust_context(question: str) -> list[dict]:
     } for item in payload if isinstance(item, dict)]
 
 
-def fuse_contexts(python_items: list[dict], rust_items: list[dict], top_k: int = TOP_K) -> list[dict]:
+def fuse_contexts(python_items: list[dict], rust_items: list[dict], top_k: int = TOP_K, *, flow: str = "hybrid") -> list[dict]:
+    with _pipeline_span(
+        "retrieval.cross_runtime_fusion",
+        flow=flow,
+        attributes={
+            "rag.results.python_count": len(python_items),
+            "rag.results.rust_count": len(rust_items),
+        },
+    ):
+        return _fuse_contexts(python_items, rust_items, top_k)
+
+
+def _fuse_contexts(python_items: list[dict], rust_items: list[dict], top_k: int = TOP_K) -> list[dict]:
     """Fuse evidence while treating the current Python index as authoritative.
 
     The Rust index may be older or contain only part of the corpus.  Keep most
@@ -268,6 +316,18 @@ def filter_rust_context(question: str, items: list[dict]) -> list[dict]:
 
 
 def rust_generate(question: str, context: list[dict], project_context: str = "") -> tuple[str, bool]:
+    with _pipeline_span(
+        "rust.generate",
+        flow="rust",
+        attributes={"rag.context.count": len(context)},
+    ) as span:
+        answer, from_cache = _rust_generate(question, context, project_context)
+        span.set_attribute("rag.cache.hit", from_cache)
+        span.set_attribute("rag.response.chars", len(answer))
+        return answer, from_cache
+
+
+def _rust_generate(question: str, context: list[dict], project_context: str = "") -> tuple[str, bool]:
     context_text = "\n\n---\n\n".join(
         f"[Источник: {item.get('file', '?')}, Раздел: {item.get('section_path', '')}]\n{item.get('text', '')}"
         for item in context

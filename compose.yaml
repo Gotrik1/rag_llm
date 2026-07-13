@@ -1,0 +1,464 @@
+name: rag-platform
+
+x-common-logging: &common-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-app-environment: &app-environment
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-rag}
+  POSTGRES_USER: ${POSTGRES_USER:-rag}
+  POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD_FILE: /run/secrets/redis_password
+  RAG_SECRET_KEY_FILE: /run/secrets/app_secret_key
+  QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+  QDRANT_COLLECTION: ${QDRANT_COLLECTION:-rag_docs_v10}
+  OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+  LLM_MODEL: ${LLM_MODEL:-qwen2.5:14b}
+  EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
+  RAG_DATA_DIR: ${RAG_DATA_DIR:-/app/.data}
+  BM25_PERSIST_DIR: ${BM25_PERSIST_DIR:-/app/.data/bm25}
+  RUST_DATA_DIR: ${RUST_DATA_DIR:-/app/.data/rust}
+  CACHE_DB: ${CACHE_DB:-/app/.data/cache/cache.db}
+  RAG_AUTH_MODE: ${RAG_AUTH_MODE:-oidc}
+  RAG_OIDC_ISSUER: ${RAG_OIDC_ISSUER:-}
+  RAG_OIDC_AUDIENCE: ${RAG_OIDC_AUDIENCE:-}
+  RAG_OIDC_JWKS_URL: ${RAG_OIDC_JWKS_URL:-}
+  RAG_OIDC_ROLE_CLAIM: ${RAG_OIDC_ROLE_CLAIM:-roles}
+  RAG_OIDC_PERMISSION_CLAIM: ${RAG_OIDC_PERMISSION_CLAIM:-permissions}
+  RAG_CORS_ORIGINS: ${CORS_ALLOW_ORIGIN:-http://localhost:8080}
+  RAG_REDIS_REQUIRED: "true"
+  RAG_AUDIT_RETENTION_DAYS: ${RAG_AUDIT_RETENTION_DAYS:-365}
+  BOOTSTRAP_SUPERADMIN_SUBJECT: ${BOOTSTRAP_SUPERADMIN_SUBJECT:-}
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  OTEL_RESOURCE_ATTRIBUTES: service.namespace=rag,deployment.environment=production
+  RAG_LOG_LEVEL: ${RAG_LOG_LEVEL:-INFO}
+
+x-app-secrets: &app-secrets
+  - postgres_password
+  - redis_password
+  - app_secret_key
+
+x-app-base: &app-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: rag-service:${RAG_IMAGE_TAG:-local}
+  environment: *app-environment
+  secrets: *app-secrets
+  networks:
+    - backend
+    - egress
+  security_opt:
+    - no-new-privileges:true
+  logging: *common-logging
+
+services:
+  postgres:
+    image: postgres:17.5-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rag}
+      POSTGRES_USER: ${POSTGRES_USER:-rag}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --data-checksums
+    command:
+      - postgres
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-200}
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - log_min_duration_statement=1000
+      - -c
+      - log_checkpoints=on
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *common-logging
+
+  redis:
+    image: redis:8.8.0-alpine
+    command:
+      - /bin/sh
+      - -ec
+      - exec redis-server --appendonly yes --appendfsync everysec --requirepass "$$(cat /run/secrets/redis_password)" --maxmemory "${REDIS_MAXMEMORY:-2gb}" --maxmemory-policy noeviction
+    secrets:
+      - redis_password
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$(cat /run/secrets/redis_password)\" ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *common-logging
+
+  qdrant:
+    image: qdrant/qdrant:v1.17.1
+    environment:
+      QDRANT__SERVICE__HTTP_PORT: "6333"
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+      QDRANT__STORAGE__STORAGE_PATH: /qdrant/storage
+      QDRANT__TELEMETRY_DISABLED: "true"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/127.0.0.1/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *common-logging
+
+  migrate:
+    <<: *app-base
+    command: ["migrate"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    <<: *app-base
+    command: ["api"]
+    environment:
+      <<: *app-environment
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+    volumes:
+      - app_data:/app/.data
+      - model_cache:/app/.fastembed_cache
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  ingestion-worker:
+    <<: *app-base
+    command: ["worker"]
+    environment:
+      <<: *app-environment
+      INGESTION_WORKERS: ${INGESTION_WORKERS:-2}
+    volumes:
+      - app_data:/app/.data
+      - model_cache:/app/.fastembed_cache
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    restart: unless-stopped
+
+  audit-retention:
+    image: postgres:17.5-alpine
+    entrypoint: ["/usr/local/bin/audit-retention"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-rag}
+      POSTGRES_USER: ${POSTGRES_USER:-rag}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      AUDIT_RETENTION_DAYS: ${RAG_AUDIT_RETENTION_DAYS:-365}
+      AUDIT_RETENTION_INTERVAL_SECONDS: ${AUDIT_RETENTION_INTERVAL_SECONDS:-86400}
+    secrets:
+      - postgres_password
+    volumes:
+      - ./deploy/postgres/audit-retention.sh:/usr/local/bin/audit-retention:ro
+    networks:
+      - backend
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *common-logging
+
+  proxy:
+    build:
+      context: .
+      dockerfile: deploy/nginx/Dockerfile
+    image: rag-proxy:${RAG_IMAGE_TAG:-local}
+    environment:
+      CORS_ALLOW_ORIGIN: ${CORS_ALLOW_ORIGIN:-http://localhost:8080}
+      NGINX_ENVSUBST_FILTER: CORS_ALLOW_ORIGIN
+    ports:
+      - ${RAG_HTTP_PORT:-8080}:8080
+    networks:
+      - frontend
+      - backend
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8080/nginx-health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    logging: *common-logging
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.155.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./deploy/otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    networks:
+      - backend
+    depends_on:
+      tempo:
+        condition: service_started
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *common-logging
+
+  prometheus:
+    image: prom/prometheus:v3.12.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${METRICS_RETENTION:-30d}
+      - --web.enable-lifecycle
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    networks:
+      - backend
+    depends_on:
+      - app
+      - otel-collector
+      - postgres-exporter
+      - redis-exporter
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *common-logging
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    environment:
+      DATA_SOURCE_URI: postgres:5432/${POSTGRES_DB:-rag}?sslmode=disable
+      DATA_SOURCE_USER: ${POSTGRES_USER:-rag}
+      DATA_SOURCE_PASS_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *common-logging
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.74.0
+    environment:
+      REDIS_ADDR: redis://redis:6379
+      REDIS_PASSWORD_FILE: /run/secrets/redis_password
+    secrets:
+      - redis_password
+    networks:
+      - backend
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *common-logging
+
+  tempo:
+    image: grafana/tempo:2.10.5
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./deploy/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    networks:
+      - backend
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *common-logging
+
+  loki:
+    image: grafana/loki:3.7.2
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./deploy/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki_data:/loki
+    networks:
+      - backend
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *common-logging
+
+  alloy:
+    image: grafana/alloy:v1.16.1
+    command: ["run", "--server.http.listen-addr=0.0.0.0:12345", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./deploy/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy
+    networks:
+      - backend
+    depends_on:
+      - loki
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *common-logging
+
+  grafana:
+    image: grafana/grafana:13.0.2
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3000}
+      GF_UNIFIED_ALERTING_ENABLED: "true"
+    secrets:
+      - grafana_admin_password
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - ${GRAFANA_BIND_ADDRESS:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000
+    networks:
+      - backend
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *common-logging
+
+  ollama:
+    image: ollama/ollama:0.9.6
+    profiles: ["local-llm"]
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - 127.0.0.1:${OLLAMA_PORT:-11434}:11434
+    networks:
+      - backend
+      - egress
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *common-logging
+
+  ollama-pull:
+    image: ollama/ollama:0.9.6
+    profiles: ["local-llm"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    command: ["pull", "${LLM_MODEL:-qwen2.5:14b}"]
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - backend
+      - egress
+    depends_on:
+      - ollama
+    restart: "no"
+
+  ollama-pull-embedding:
+    image: ollama/ollama:0.9.6
+    profiles: ["local-llm"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    command: ["pull", "${EMBED_MODEL:-nomic-embed-text}"]
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - backend
+      - egress
+    depends_on:
+      - ollama
+    restart: "no"
+
+networks:
+  frontend:
+  egress:
+  backend:
+    internal: true
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  app_data:
+  model_cache:
+  prometheus_data:
+  tempo_data:
+  loki_data:
+  alloy_data:
+  grafana_data:
+  ollama_data:
+
+secrets:
+  postgres_password:
+    file: ${POSTGRES_PASSWORD_FILE:-./deploy/secrets/postgres_password}
+  redis_password:
+    file: ${REDIS_PASSWORD_FILE:-./deploy/secrets/redis_password}
+  grafana_admin_password:
+    file: ${GRAFANA_ADMIN_PASSWORD_FILE:-./deploy/secrets/grafana_admin_password}
+  app_secret_key:
+    file: ${APP_SECRET_KEY_FILE:-./deploy/secrets/app_secret_key}

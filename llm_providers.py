@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 import zipfile
@@ -14,6 +15,7 @@ from pydantic import Field
 from llama_index.core.llms import CompletionResponse, LLMMetadata
 from llama_index.core.llms.callbacks import llm_completion_callback
 from llama_index.core.llms.custom import CustomLLM
+from runtime_paths import CERTIFICATES_DIR
 
 
 DEFAULTS = {
@@ -28,12 +30,15 @@ GIGACHAT_CA_ARCHIVES = (
     Path.home() / "Downloads" / "russian_trusted_sub_ca.zip",
     Path.home() / "Downloads" / "windows_russian_trusted_root_ca.zip",
 )
-GIGACHAT_CA_BUNDLE = Path(".ingestion_cache") / "certificates" / "gigachat-russian-ca.pem"
+GIGACHAT_CA_BUNDLE = CERTIFICATES_DIR / "gigachat-russian-ca.pem"
 MAX_OUTPUT_TOKENS = 4056
 
 
 def gigachat_ca_bundle() -> str | bool:
     """Build a local CA bundle from the official Russian CA archives, if supplied."""
+    configured_bundle = os.getenv("GIGACHAT_CA_BUNDLE", "").strip()
+    if configured_bundle and Path(configured_bundle).exists():
+        return configured_bundle
     if GIGACHAT_CA_BUNDLE.exists():
         return str(GIGACHAT_CA_BUNDLE)
     certificates: list[str] = []

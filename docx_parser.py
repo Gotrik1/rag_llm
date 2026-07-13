@@ -8,12 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+from runtime_paths import MATHML_CACHE_DIR
+
 
 NS = {
     "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
     "m": "http://schemas.openxmlformats.org/officeDocument/2006/math",
 }
-MATHML_CACHE_DIR = Path(".ingestion_cache") / "mathml"
 
 
 @dataclass

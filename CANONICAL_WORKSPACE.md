@@ -20,6 +20,10 @@ Before editing, inspect `git status --short`. Runtime files live only under
 `.data/`; code resolves them through `RAG_DATA_DIR` (locally `.data`, in the
 backend container `/app/.data`).
 
+The local `docker-compose.yml` bind-mounts the committed `./.data` snapshot.
+The production `compose.yaml` intentionally uses a separate `app_data` Docker
+volume at `/app/.data`; production runtime changes do not modify the checkout.
+
 ## Isolated preview
 
 An optional local preview can be started without replacing the main stack:

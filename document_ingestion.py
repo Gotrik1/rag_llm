@@ -123,7 +123,7 @@ def _read_cache(path: Path) -> IngestedDocument | None:
 
 
 def _write_cache(path: Path, result: IngestedDocument) -> None:
-    CACHE_DIR.mkdir(exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = _cache_path(path)
     cache_path.write_text(
         json.dumps({

@@ -1,0 +1,181 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: RAG production alerts
+    folder: RAG
+    interval: 1m
+    rules:
+      - uid: rag-api-unavailable
+        title: RAG API unavailable
+        condition: threshold
+        data:
+          - refId: availability
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              datasource:
+                type: prometheus
+                uid: prometheus
+              editorMode: code
+              expr: sum(up{job="rag-api"})
+              instant: true
+              intervalMs: 15000
+              maxDataPoints: 20000
+              range: false
+              refId: availability
+          - refId: threshold
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params: [1]
+                    type: lt
+                  operator:
+                    type: and
+                  query:
+                    params: [threshold]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: availability
+              intervalMs: 1000
+              maxDataPoints: 20000
+              refId: threshold
+              type: threshold
+        dashboardUid: rag-overview
+        panelId: 1
+        noDataState: Alerting
+        execErrState: Alerting
+        for: 2m
+        annotations:
+          summary: Prometheus cannot scrape the RAG API.
+        labels:
+          severity: critical
+          service: rag-api
+        isPaused: false
+
+      - uid: rag-high-error-rate
+        title: RAG API high 5xx error rate
+        condition: threshold
+        data:
+          - refId: error_ratio
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              datasource:
+                type: prometheus
+                uid: prometheus
+              editorMode: code
+              expr: sum(rate(rag_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(rag_http_requests_total[5m])), 0.001)
+              instant: true
+              intervalMs: 15000
+              maxDataPoints: 20000
+              range: false
+              refId: error_ratio
+          - refId: threshold
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params: [0.05]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [threshold]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: error_ratio
+              intervalMs: 1000
+              maxDataPoints: 20000
+              refId: threshold
+              type: threshold
+        dashboardUid: rag-overview
+        panelId: 4
+        noDataState: OK
+        execErrState: Alerting
+        for: 10m
+        annotations:
+          summary: More than 5 percent of requests return 5xx.
+        labels:
+          severity: warning
+          service: rag-api
+        isPaused: false
+
+      - uid: rag-authorization-denial-spike
+        title: RAG authorization denial spike
+        condition: threshold
+        data:
+          - refId: denial_rate
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              datasource:
+                type: prometheus
+                uid: prometheus
+              editorMode: code
+              expr: sum(rate(rag_authorization_decisions_total{result=~"deny|unauthenticated"}[5m]))
+              instant: true
+              intervalMs: 15000
+              maxDataPoints: 20000
+              range: false
+              refId: denial_rate
+          - refId: threshold
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params: [0.5]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [threshold]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: denial_rate
+              intervalMs: 1000
+              maxDataPoints: 20000
+              refId: threshold
+              type: threshold
+        dashboardUid: rag-overview
+        panelId: 6
+        noDataState: OK
+        execErrState: Alerting
+        for: 5m
+        annotations:
+          summary: Authorization denials exceed 0.5 requests per second.
+        labels:
+          severity: warning
+          service: rag-auth
+        isPaused: false

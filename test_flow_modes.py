@@ -9,8 +9,10 @@ class FakeAgent:
     def __init__(self):
         self.calls = []
 
-    def ask(self, question, prompt, prompt_id):
+    def ask(self, question, prompt, prompt_id, retrieval_query=None):
         self.calls.append(("ask", question))
+        if retrieval_query is not None:
+            self.calls.append(("retrieval_query", retrieval_query))
         return "python answer", [{"file": "python.docx", "section": "1", "score": 1, "text_preview": "evidence"}], False
 
     def retrieve_context(self, question, top_k):
@@ -115,6 +117,21 @@ class FlowModeTests(unittest.TestCase):
             "model": "Qwen/Qwen3.8-27B",
         }):
             self.assertEqual(web_ui.llm_label()["label"], "vLLM · Qwen/Qwen3.8-27B")
+
+    def test_follow_up_retrieval_uses_previous_user_turn_from_same_chat(self):
+        scope = {"messages": [
+            {"chat_id": "other", "role": "user", "content": "Что такое другой показатель?"},
+            {"chat_id": "chat-1", "role": "user", "content": "Что такое ИВ0? Как рассчитывается?"},
+            {"chat_id": "chat-1", "role": "assistant", "content": "Ответ"},
+            {"chat_id": "chat-1", "role": "user", "content": "А по какой формуле?"},
+        ]}
+        query = web_ui.contextualize_retrieval_question("А по какой формуле?", scope, "chat-1")
+        self.assertIn("Что такое ИВ0?", query)
+        self.assertNotIn("другой показатель", query)
+
+    def test_standalone_retrieval_question_is_not_expanded(self):
+        question = "Объясни порядок расчета ИВ0 по шагам"
+        self.assertEqual(web_ui.contextualize_retrieval_question(question, {"messages": []}, "chat-1"), question)
 
 
 if __name__ == "__main__":

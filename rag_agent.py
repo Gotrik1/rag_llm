@@ -1539,12 +1539,21 @@ class RAGAgent:
         print(f"✓ Проиндексировано {len(nodes)} чанков из {p.name}")
         return len(nodes)
 
-    def ask(self, question: str, system_prompt: str | None = None, prompt_id: str = "rag-grounded") -> tuple[str, list[dict], bool]:
+    def ask(
+        self,
+        question: str,
+        system_prompt: str | None = None,
+        prompt_id: str = "rag-grounded",
+        retrieval_query: str | None = None,
+    ) -> tuple[str, list[dict], bool]:
         """
         Возвращает (answer, sources, from_cache).
         sources — список dict с ключами file, section, score.
         """
-        qhash = _question_hash(f"{prompt_id}\n{system_prompt or GROUNDED_SYSTEM_PROMPT}\n{question}")
+        search_question = (retrieval_query or question).strip()
+        qhash = _question_hash(
+            f"{prompt_id}\n{system_prompt or GROUNDED_SYSTEM_PROMPT}\n{question}\n{search_question}"
+        )
 
         with _pipeline_span("cache.lookup") as span:
             cached = self.response_cache.get(qhash)
@@ -1565,7 +1574,7 @@ class RAGAgent:
             )
 
         spec = refine_prism_query(question)
-        context = self.retrieve_context(question, TOP_K, spec)
+        context = self.retrieve_context(search_question, TOP_K, spec)
         calculations = extract_formula_lines_from_texts([item["text"] for item in context], question)
         answer = self._generate_grounded_answer(question, context, calculations, spec, system_prompt)
 

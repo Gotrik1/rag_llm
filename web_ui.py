@@ -197,6 +197,31 @@ def project_context_prompt(scope: dict) -> str:
     return "\n\n".join(parts)
 
 
+def contextualize_retrieval_question(question: str, scope: dict, chat_id: str) -> str:
+    """Resolve short referential follow-ups using the previous user turn in this chat."""
+    normalized = re.sub(r"\s+", " ", question.strip().lower())
+    follow_up = len(normalized) <= 140 and bool(re.match(
+        r"^(?:а\s+|и\s+|но\s+)?(?:по\s+)?(?:како(?:й|е|я|ие)|как|где|когда|почему|зачем|сколько|"
+        r"что\s+(?:с|насч[её]т)|это|он|она|они|его|е[её]|их)\b",
+        normalized,
+    ))
+    if not follow_up:
+        return question
+
+    skipped_current = False
+    for message in reversed(scope.get("messages", [])):
+        if str(message.get("chat_id", "")) != chat_id or str(message.get("role", "")) != "user":
+            continue
+        content = str(message.get("content", "")).strip()
+        if not content:
+            continue
+        if not skipped_current and re.sub(r"\s+", " ", content.lower()) == normalized:
+            skipped_current = True
+            continue
+        return f"Предыдущий вопрос: {content[:1000]}\nУточняющий вопрос: {question}"
+    return question
+
+
 def save_flow_mode(mode: str) -> None:
     FLOW_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     FLOW_CONFIG_PATH.write_text(json.dumps({"mode": mode}), encoding="utf-8")
@@ -1045,16 +1070,19 @@ class Handler(BaseHTTPRequestHandler):
 
         mode = load_flow_mode()
         agent = get_agent()
+        retrieval_question = contextualize_retrieval_question(question, scope, chat_id)
         t0 = time.time()
         with _request_lock:
             profile = get_profile(load_system_prompt_id(), GROUNDED_SYSTEM_PROMPT)
             scoped_prompt = f"{profile['prompt']}\n\n{project_context_prompt(scope)}"
             if mode == "python":
-                answer, sources, from_cache = agent.ask(question, scoped_prompt, profile["id"])
-                context = agent.retrieve_context(question, TOP_K)
+                answer, sources, from_cache = agent.ask(
+                    question, scoped_prompt, profile["id"], retrieval_query=retrieval_question
+                )
+                context = agent.retrieve_context(retrieval_question, TOP_K)
             elif mode == "rust":
-                python_items = agent.retrieve_context(question, TOP_K)
-                rust_items = filter_rust_context(question, rust_context(question))
+                python_items = agent.retrieve_context(retrieval_question, TOP_K)
+                rust_items = filter_rust_context(retrieval_question, rust_context(retrieval_question))
                 context = fuse_contexts(python_items, rust_items, TOP_K)
                 rust_result = rust_generate(question, context, project_context_prompt(scope))
                 if isinstance(rust_result, tuple):
@@ -1066,8 +1094,8 @@ class Handler(BaseHTTPRequestHandler):
                     "text_preview": item["text"][:120],
                 } for item in context]
             else:
-                python_items = agent.retrieve_context(question, TOP_K)
-                rust_items = filter_rust_context(question, rust_context(question))
+                python_items = agent.retrieve_context(retrieval_question, TOP_K)
+                rust_items = filter_rust_context(retrieval_question, rust_context(retrieval_question))
                 context = fuse_contexts(python_items, rust_items, TOP_K)
                 spec = refine_prism_query(question)
                 calculations = extract_formula_lines(context, question)

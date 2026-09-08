@@ -195,7 +195,7 @@ services:
 
   audit-retention:
     image: postgres:17.5-alpine
-    entrypoint: ["/usr/local/bin/audit-retention"]
+    entrypoint: ["/bin/sh", "/usr/local/bin/audit-retention"]
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"

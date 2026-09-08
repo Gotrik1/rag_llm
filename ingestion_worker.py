@@ -14,10 +14,14 @@ from persistence import get_store
 from db_store import update_document
 
 
-async def ingest_document_job(ctx: dict, job_id: str, payload: dict) -> dict:
+async def ingest_document_job(ctx: dict, job_id: str, payload: dict | None = None) -> dict:
     del ctx
     store = get_store()
     job = await asyncio.to_thread(store.get_job, job_id)
+    if payload is None:
+        payload = await asyncio.to_thread(store.get_job_payload, job_id)
+    if not isinstance(payload, dict):
+        raise ValueError("ingestion job payload not found")
     document_id = str(payload.get("document_id", "")).strip()
     if not job or job["cancel_requested"]:
         await asyncio.to_thread(store.update_job, job_id, status="cancelled", finished_at=time.time())

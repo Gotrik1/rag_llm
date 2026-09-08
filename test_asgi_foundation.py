@@ -65,6 +65,48 @@ class AsgiFoundationTests(unittest.TestCase):
         create_message.assert_called_once()
         self.assertEqual(update_message.call_args.args[1]["status"], "complete")
 
+    def test_durable_ask_uses_generation_queue_and_returns_persisted_result(self):
+        created = {"id": "message-1"}
+        completed = {
+            "status": "completed",
+            "result": {
+                "answer": "durable answer",
+                "message_id": "message-1",
+                "job_id": "job-1",
+                "status": "complete",
+                "flow_mode": "python",
+            },
+        }
+        with patch.dict("os.environ", {"RAG_DURABLE_GENERATION": "true"}), \
+             patch("asgi_app.create_message", return_value=created), \
+             patch("asgi_app.update_message", return_value={}), \
+             patch.object(asgi_app.jobs, "submit", AsyncMock(return_value={"id": "job-1"})) as submit, \
+             patch.object(asgi_app.jobs, "wait", AsyncMock(return_value=completed)):
+            response = self.client.post("/api/ask", json={"question": "Test question", "chat_id": "chat-1"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["answer"], "durable answer")
+        submit.assert_awaited_once_with(
+            "generation",
+            {
+                "assistant_message_id": "message-1",
+                "request": {"question": "Test question", "chat_id": "chat-1"},
+                "owner_subject": "rag-superadmin",
+            },
+        )
+
+    def test_durable_ask_returns_accepted_when_job_outlives_http_wait(self):
+        with patch.dict("os.environ", {"RAG_DURABLE_GENERATION": "true"}), \
+             patch("asgi_app.create_message", return_value={"id": "message-1"}), \
+             patch("asgi_app.update_message", return_value={}), \
+             patch.object(asgi_app.jobs, "submit", AsyncMock(return_value={"id": "job-1"})), \
+             patch.object(asgi_app.jobs, "wait", AsyncMock(return_value={"id": "job-1", "status": "running"})):
+            response = self.client.post("/api/ask", json={"question": "Test question", "chat_id": "chat-1"})
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["status"], "running")
+        self.assertEqual(response.json()["job_id"], "job-1")
+
     def test_server_owned_generation_survives_client_waiter_cancellation(self):
         started = threading.Event()
         release = threading.Event()
@@ -142,6 +184,24 @@ class AsgiFoundationTests(unittest.TestCase):
         self.assertIn("event: delta", response.text)
         self.assertIn("streamed answer", response.text)
         self.assertIn("event: completed", response.text)
+
+    def test_durable_sse_stream_uses_queue_and_persisted_result(self):
+        completed = {
+            "id": "job-1",
+            "status": "completed",
+            "result": {"answer": "durable stream", "flow_mode": "python", "status": "complete"},
+        }
+        with patch.dict("os.environ", {"RAG_DURABLE_GENERATION": "true"}), \
+             patch("asgi_app.create_message", return_value={"id": "message-1"}), \
+             patch("asgi_app.update_message", return_value={}), \
+             patch.object(asgi_app.jobs, "submit", AsyncMock(return_value={"id": "job-1"})), \
+             patch.object(asgi_app.jobs, "get", AsyncMock(return_value=completed)):
+            response = self.client.post("/api/ask/stream", json={"question": "Test", "chat_id": "chat-1"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("event: started", response.text)
+        self.assertIn("event: completed", response.text)
+        self.assertIn("durable stream", response.text)
 
     def test_legacy_routes_are_protected_and_keep_response_status(self):
         with patch("asgi_app.legacy_operation", return_value=({"mode": "python"}, 200)) as operation:

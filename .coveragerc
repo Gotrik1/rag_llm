@@ -6,6 +6,7 @@ source =
     db_store
     document_ingestion
     docx_parser
+    generation_worker
     ingestion_task
     ingestion_worker
     jobs
@@ -13,6 +14,7 @@ source =
     llm_providers
     persistence
     policy
+    quality_eval
     rag_agent
     response_cache
     runtime_paths

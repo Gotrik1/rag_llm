@@ -27,7 +27,7 @@ jobs:
         run: pip install -r requirements.docker.txt
 
       - name: Check Python syntax
-        run: python -m compileall -q asgi_app.py web_ui.py db_store.py rag_agent.py response_cache.py document_ingestion.py docx_parser.py ingestion_worker.py ingestion_task.py
+        run: python -m compileall -q asgi_app.py web_ui.py db_store.py rag_agent.py response_cache.py document_ingestion.py docx_parser.py ingestion_worker.py generation_worker.py ingestion_task.py quality_eval.py
 
       - name: Run Python tests
         run: python -m unittest discover -v

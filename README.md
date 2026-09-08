@@ -24,6 +24,7 @@ deployment.
 - [Architecture](architecture.md) — current runtime and data-flow boundaries.
 - [Deployment](DEPLOYMENT.md) — production deployment, verification, backup, and rollback.
 - [Production readiness report](docs/PRODUCTION_READINESS_REPORT.md) — implemented guarantees and test coverage.
+- [RAG quality gate](docs/QUALITY_EVALUATION.md) — corpus-level 9/10 acceptance method.
 - Live API schema: `/api/openapi.json`; Swagger UI: `/docs`.
 
 ## Local verification
@@ -83,5 +84,7 @@ remain on internal networks.
 - Never commit `.env`, secret values, certificates, uploaded documents, or runtime data.
 - Never use `docker compose down -v` against an environment whose data must survive.
 - Keep `RAG_WORKER_CONCURRENCY=1` while BM25 uses one shared snapshot.
+- Scale `RAG_GENERATION_CONCURRENCY` independently from ingestion, after
+  measuring model memory and tokens-per-second under concurrent prompts.
 - Keep production authentication in `oidc` mode with real issuer/audience/JWKS values.
 - Treat answer text as a synthesis; use its source links to verify critical facts.

@@ -9,6 +9,7 @@ ui/node_modules/.tmp/
 .coverage
 coverage.xml
 htmlcov/
+quality-report*.json
 .tmp/
 .env
 bm25_index*/

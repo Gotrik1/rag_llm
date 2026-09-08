@@ -64,10 +64,11 @@ Never run `down -v` on a retained environment.
 docker compose -f compose.yaml --env-file .env build
 docker compose -f compose.yaml --env-file .env up -d
 docker compose -f compose.yaml --env-file .env ps
-docker compose -f compose.yaml --env-file .env logs --since 15m migrate app ingestion-worker proxy tls-proxy
+docker compose -f compose.yaml --env-file .env logs --since 15m migrate app ingestion-worker generation-worker proxy tls-proxy
 ```
 
-`migrate` must finish successfully before `app` and `ingestion-worker` become
+`migrate` must finish successfully before `app`, `ingestion-worker`, and
+`generation-worker` become
 healthy. The first vLLM/model start can take significant time; do not mistake
 model download/loading for API readiness.
 
@@ -88,11 +89,14 @@ Then verify through the real browser/OIDC path:
 2. Upload one small document; observe queued → processing → ready and a nonzero chunk count.
 3. Ask a question whose answer is present and verify the section/source download link.
 4. Ask a formula question and verify inline/display rendering.
-5. Start a slow answer, refresh the page, reopen the chat, and verify its terminal answer appears.
+5. Start a slow answer, refresh the page, then restart only `app`; verify the
+   generation worker finishes it and the answer, sources, and formulas appear.
 6. Start answers in two chats and switch between them; verify no cross-chat message placement.
 7. Upload different documents to two projects and verify facts/sources do not cross project boundaries.
 8. Repeat an identical question and verify `from_cache=true`; change project memory/document corpus and verify no stale hit.
 9. Inspect Grafana `RAG Production Overview`, Prometheus targets, Loki logs, and Tempo traces.
+10. Run the versioned corpus gate from `docs/QUALITY_EVALUATION.md`; every case
+    must score at least 9/10.
 
 Record response status, latency, source file/section, and the deployed Git SHA.
 
@@ -100,7 +104,7 @@ Record response status, latency, source file/section, and the deployed Git SHA.
 
 ```console
 docker compose -f compose.yaml --env-file .env ps
-docker compose -f compose.yaml --env-file .env logs --since 15m app ingestion-worker vllm llm-bridge
+docker compose -f compose.yaml --env-file .env logs --since 15m app ingestion-worker generation-worker vllm llm-bridge
 docker compose -f compose.yaml --env-file .env exec app alembic current
 docker compose -f compose.yaml --env-file .env restart app
 ```

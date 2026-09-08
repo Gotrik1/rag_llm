@@ -53,6 +53,9 @@ case "${1:-api}" in
     worker)
         exec arq ingestion_worker.WorkerSettings
         ;;
+    generation-worker)
+        exec arq generation_worker.WorkerSettings
+        ;;
     *)
         exec "$@"
         ;;

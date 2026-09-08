@@ -1,0 +1,2 @@
+{"id":"project-code","question":"Какое кодовое слово проекта указано в тестовой базе знаний?","expected_terms":["Кедр"],"expected_sources":["e2e_knowledge.md"],"forbidden_terms":["Сосна"],"max_latency_s":30}
+{"id":"unsupported","question":"Какой серийный номер турбины указан в тестовой базе знаний?","expect_refusal":true,"max_latency_s":30}

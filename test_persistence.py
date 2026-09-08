@@ -23,6 +23,8 @@ class PersistenceTests(unittest.TestCase):
         self.assertTrue(self.store.request_cancel(job["id"]))
         loaded = self.store.get_job(job["id"])
         self.assertTrue(loaded["cancel_requested"])
+        self.assertNotIn("payload", loaded)
+        self.assertEqual(self.store.get_job_payload(job["id"]), {"path": "doc.docx"})
         self.store.update_job(job["id"], status="cancelled", progress=100)
         self.assertEqual(self.store.get_job(job["id"])["status"], "cancelled")
 

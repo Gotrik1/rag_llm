@@ -36,6 +36,7 @@ class AskRequest(BaseModel):
 ALLOWED_UPLOAD_SUFFIXES = {".docx", ".pdf", ".md", ".txt"}
 MAX_UPLOAD_BYTES = int(os.getenv("RAG_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 MAX_UPLOAD_FILES = int(os.getenv("RAG_MAX_UPLOAD_FILES", "20"))
+GENERATION_WAIT_SECONDS = float(os.getenv("RAG_GENERATION_WAIT_SECONDS", "900"))
 
 
 def safe_upload_name(filename: str) -> str:
@@ -133,8 +134,14 @@ async def _run_and_persist_ask(request_payload: dict, assistant_message: dict) -
             "content_html": str(result.get("html_answer", "")),
             "status": "complete",
             "metadata": {
+                "flow_mode": result.get("flow_mode"),
+                "from_cache": bool(result.get("from_cache", False)),
+                "elapsed_s": result.get("elapsed_s", 0),
                 "model_label": (result.get("llm") or {}).get("label"),
+                "llm": result.get("llm") or {},
                 "sources": result.get("sources") or [],
+                "formulas": result.get("formulas") or [],
+                "warnings": result.get("warnings") or [],
                 "usage": result.get("usage") or {},
             },
         },
@@ -243,7 +250,50 @@ async def ask(payload: AskRequest, principal: Principal = Depends(current_princi
                 payload.chat_id,
                 {"role": "assistant", "content": "", "status": "running", "metadata": {"principal": principal.subject}},
             )
-        if assistant_message:
+        durable_generation = os.getenv("RAG_DURABLE_GENERATION", "false").lower() == "true"
+        if assistant_message and durable_generation:
+            try:
+                job = await jobs.submit(
+                    "generation",
+                    {
+                        "assistant_message_id": str(assistant_message["id"]),
+                        "request": request_payload,
+                        "owner_subject": principal.subject,
+                    },
+                )
+                await asyncio.to_thread(
+                    update_message,
+                    str(assistant_message["id"]),
+                    {
+                        "metadata": {
+                            "principal": principal.subject,
+                            "job_id": str(job["id"]),
+                        }
+                    },
+                )
+            except Exception as exc:
+                await asyncio.to_thread(
+                    update_message,
+                    str(assistant_message["id"]),
+                    {"content": str(exc), "status": "error"},
+                )
+                raise HTTPException(503, "Generation queue is unavailable") from exc
+            terminal = await jobs.wait(str(job["id"]), GENERATION_WAIT_SECONDS)
+            if terminal and terminal["status"] == "completed" and isinstance(terminal.get("result"), dict):
+                result = terminal["result"]
+            elif terminal and terminal["status"] in {"failed", "cancelled"}:
+                raise HTTPException(500, str(terminal.get("error") or "Generation did not complete"))
+            else:
+                result = {
+                    "answer": "",
+                    "message_id": str(assistant_message["id"]),
+                    "job_id": str(job["id"]),
+                    "status": "running",
+                    "flow_mode": "queued",
+                    "from_cache": False,
+                    "elapsed_s": time.perf_counter() - started,
+                }
+        elif assistant_message:
             task = asyncio.create_task(_run_and_persist_ask(request_payload, assistant_message))
             _persistent_ask_tasks.add(task)
             task.add_done_callback(_forget_persistent_ask)
@@ -252,8 +302,8 @@ async def ask(payload: AskRequest, principal: Principal = Depends(current_princi
             result = await asyncio.shield(task)
         else:
             result = await asyncio.to_thread(run_ask, question)
-        PIPELINE_SECONDS.labels("ask", result["flow_mode"]).observe(time.perf_counter() - started)
-        return JSONResponse(result)
+        PIPELINE_SECONDS.labels("ask", result.get("flow_mode", "unknown")).observe(time.perf_counter() - started)
+        return JSONResponse(result, status_code=202 if result.get("status") == "running" else 200)
 
 
 def _sse(event: str, data: dict) -> str:
@@ -263,6 +313,63 @@ def _sse(event: str, data: dict) -> str:
 @app.post("/api/ask/stream")
 async def ask_stream(payload: AskRequest, request: Request, principal: Principal = Depends(current_principal)):
     """SSE contract with immediate progress, heartbeats and incremental answer chunks."""
+    if payload.chat_id and os.getenv("RAG_DURABLE_GENERATION", "false").lower() == "true":
+        async def durable_events():
+            assistant_message = await asyncio.to_thread(
+                create_message,
+                payload.chat_id,
+                {"role": "assistant", "content": "", "status": "running", "metadata": {"principal": principal.subject}},
+            )
+            try:
+                job = await jobs.submit(
+                    "generation",
+                    {
+                        "assistant_message_id": str(assistant_message["id"]),
+                        "request": payload.model_dump(exclude_none=True),
+                        "owner_subject": principal.subject,
+                    },
+                )
+                await asyncio.to_thread(
+                    update_message,
+                    str(assistant_message["id"]),
+                    {"metadata": {"principal": principal.subject, "job_id": str(job["id"])}},
+                )
+            except Exception as exc:
+                await asyncio.to_thread(
+                    update_message,
+                    str(assistant_message["id"]),
+                    {"content": str(exc), "status": "error"},
+                )
+                yield _sse("error", {"message": "Generation queue is unavailable"})
+                return
+            yield _sse(
+                "started",
+                {"flow": "queued", "job_id": str(job["id"]), "message_id": str(assistant_message["id"])},
+            )
+            while True:
+                if await request.is_disconnected():
+                    return
+                state = await jobs.get(str(job["id"]))
+                if state is None:
+                    yield _sse("error", {"message": "Generation job disappeared"})
+                    return
+                if state["status"] == "completed":
+                    result = dict(state.get("result") or {})
+                    result.pop("html_answer", None)
+                    yield _sse("completed", result)
+                    return
+                if state["status"] in {"failed", "cancelled"}:
+                    yield _sse("error", {"message": str(state.get("error") or "Generation did not complete")})
+                    return
+                yield _sse("heartbeat", {"status": state["status"], "progress": state.get("progress", 0)})
+                await asyncio.sleep(1)
+
+        return StreamingResponse(
+            durable_events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     async def events():
         yield _sse("started", {"flow": "pending"})
         deltas: asyncio.Queue[str] = asyncio.Queue()
@@ -289,10 +396,10 @@ async def ask_stream(payload: AskRequest, request: Request, principal: Principal
 
 
 @app.post("/api/jobs/ingestion")
-async def submit_ingestion(payload: dict, _: Principal = Depends(current_principal)):
+async def submit_ingestion(payload: dict, principal: Principal = Depends(current_principal)):
     """Start long ingestion without holding an HTTP connection open."""
     try:
-        job = await jobs.submit("ingestion", payload)
+        job = await jobs.submit("ingestion", {**payload, "owner_subject": principal.subject})
     except Exception as exc:
         raise HTTPException(503, str(exc)) from exc
     JOBS.labels("ingestion", "queued").inc()
@@ -304,7 +411,7 @@ async def upload_documents(
     files: list[UploadFile] = File(...),
     project_id: str = Form(""),
     chat_id: str = Form(""),
-    _: Principal = Depends(current_principal),
+    principal: Principal = Depends(current_principal),
 ):
     """Persist uploads and enqueue ingestion without holding the request open."""
     if not files or len(files) > MAX_UPLOAD_FILES:
@@ -342,7 +449,14 @@ async def upload_documents(
             },
         )
         try:
-            job = await jobs.submit("ingestion", {"path": str(target), "document_id": str(document["id"])})
+            job = await jobs.submit(
+                "ingestion",
+                {
+                    "path": str(target),
+                    "document_id": str(document["id"]),
+                    "owner_subject": principal.subject,
+                },
+            )
         except Exception as exc:
             await asyncio.to_thread(
                 update_document,
@@ -395,7 +509,9 @@ async def api_openapi(_: Principal = Depends(current_principal)):
 
 
 @app.get("/api/jobs/{job_id}")
-async def get_job(job_id: str, _: Principal = Depends(current_principal)):
+async def get_job(job_id: str, principal: Principal = Depends(current_principal)):
+    if not await jobs.can_access(job_id, principal.subject, "superadmin" in principal.roles):
+        raise HTTPException(404, "job not found")
     job = await jobs.get(job_id)
     if job is None:
         raise HTTPException(404, "job not found")
@@ -405,7 +521,9 @@ async def get_job(job_id: str, _: Principal = Depends(current_principal)):
 
 
 @app.delete("/api/jobs/{job_id}")
-async def cancel_job(job_id: str, _: Principal = Depends(current_principal)):
+async def cancel_job(job_id: str, principal: Principal = Depends(current_principal)):
+    if not await jobs.can_access(job_id, principal.subject, "superadmin" in principal.roles):
+        raise HTTPException(404, "job not found")
     if not await jobs.cancel(job_id):
         raise HTTPException(409, "job cannot be cancelled")
     return {"id": job_id, "status": "cancelled"}

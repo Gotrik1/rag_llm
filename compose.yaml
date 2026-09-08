@@ -33,6 +33,8 @@ x-app-environment: &app-environment
   RAG_OIDC_PERMISSION_CLAIM: ${RAG_OIDC_PERMISSION_CLAIM:-permissions}
   RAG_CORS_ORIGINS: ${CORS_ALLOW_ORIGIN:-http://localhost:8080}
   RAG_REDIS_REQUIRED: "true"
+  RAG_DURABLE_GENERATION: ${RAG_DURABLE_GENERATION:-true}
+  RAG_GENERATION_WAIT_SECONDS: ${RAG_GENERATION_WAIT_SECONDS:-900}
   RAG_AUDIT_RETENTION_DAYS: ${RAG_AUDIT_RETENTION_DAYS:-365}
   BOOTSTRAP_SUPERADMIN_SUBJECT: ${BOOTSTRAP_SUPERADMIN_SUBJECT:-rag-superadmin}
   OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
@@ -247,6 +249,27 @@ services:
     security_opt:
       - no-new-privileges:true
     logging: *common-logging
+
+  generation-worker:
+    <<: *app-base
+    command: ["generation-worker"]
+    environment:
+      <<: *app-environment
+      RAG_GENERATION_CONCURRENCY: ${RAG_GENERATION_CONCURRENCY:-4}
+      RAG_GENERATION_TIMEOUT_SECONDS: ${RAG_GENERATION_TIMEOUT_SECONDS:-1800}
+    volumes:
+      - ${RAG_DATA_ROOT:-./.data/storage}/app:/app/.data:z
+      - ${RAG_DATA_ROOT:-./.data/storage}/model-cache:/app/.fastembed_cache:z
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      llm-bridge:
+        condition: service_healthy
+    restart: unless-stopped
 
   tls-proxy:
     image: nginx:1.28-alpine

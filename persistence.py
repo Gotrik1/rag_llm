@@ -217,6 +217,13 @@ class Persistence:
             row = session.get(JobRow, job_id)
             return self.job_dict(row) if row else None
 
+    def get_job_payload(self, job_id: str) -> dict[str, Any] | None:
+        """Return worker-only payload without exposing it through job APIs."""
+        if not self.engine: return None
+        with Session(self.engine) as session:
+            row = session.get(JobRow, job_id)
+            return dict(row.payload) if row and isinstance(row.payload, dict) else None
+
     def request_cancel(self, job_id: str) -> bool:
         if not self.engine: return False
         with Session(self.engine) as session:

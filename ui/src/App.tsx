@@ -90,6 +90,8 @@ type ApiContextChunk = {
 type AskResponse = {
   answer: string;
   message_id?: string;
+  job_id?: string;
+  status?: "running" | "complete";
   html_answer?: string;
   from_cache: boolean;
   elapsed_s: number;
@@ -273,8 +275,41 @@ function messageFromRecord(record: MessageRecord): ChatEntry {
   };
 }
 
+export function resultFromMessageRecord(record: MessageRecord): AskResponse | null {
+  if (record.role !== "assistant" || record.status === "running") return null;
+  const metadata = record.metadata ?? {};
+  const sources = Array.isArray(metadata.sources) ? metadata.sources as ApiSource[] : [];
+  const formulas = Array.isArray(metadata.formulas) ? metadata.formulas as ApiFormula[] : [];
+  const warnings = Array.isArray(metadata.warnings)
+    ? metadata.warnings.filter((item): item is string => typeof item === "string")
+    : [];
+  const usage = metadata.usage && typeof metadata.usage === "object"
+    ? metadata.usage as AskResponse["usage"]
+    : undefined;
+  const llm = metadata.llm && typeof metadata.llm === "object"
+    ? metadata.llm as AskResponse["llm"]
+    : undefined;
+  return {
+    answer: record.content,
+    message_id: record.id,
+    status: record.status === "error" ? undefined : "complete",
+    html_answer: record.content_html,
+    from_cache: metadata.from_cache === true,
+    elapsed_s: typeof metadata.elapsed_s === "number" ? metadata.elapsed_s : 0,
+    sources,
+    formulas,
+    warnings,
+    usage,
+    llm
+  };
+}
+
 export function hasRunningAssistantMessage(records: Array<Pick<MessageRecord, "role" | "status">>): boolean {
   return records.some((record) => record.role === "assistant" && record.status === "running");
+}
+
+export function generationResponseIsTerminal(status?: AskResponse["status"]): boolean {
+  return status !== "running";
 }
 
 function readStored<T>(key: string, fallback: T): T {
@@ -427,6 +462,13 @@ export function App() {
   const loadMessages = useCallback(async (chatId: string) => {
     const data = await getJson<{ items: MessageRecord[] }>(`/api/chats/${chatId}/messages`, API_TIMEOUT_MS);
     setMessages(data.items.map(messageFromRecord));
+    if (activeChatIdRef.current === chatId) {
+      const restored = [...data.items]
+        .reverse()
+        .map(resultFromMessageRecord)
+        .find((item): item is AskResponse => item !== null) ?? null;
+      setLastResult(restored);
+    }
     setRunningChatIds((current) => {
       const persistedRunning = hasRunningAssistantMessage(data.items);
       if (persistedRunning) {
@@ -737,9 +779,11 @@ export function App() {
     setDebugError("");
     setActiveTab("system");
 
+    let shouldClearRunning = false;
     try {
       await postJson<MessageRecord>(`/api/chats/${requestChatId}/messages`, { role: "user", content: question }, API_TIMEOUT_MS);
       const data = await postJson<AskResponse>("/api/ask", { question, chat_id: requestChatId }, ASK_TIMEOUT_MS);
+      shouldClearRunning = generationResponseIsTerminal(data.status);
 
       const currentChat = chats.find((chat) => chat.id === requestChatId);
       if (currentChat && currentChat.title === "Новый чат") {
@@ -764,7 +808,9 @@ export function App() {
         }
       }
     } finally {
-      setRunningChatIds((current) => current.filter((chatId) => chatId !== requestChatId));
+      if (shouldClearRunning) {
+        setRunningChatIds((current) => current.filter((chatId) => chatId !== requestChatId));
+      }
     }
   }, [activeChatId, chats, loadMessages]);
 

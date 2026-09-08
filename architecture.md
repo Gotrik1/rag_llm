@@ -80,7 +80,9 @@ sequenceDiagram
         API-->>UI: answer + message_id
     else Browser refreshes or disconnects
         UI-xAPI: HTTP delivery cancelled
-        RAG-->>API: task continues in process
+        API->>Queue: persist generation job
+        Queue->>RAG: generation worker claims job
+        RAG-->>API: result persists independently of API process
         API->>DB: assistant status=complete/error
         UI->>DB: reload chat messages through API
         loop while assistant status=running

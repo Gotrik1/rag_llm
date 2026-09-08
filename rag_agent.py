@@ -140,6 +140,12 @@ def refusal_answer() -> str:
 # and advertises a 262k context window; neither is appropriate for this local RAG
 # request path, which supplies a bounded set of document chunks.
 OLLAMA_MODEL_PROFILES: dict[str, dict] = {
+    "Qwen/Qwen3.8-27B": {
+        "context_window": 32768,
+        "thinking": False,
+        "num_predict": 2048,
+        "request_timeout": 180.0,
+    },
     "qwen3.5:9b": {
         "context_window": 8192,
         "thinking": False,
@@ -1638,6 +1644,8 @@ class RAGAgent:
         ) as span:
             response = self.llm.complete(prompt)
             answer = sanitize_grounded_answer(str(response).strip(), question, calculations)
+            if not answer:
+                raise RuntimeError("LLM returned an empty answer")
             span.set_attribute("rag.response.chars", len(answer))
         self.response_cache.set(generation_key, {"answer": answer})
         return answer

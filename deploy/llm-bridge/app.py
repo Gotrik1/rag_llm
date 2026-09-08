@@ -37,7 +37,9 @@ def _openai_payload(payload: dict[str, Any], stream: bool) -> dict[str, Any]:
         "max_tokens": int(options.get("num_predict", 2048)),
         "seed": int(options.get("seed", 42)),
     }
-    if payload.get("think") is False:
+    # This bridge serves the latency-sensitive RAG path. Qwen3.8 can otherwise
+    # spend the entire output budget on reasoning and return empty content.
+    if payload.get("think") is False or LLM_MODEL.startswith("Qwen/Qwen3.8"):
         result["chat_template_kwargs"] = {"enable_thinking": False}
     return result
 

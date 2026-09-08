@@ -387,7 +387,8 @@ def llm_label() -> dict:
         "yandex": "YandexGPT",
     }
     model = str(config.get("model", LLM_MODEL))
-    return {"provider": provider, "model": model, "label": f"{provider_names.get(provider, provider)} · {model}"}
+    runtime = "vLLM" if provider == "ollama" and model.startswith("Qwen/Qwen3.8") else provider_names.get(provider, provider)
+    return {"provider": provider, "model": model, "label": f"{runtime} · {model}"}
 
 
 def ollama_models() -> list[str]:

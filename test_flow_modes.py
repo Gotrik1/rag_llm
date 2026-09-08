@@ -109,6 +109,13 @@ class FlowModeTests(unittest.TestCase):
         self.assertTrue(captured["payload"]["cache_cleared"])
         save.assert_called_once_with("hybrid")
 
+    def test_qwen38_compatibility_provider_is_labeled_as_vllm(self):
+        with patch.object(web_ui, "load_provider_config", return_value={
+            "provider": "ollama",
+            "model": "Qwen/Qwen3.8-27B",
+        }):
+            self.assertEqual(web_ui.llm_label()["label"], "vLLM · Qwen/Qwen3.8-27B")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -80,7 +80,7 @@ services:
     secrets:
       - postgres_password
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ${RAG_DATA_ROOT:-./.data/storage}/postgres:/var/lib/postgresql/data
     networks:
       - backend
     healthcheck:
@@ -103,7 +103,7 @@ services:
     secrets:
       - redis_password
     volumes:
-      - redis_data:/data
+      - ${RAG_DATA_ROOT:-./.data/storage}/redis:/data
     networks:
       - backend
     healthcheck:
@@ -125,7 +125,7 @@ services:
       QDRANT__STORAGE__STORAGE_PATH: /qdrant/storage
       QDRANT__TELEMETRY_DISABLED: "true"
     volumes:
-      - qdrant_data:/qdrant/storage
+      - ${RAG_DATA_ROOT:-./.data/storage}/qdrant:/qdrant/storage
     networks:
       - backend
     healthcheck:
@@ -154,8 +154,8 @@ services:
       <<: *app-environment
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
     volumes:
-      - app_data:/app/.data
-      - model_cache:/app/.fastembed_cache
+      - ${RAG_DATA_ROOT:-./.data/storage}/app:/app/.data
+      - ${RAG_DATA_ROOT:-./.data/storage}/model-cache:/app/.fastembed_cache
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -180,8 +180,8 @@ services:
       <<: *app-environment
       RAG_WORKER_CONCURRENCY: ${RAG_WORKER_CONCURRENCY:-2}
     volumes:
-      - app_data:/app/.data
-      - model_cache:/app/.fastembed_cache
+      - ${RAG_DATA_ROOT:-./.data/storage}/app:/app/.data
+      - ${RAG_DATA_ROOT:-./.data/storage}/model-cache:/app/.fastembed_cache
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -298,7 +298,7 @@ services:
     volumes:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./deploy/prometheus/rules:/etc/prometheus/rules:ro
-      - prometheus_data:/prometheus
+      - ${RAG_DATA_ROOT:-./.data/storage}/prometheus:/prometheus
     networks:
       - backend
     depends_on:
@@ -351,7 +351,7 @@ services:
     command: ["-config.file=/etc/tempo/tempo.yaml"]
     volumes:
       - ./deploy/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
-      - tempo_data:/var/tempo
+      - ${RAG_DATA_ROOT:-./.data/storage}/tempo:/var/tempo
     networks:
       - backend
     restart: unless-stopped
@@ -364,7 +364,7 @@ services:
     command: ["-config.file=/etc/loki/loki.yaml"]
     volumes:
       - ./deploy/loki/loki.yaml:/etc/loki/loki.yaml:ro
-      - loki_data:/loki
+      - ${RAG_DATA_ROOT:-./.data/storage}/loki:/loki
     networks:
       - backend
     restart: unless-stopped
@@ -378,7 +378,7 @@ services:
     volumes:
       - ./deploy/alloy/config.alloy:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - alloy_data:/var/lib/alloy
+      - ${RAG_DATA_ROOT:-./.data/storage}/alloy:/var/lib/alloy
     networks:
       - backend
     depends_on:
@@ -402,7 +402,7 @@ services:
     volumes:
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
-      - grafana_data:/var/lib/grafana
+      - ${RAG_DATA_ROOT:-./.data/storage}/grafana:/var/lib/grafana
     ports:
       - ${GRAFANA_BIND_ADDRESS:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000
     networks:
@@ -420,7 +420,7 @@ services:
     image: ollama/ollama:0.9.6
     profiles: ["local-llm"]
     volumes:
-      - ollama_data:/root/.ollama
+      - ${RAG_DATA_ROOT:-./.data/storage}/ollama:/root/.ollama
     ports:
       - 127.0.0.1:${OLLAMA_PORT:-11434}:11434
     networks:
@@ -438,7 +438,7 @@ services:
       OLLAMA_HOST: http://ollama:11434
     command: ["pull", "${LLM_MODEL:-qwen2.5:14b}"]
     volumes:
-      - ollama_data:/root/.ollama
+      - ${RAG_DATA_ROOT:-./.data/storage}/ollama:/root/.ollama
     networks:
       - backend
       - egress
@@ -453,7 +453,7 @@ services:
       OLLAMA_HOST: http://ollama:11434
     command: ["pull", "${EMBED_MODEL:-nomic-embed-text}"]
     volumes:
-      - ollama_data:/root/.ollama
+      - ${RAG_DATA_ROOT:-./.data/storage}/ollama:/root/.ollama
     networks:
       - backend
       - egress

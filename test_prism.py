@@ -85,14 +85,14 @@ class PrismQueryTests(unittest.TestCase):
             "noise": {"file": "other.md", "score": 0.05, "text": "irrelevant"},
         }
         nodes = [
-            Node("$$\nI = \\frac{U}{R}\n$$", {"file_name": "acceptance.md", "section_title": "Formula"}),
+            Node("$$\nI = \\frac{U}{R}\n$$", {"file_name": "4f424eaf3d7149b2a8d7d668e1e49836_acceptance.md", "section_title": "Formula"}),
             Node("$$\nX = Y\n$$", {"file_name": "unseen.md", "section_title": "Formula"}),
         ]
 
         siblings = formula_sibling_results(nodes, merged, "Приведи формулу тока")
 
         self.assertEqual(len(siblings), 1)
-        self.assertEqual(siblings[0]["file"], "acceptance.md")
+        self.assertTrue(siblings[0]["file"].endswith("_acceptance.md"))
         self.assertIn("formula-sibling", siblings[0]["matched_queries"])
 
     def test_explicit_section_rejects_other_sections_and_deleted_evidence(self):

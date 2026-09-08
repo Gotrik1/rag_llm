@@ -1135,6 +1135,15 @@ def formula_sibling_results(nodes: list, merged: dict[str, dict], question: str)
     if not is_formula_question(question) or not merged:
         return []
 
+    def canonical_source(value: object) -> str:
+        name = Path(str(value)).name.casefold()
+        # Uploaded files are persisted with one or more collision-safe UUID
+        # prefixes, while the vector payload and registry expose the user-facing
+        # basename. Treat both representations as the same source.
+        while re.match(r"^[0-9a-f]{32}_", name):
+            name = name[33:]
+        return name
+
     source_scores: dict[str, float] = {}
     normalized_question = re.sub(r"\s+", " ", question.strip().lower())
     for item in merged.values():
@@ -1144,12 +1153,12 @@ def formula_sibling_results(nodes: list, merged: dict[str, dict], question: str)
         }
         if normalized_question not in matched_queries:
             continue
-        source = Path(str(item.get("file", ""))).name.casefold()
+        source = canonical_source(item.get("file", ""))
         if source:
             source_scores[source] = max(source_scores.get(source, float("-inf")), float(item.get("score", 0.0)))
     if not source_scores:
         for item in merged.values():
-            source = Path(str(item.get("file", ""))).name.casefold()
+            source = canonical_source(item.get("file", ""))
             if source:
                 source_scores[source] = max(source_scores.get(source, float("-inf")), float(item.get("score", 0.0)))
     preferred_sources = {
@@ -1161,7 +1170,7 @@ def formula_sibling_results(nodes: list, merged: dict[str, dict], question: str)
         meta = node.metadata or {}
         text = node.text or ""
         source_name = meta.get("file_name", meta.get("file_path", "?"))
-        source = Path(str(source_name)).name.casefold()
+        source = canonical_source(source_name)
         if source not in preferred_sources:
             continue
         section = f"{meta.get('section_path', '')} {meta.get('section_title', '')}".lower()

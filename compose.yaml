@@ -80,7 +80,7 @@ services:
     secrets:
       - postgres_password
     volumes:
-      - ${RAG_DATA_ROOT:-./.data/storage}/postgres:/var/lib/postgresql/data
+      - ${RAG_DATA_ROOT:-./.data/storage}/postgres:/var/lib/postgresql/data:Z
     networks:
       - backend
     healthcheck:
@@ -103,7 +103,7 @@ services:
     secrets:
       - redis_password
     volumes:
-      - ${RAG_DATA_ROOT:-./.data/storage}/redis:/data
+      - ${RAG_DATA_ROOT:-./.data/storage}/redis:/data:Z
     networks:
       - backend
     healthcheck:
@@ -125,7 +125,7 @@ services:
       QDRANT__STORAGE__STORAGE_PATH: /qdrant/storage
       QDRANT__TELEMETRY_DISABLED: "true"
     volumes:
-      - ${RAG_DATA_ROOT:-./.data/storage}/qdrant:/qdrant/storage
+      - ${RAG_DATA_ROOT:-./.data/storage}/qdrant:/qdrant/storage:Z
     networks:
       - backend
     healthcheck:
@@ -154,8 +154,8 @@ services:
       <<: *app-environment
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
     volumes:
-      - ${RAG_DATA_ROOT:-./.data/storage}/app:/app/.data
-      - ${RAG_DATA_ROOT:-./.data/storage}/model-cache:/app/.fastembed_cache
+      - ${RAG_DATA_ROOT:-./.data/storage}/app:/app/.data:z
+      - ${RAG_DATA_ROOT:-./.data/storage}/model-cache:/app/.fastembed_cache:z
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -182,8 +182,8 @@ services:
       <<: *app-environment
       RAG_WORKER_CONCURRENCY: ${RAG_WORKER_CONCURRENCY:-2}
     volumes:
-      - ${RAG_DATA_ROOT:-./.data/storage}/app:/app/.data
-      - ${RAG_DATA_ROOT:-./.data/storage}/model-cache:/app/.fastembed_cache
+      - ${RAG_DATA_ROOT:-./.data/storage}/app:/app/.data:z
+      - ${RAG_DATA_ROOT:-./.data/storage}/model-cache:/app/.fastembed_cache:z
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -300,7 +300,7 @@ services:
     volumes:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./deploy/prometheus/rules:/etc/prometheus/rules:ro
-      - ${RAG_DATA_ROOT:-./.data/storage}/prometheus:/prometheus
+      - ${RAG_DATA_ROOT:-./.data/storage}/prometheus:/prometheus:Z
     networks:
       - backend
     depends_on:
@@ -353,7 +353,7 @@ services:
     command: ["-config.file=/etc/tempo/tempo.yaml"]
     volumes:
       - ./deploy/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
-      - ${RAG_DATA_ROOT:-./.data/storage}/tempo:/var/tempo
+      - ${RAG_DATA_ROOT:-./.data/storage}/tempo:/var/tempo:Z
     networks:
       - backend
     restart: unless-stopped
@@ -366,7 +366,7 @@ services:
     command: ["-config.file=/etc/loki/loki.yaml"]
     volumes:
       - ./deploy/loki/loki.yaml:/etc/loki/loki.yaml:ro
-      - ${RAG_DATA_ROOT:-./.data/storage}/loki:/loki
+      - ${RAG_DATA_ROOT:-./.data/storage}/loki:/loki:Z
     networks:
       - backend
     restart: unless-stopped
@@ -380,7 +380,7 @@ services:
     volumes:
       - ./deploy/alloy/config.alloy:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ${RAG_DATA_ROOT:-./.data/storage}/alloy:/var/lib/alloy
+      - ${RAG_DATA_ROOT:-./.data/storage}/alloy:/var/lib/alloy:Z
     networks:
       - backend
     depends_on:
@@ -404,7 +404,7 @@ services:
     volumes:
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
-      - ${RAG_DATA_ROOT:-./.data/storage}/grafana:/var/lib/grafana
+      - ${RAG_DATA_ROOT:-./.data/storage}/grafana:/var/lib/grafana:Z
     ports:
       - ${GRAFANA_BIND_ADDRESS:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000
     networks:
@@ -446,7 +446,7 @@ services:
     gpus: all
     ipc: host
     volumes:
-      - ${RAG_DATA_ROOT:-./.data/storage}/models:/root/.cache/huggingface
+      - ${RAG_DATA_ROOT:-./.data/storage}/models:/root/.cache/huggingface:Z
     networks:
       - backend
       - egress
@@ -473,7 +473,7 @@ services:
       FASTEMBED_CACHE_PATH: /data/fastembed
       LLM_REQUEST_TIMEOUT: ${LLM_REQUEST_TIMEOUT:-900}
     volumes:
-      - ${RAG_DATA_ROOT:-./.data/storage}/embeddings:/data/fastembed
+      - ${RAG_DATA_ROOT:-./.data/storage}/embeddings:/data/fastembed:Z
     networks:
       - backend
       - egress

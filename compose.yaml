@@ -476,6 +476,7 @@ services:
       - ${RAG_DATA_ROOT:-./.data/storage}/embeddings:/data/fastembed
     networks:
       - backend
+      - egress
     depends_on:
       vllm:
         condition: service_healthy

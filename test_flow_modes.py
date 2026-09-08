@@ -30,7 +30,7 @@ def context_item(prefix):
 
 
 class FlowModeTests(unittest.TestCase):
-    def invoke(self, mode):
+    def invoke(self, mode, include_chat=True):
         handler = object.__new__(web_ui.Handler)
         captured = {}
         handler.send_json = lambda payload, status=200: captured.update(payload=payload, status=status)
@@ -38,6 +38,7 @@ class FlowModeTests(unittest.TestCase):
         with patch.object(web_ui, "load_flow_mode", return_value=mode), \
              patch.object(web_ui, "get_agent", return_value=agent), \
              patch.object(web_ui, "get_profile", return_value={"prompt": "test", "id": "test"}), \
+             patch.object(web_ui, "get_workspace", return_value={"active_chat_id": "active-chat"}), \
              patch.object(web_ui, "get_project_conversation", return_value={"project_name": "test", "memory": {}, "messages": []}), \
              patch.object(web_ui, "validate_retrieval", return_value=[]), \
              patch.object(web_ui, "extract_formula_lines", return_value=[]), \
@@ -51,13 +52,22 @@ class FlowModeTests(unittest.TestCase):
                 with patch.object(web_ui, "rust_context", return_value=[context_item("rust")]):
                     handler.handle_ask({"question": "Что сказано?", "chat_id": "test-chat"})
             else:
-                handler.handle_ask({"question": "Что сказано?", "chat_id": "test-chat"})
+                body = {"question": "Что сказано?"}
+                if include_chat:
+                    body["chat_id"] = "test-chat"
+                handler.handle_ask(body)
         return captured, agent
 
     def test_python_mode_uses_only_python_flow(self):
         result, agent = self.invoke("python")
         self.assertEqual(result["payload"]["answer"], "python answer")
         self.assertEqual(result["payload"]["flow_mode"], "python")
+        self.assertIn(("ask", "Что сказано?"), agent.calls)
+
+    def test_missing_chat_id_uses_active_workspace_chat(self):
+        result, agent = self.invoke("python", include_chat=False)
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["payload"]["answer"], "python answer")
         self.assertIn(("ask", "Что сказано?"), agent.calls)
 
     def test_rust_mode_uses_rust_answer(self):

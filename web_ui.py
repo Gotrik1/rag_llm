@@ -1031,6 +1031,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "empty question"}, 400)
             return
         chat_id = str(body.get("chat_id", "")).strip()
+        if not chat_id:
+            workspace = get_workspace(*storage_defaults())
+            chat_id = str(workspace.get("active_chat_id") or "").strip()
+        if not chat_id:
+            self.send_json({"error": "active chat not found"}, 409)
+            return
         scope = get_project_conversation(chat_id)
         if scope is None:
             self.send_json({"error": "chat not found"}, 404)

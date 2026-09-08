@@ -1,7 +1,8 @@
 # Production readiness report
 
-Date: 2026-09-08. Branch: `dev`. This report describes the current checkout;
-the deployed VM revision must be recorded separately after deployment.
+Date: 2026-09-08. Branch: `dev`. The application release described below is
+deployed on VM `iprg001`; the remaining authentication gate is called out
+explicitly and prevents treating the Internet-facing endpoint as security-ready.
 
 ## Implemented in this hardening pass
 
@@ -16,9 +17,9 @@ the deployed VM revision must be recorded separately after deployment.
 | Project isolation | documents attached to other project/chats are filtered before reranking; exclusion set is part of cache key | scope unit tests |
 | Cache | exact Redis namespace/TTL retained; corpus and flow changes invalidate; scope affects key | response-cache and flow tests |
 | Grounding | prompt remains bounded to selected chunks; generalized beyond regulatory documents; textual source policy added | PRISM/prompt-injection contracts |
-| Formulas | KaTeX/MathJax rendering and existing deterministic formula extraction preserved | formula/PRISM tests + production UI build |
+| Formulas | KaTeX rendering, short Markdown/LaTeX equality extraction, and same-document formula sibling retrieval | formula/PRISM tests + real production browser |
 | Live API contract | `/api/openapi.json` now serves `app.openapi()` rather than the stale compatibility file | route contract/import test |
-| Deployment | Compose project normalized to `rag-assistant`; worker single-writer default; env and secret templates corrected | `docker compose -f compose.yaml config --quiet` |
+| Deployment | local Compose contract is `rag-assistant`; the existing VM project remains `rag-platform` to preserve named volumes; worker single-writer default and secret templates corrected | rendered Compose validation and live VM services |
 | Documentation | root README, current architecture/runbook, deploy inventory, detailed Russian user guide | link/path review |
 
 ## Test evidence
@@ -40,21 +41,31 @@ connection cleanup. Docker
 Desktop 4.71 still crashes in its optional Model Runner before the Engine starts,
 so the full Compose runtime remains a required VM acceptance gate.
 
-## Required VM acceptance evidence
+## VM deployment evidence
 
-Deployment is not complete until the report records:
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Target/release | passed | `iprg001`; `/opt/rag_llm/current` points to an immutable release; the exact revision and archive SHA-256 are recorded in root-only `/opt/rag_llm/shared/deployed-release.txt`; accepted application-code baseline is `941c499da` |
+| Release artifact | passed | release archive was built from tracked files with runtime data, generated artifacts and secrets explicitly excluded; hash was verified before extraction |
+| Backup/rollback | passed | latest backup `/opt/rag_llm/shared/backups/pre-941c499da-20260908T200340Z`; PostgreSQL dump, Qdrant snapshot, app-data archive and `SHA256SUMS`; two deliberately triggered gates proved automatic rollback before final activation |
+| Migrations/services | passed | migration container exited successfully; app/proxy/LLM bridge healthy; PostgreSQL, Redis, Qdrant, ingestion worker, generation worker, vLLM and telemetry containers running |
+| Health | passed | internal HTTP and external TLS `/healthz` both return `{"status":"ok"}` |
+| Dependencies/tests | passed | final image `pip check`: no broken requirements; final image `93` unit/contract tests passed, `7` environment-dependent integration/live-model tests skipped |
+| Durable generation | passed | a queued answer survived browser refresh and an API/worker replacement, then completed in its original chat |
+| Concurrent chats | passed with automated contract evidence | server-owned two-chat test passes; UI keeps independent chat state and lists several project chats concurrently |
+| Upload/registry/source | passed | Markdown acceptance file became `ready` with 4 chunks; UI shows it under “Документы в памяти”; the original is available through its document-content link |
+| Retrieval/formulas | passed | clean production chat returned `NEBULA-742`, `I = U/R`, and `I = 3 A`; answer cites both `Unique fact` and `Formula`; browser accessibility tree contains real KaTeX `math` nodes |
+| Queues | passed | default, ingestion and generation ARQ queue lengths are all zero after acceptance; ingestion and generation use distinct queue names |
+| Cache | passed at contract level | namespace/TTL, scope key, flow invalidation and corpus invalidation tests pass; a separate live repeat/mutation benchmark was not run because chat history intentionally changes the grounded cache key |
+| Project isolation | passed at integration-contract level | cross-project exclusion test passes; a destructive live two-project corpus mutation was not performed on the retained VM data |
+| Observability | partially verified | Prometheus, Grafana, Loki, Tempo, Alloy and OpenTelemetry containers are running; dashboard contents and alert delivery were not manually certified in this pass |
+| Authentication | **blocked** | VM currently has `RAG_AUTH_MODE=development` and no OIDC issuer; requests receive the development bootstrap superadmin identity. This is unacceptable for an open production endpoint. |
 
-- target hostname/install directory and deployed Git SHA/image IDs;
-- migration completion and healthy Compose service list;
-- authenticated `/healthz`, `/readyz`, document upload/job, source download;
-- refresh-during-generation result persistence;
-- two simultaneous chats with correct placement;
-- two-project source-isolation test;
-- formula and table rendering in a real browser;
-- exact cache hit and corpus-change miss;
-- backup artifact/checksum and rollback image/reference;
-- final Python/PostgreSQL integration test counts;
-- Grafana/Prometheus/Loki/Tempo verification.
+The technical rollout is complete and rollback-ready, but security acceptance is
+not complete until the operator supplies the corporate OIDC issuer, audience,
+JWKS URL and bootstrap subject, switches `RAG_AUTH_MODE=oidc`, and verifies RBAC
+with both an allowed and a denied user. No credential from the VM access document
+was reused as an application password.
 
 ## Residual risks and scaling triggers
 
@@ -72,3 +83,6 @@ Deployment is not complete until the report records:
    before claiming the score for the real corpus.
 5. Rust currently has compilation coverage but no unit tests; production should
    add retrieval/cache protocol tests before making Rust the default flow.
+6. The Qdrant Python client is `1.19.0` while the server is `1.17.1`; the client
+   warns that the minor-version gap exceeds its compatibility policy. Pin or
+   upgrade the pair together in the next maintenance release.

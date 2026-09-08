@@ -421,7 +421,6 @@ services:
   vllm:
     image: vllm/vllm-openai:v0.17.0
     command:
-      - serve
       - ${VLLM_MODEL:-Qwen/Qwen3.8-27B}
       - --host
       - 0.0.0.0

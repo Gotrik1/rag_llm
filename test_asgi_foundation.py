@@ -1,8 +1,14 @@
+import asyncio
+import threading
 import unittest
-from unittest.mock import AsyncMock, patch
+import tempfile
+from contextlib import suppress
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
 
+import asgi_app
 from asgi_app import app
 
 
@@ -21,6 +27,14 @@ class AsgiFoundationTests(unittest.TestCase):
         self.assertEqual(metrics.status_code, 200)
         self.assertIn("rag_http_requests_total", metrics.text)
 
+    def test_live_openapi_schema_includes_production_routes(self):
+        response = self.client.get("/api/openapi.json")
+        self.assertEqual(response.status_code, 200)
+        paths = response.json()["paths"]
+        self.assertIn("/api/ask", paths)
+        self.assertIn("/api/upload", paths)
+        self.assertIn("/api/projects/{project_id}/documents", paths)
+
     def test_development_bootstrap_is_superadmin(self):
         response = self.client.get("/api/me")
         self.assertEqual(response.status_code, 200)
@@ -38,6 +52,49 @@ class AsgiFoundationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), payload)
         ask.assert_called_once_with("Test question")
+
+    def test_ask_persists_server_owned_assistant_message(self):
+        payload = {"answer": "persistent answer", "html_answer": "<p>persistent answer</p>", "flow_mode": "python"}
+        created = {"id": "message-1"}
+        with patch("asgi_app.create_message", return_value=created) as create_message, \
+             patch("asgi_app.update_message", return_value={}) as update_message, \
+             patch("asgi_app.run_ask", return_value=payload):
+            response = self.client.post("/api/ask", json={"question": "Test question", "chat_id": "chat-1"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["message_id"], "message-1")
+        create_message.assert_called_once()
+        self.assertEqual(update_message.call_args.args[1]["status"], "complete")
+
+    def test_server_owned_generation_survives_client_waiter_cancellation(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_ask(_payload):
+            started.set()
+            self.assertTrue(release.wait(2))
+            return {"answer": "done", "html_answer": "<p>done</p>", "flow_mode": "python"}
+
+        async def scenario():
+            generation = asyncio.create_task(
+                asgi_app._run_and_persist_ask({"question": "test", "chat_id": "chat-1"}, {"id": "message-1"})
+            )
+
+            async def client_waiter():
+                return await asyncio.shield(generation)
+
+            waiter = asyncio.create_task(client_waiter())
+            self.assertTrue(await asyncio.to_thread(started.wait, 1))
+            waiter.cancel()
+            with suppress(asyncio.CancelledError):
+                await waiter
+            release.set()
+            return await generation
+
+        with patch("asgi_app.run_ask", side_effect=slow_ask), \
+             patch("asgi_app.update_message", return_value={}) as update_message:
+            result = asyncio.run(scenario())
+        self.assertEqual(result["message_id"], "message-1")
+        self.assertEqual(update_message.call_args.args[1]["status"], "complete")
 
     def test_sse_stream_emits_answer_deltas_and_completion(self):
         payload = {"answer": "streamed answer", "html_answer": "ignored", "flow_mode": "python"}
@@ -66,6 +123,33 @@ class AsgiFoundationTests(unittest.TestCase):
             self.assertEqual(created.status_code, 202)
             status = self.client.get(f"/api/jobs/{created.json()['id']}")
         self.assertEqual(status.json()["status"], "queued")
+
+    def test_upload_is_persisted_and_queued_for_project(self):
+        queued = {"id": "job-1", "kind": "ingestion", "status": "queued", "progress": 0}
+        document = {"id": "document-1"}
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("asgi_app.UPLOAD_DIR", Path(directory)), \
+             patch("asgi_app.create_document", return_value=document) as create_document, \
+             patch("asgi_app.update_document", return_value=document), \
+             patch.object(__import__("asgi_app").jobs, "submit", AsyncMock(return_value=queued)) as submit:
+            response = self.client.post(
+                "/api/upload",
+                data={"project_id": "project-1", "chat_id": "chat-1"},
+                files={"files": ("manual.md", b"# Manual\nUseful content", "text/markdown")},
+            )
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["files"][0]["job_id"], "job-1")
+        self.assertEqual(create_document.call_args.args[0], "project-1")
+        self.assertEqual(create_document.call_args.args[1], "chat-1")
+        self.assertEqual(submit.await_args.args[1]["document_id"], "document-1")
+
+    def test_project_document_registry_is_exposed(self):
+        items = [{"id": "document-1", "file_name": "manual.pdf", "status": "ready"}]
+        with patch("asgi_app.list_documents", return_value=items) as list_documents:
+            response = self.client.get("/api/projects/project-1/documents")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["items"], items)
+        list_documents.assert_called_once_with("project-1", None)
 
 
 if __name__ == "__main__":

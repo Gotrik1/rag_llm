@@ -1,4 +1,4 @@
-name: rag-platform
+name: rag-assistant
 
 x-common-logging: &common-logging
   driver: json-file
@@ -180,7 +180,7 @@ services:
     command: ["worker"]
     environment:
       <<: *app-environment
-      RAG_WORKER_CONCURRENCY: ${RAG_WORKER_CONCURRENCY:-2}
+      RAG_WORKER_CONCURRENCY: ${RAG_WORKER_CONCURRENCY:-1}
     volumes:
       - ${RAG_DATA_ROOT:-./.data/storage}/app:/app/.data:z
       - ${RAG_DATA_ROOT:-./.data/storage}/model-cache:/app/.fastembed_cache:z

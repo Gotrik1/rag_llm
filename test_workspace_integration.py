@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import unittest
 import uuid
@@ -13,6 +14,7 @@ import db_store
 from web_ui import Handler
 
 
+@unittest.skipUnless(os.environ.get("DATABASE_URL"), "DATABASE_URL is required for PostgreSQL integration tests")
 class WorkspacePersistenceIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

@@ -26,12 +26,14 @@ from db_store import (
     delete_chat,
     delete_message,
     delete_project,
+    document_sources,
     get_chat,
     get_project_conversation,
     get_message,
     get_project,
     get_workspace,
     list_chats,
+    list_documents,
     list_messages,
     list_projects,
     rollback_transaction,
@@ -220,6 +222,56 @@ def contextualize_retrieval_question(question: str, scope: dict, chat_id: str) -
             continue
         return f"Предыдущий вопрос: {content[:1000]}\nУточняющий вопрос: {question}"
     return question
+
+
+def enrich_source_links(sources: list[dict]) -> list[dict]:
+    """Attach stable download URLs and restore user-facing upload names."""
+    try:
+        records = document_sources([str(source.get("file", "")) for source in sources])
+    except Exception:
+        # Retrieval remains available during a temporary PostgreSQL incident.
+        return sources
+    enriched: list[dict] = []
+    for source in sources:
+        item = dict(source)
+        record = records.get(str(source.get("file", "")))
+        if record:
+            item["file"] = str(record.get("file_name") or item.get("file", ""))
+            item["document_id"] = str(record["id"])
+            item["url"] = f"/api/documents/{record['id']}/content"
+        enriched.append(item)
+    return enriched
+
+
+def excluded_document_sources(scope: dict, chat_id: str) -> set[str]:
+    """Hide documents attached to other projects/chats while keeping global corpora."""
+    try:
+        records = list_documents()
+    except Exception:
+        return set()
+    current_project = str(scope.get("project_id") or "")
+    excluded: set[str] = set()
+    for record in records:
+        document_project = str(record.get("project_id") or "")
+        document_chat = str(record.get("chat_id") or "")
+        if not document_project and not document_chat:
+            continue
+        is_visible = bool(current_project and document_project == current_project) or document_chat == chat_id
+        if not is_visible:
+            for field in ("source_path", "file_name"):
+                value = str(record.get(field) or "").strip()
+                if value:
+                    excluded.add(Path(value).name.casefold())
+    return excluded
+
+
+def filter_scoped_context(items: list[dict], excluded_sources: set[str]) -> list[dict]:
+    if not excluded_sources:
+        return items
+    return [
+        item for item in items
+        if Path(str(item.get("file", ""))).name.casefold() not in excluded_sources
+    ]
 
 
 def save_flow_mode(mode: str) -> None:
@@ -1067,41 +1119,53 @@ class Handler(BaseHTTPRequestHandler):
         if scope is None:
             self.send_json({"error": "chat not found"}, 404)
             return
+        excluded_sources = excluded_document_sources(scope, chat_id)
 
         mode = load_flow_mode()
         agent = get_agent()
         retrieval_question = contextualize_retrieval_question(question, scope, chat_id)
         t0 = time.time()
-        with _request_lock:
-            profile = get_profile(load_system_prompt_id(), GROUNDED_SYSTEM_PROMPT)
-            scoped_prompt = f"{profile['prompt']}\n\n{project_context_prompt(scope)}"
-            if mode == "python":
-                answer, sources, from_cache = agent.ask(
-                    question, scoped_prompt, profile["id"], retrieval_query=retrieval_question
-                )
-                context = agent.retrieve_context(retrieval_question, TOP_K)
-            elif mode == "rust":
-                python_items = agent.retrieve_context(retrieval_question, TOP_K)
-                rust_items = filter_rust_context(retrieval_question, rust_context(retrieval_question))
-                context = fuse_contexts(python_items, rust_items, TOP_K)
-                rust_result = rust_generate(question, context, project_context_prompt(scope))
-                if isinstance(rust_result, tuple):
-                    answer, from_cache = rust_result
-                else:  # Keeps the callable easy to mock in contract tests.
-                    answer, from_cache = str(rust_result), False
-                sources = [{
-                    "file": item["file"], "section": item.get("section_path", ""), "score": item["score"],
-                    "text_preview": item["text"][:120],
-                } for item in context]
-            else:
-                python_items = agent.retrieve_context(retrieval_question, TOP_K)
-                rust_items = filter_rust_context(retrieval_question, rust_context(retrieval_question))
-                context = fuse_contexts(python_items, rust_items, TOP_K)
-                spec = refine_prism_query(question)
-                calculations = extract_formula_lines(context, question)
-                answer = agent._generate_grounded_answer(question, context, calculations, spec, scoped_prompt)
-                from_cache = bool(getattr(agent, "_last_generation_from_cache", False))
-                sources = [{"file": item["file"], "section": item.get("section_path", ""), "score": item["score"], "text_preview": item["text"][:120]} for item in context]
+        profile = get_profile(load_system_prompt_id(), GROUNDED_SYSTEM_PROMPT)
+        scoped_prompt = f"{profile['prompt']}\n\n{project_context_prompt(scope)}"
+        if mode == "python":
+            ask_options = {"retrieval_query": retrieval_question}
+            if excluded_sources:
+                ask_options["excluded_sources"] = excluded_sources
+            answer, sources, from_cache = agent.ask(question, scoped_prompt, profile["id"], **ask_options)
+            context = agent.retrieve_context(
+                retrieval_question, TOP_K, excluded_sources=excluded_sources
+            ) if excluded_sources else agent.retrieve_context(retrieval_question, TOP_K)
+        elif mode == "rust":
+            python_items = agent.retrieve_context(
+                retrieval_question, TOP_K, excluded_sources=excluded_sources
+            ) if excluded_sources else agent.retrieve_context(retrieval_question, TOP_K)
+            rust_items = filter_scoped_context(
+                filter_rust_context(retrieval_question, rust_context(retrieval_question)), excluded_sources
+            )
+            context = fuse_contexts(python_items, rust_items, TOP_K)
+            rust_result = rust_generate(question, context, project_context_prompt(scope))
+            if isinstance(rust_result, tuple):
+                answer, from_cache = rust_result
+            else:  # Keeps the callable easy to mock in contract tests.
+                answer, from_cache = str(rust_result), False
+            sources = [{
+                "file": item["file"], "section": item.get("section_path", ""), "score": item["score"],
+                "text_preview": item["text"][:120],
+            } for item in context]
+        else:
+            python_items = agent.retrieve_context(
+                retrieval_question, TOP_K, excluded_sources=excluded_sources
+            ) if excluded_sources else agent.retrieve_context(retrieval_question, TOP_K)
+            rust_items = filter_scoped_context(
+                filter_rust_context(retrieval_question, rust_context(retrieval_question)), excluded_sources
+            )
+            context = fuse_contexts(python_items, rust_items, TOP_K)
+            spec = refine_prism_query(question)
+            calculations = extract_formula_lines(context, question)
+            answer = agent._generate_grounded_answer(question, context, calculations, spec, scoped_prompt)
+            from_cache = bool(getattr(agent, "last_generation_from_cache", False))
+            sources = [{"file": item["file"], "section": item.get("section_path", ""), "score": item["score"], "text_preview": item["text"][:120]} for item in context]
+        sources = enrich_source_links(sources)
         formulas = extract_formula_lines(context, question)
         warnings = validate_retrieval(question, context, answer)
         self.send_json({

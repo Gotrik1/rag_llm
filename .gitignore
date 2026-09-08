@@ -4,6 +4,8 @@ ui/dist/
 ui/.vite/
 ui/node_modules/.tmp/
 .venv
+.test-venv/
+.codebase-memory/
 .env
 bm25_index*/
 tantivy_index/

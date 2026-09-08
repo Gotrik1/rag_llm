@@ -64,6 +64,7 @@ type ChatEntry = {
 
 type ApiSource = {
   file: string;
+  url?: string;
   section?: string;
   score: number;
   text_preview?: string;
@@ -88,6 +89,7 @@ type ApiContextChunk = {
 
 type AskResponse = {
   answer: string;
+  message_id?: string;
   html_answer?: string;
   from_cache: boolean;
   elapsed_s: number;
@@ -113,11 +115,24 @@ type DebugResponse = {
 
 type UploadResponse = {
   chunks: number;
+  queued?: boolean;
   files: {
+    id: string;
     file: string;
-    stored_path: string;
-    chunks: number;
+    job_id: string;
+    status: string;
+    url: string;
+    size_bytes: number;
   }[];
+};
+
+type DocumentRecord = {
+  id: string;
+  file_name: string;
+  status: "queued" | "processing" | "ready" | "failed" | "cancelled";
+  processing_state?: { job_id?: string; progress?: number; error?: string };
+  metadata?: { chunks?: number; size_bytes?: number };
+  created_at?: string;
 };
 
 type ModelsResponse = {
@@ -345,7 +360,7 @@ function useMathTypeset(html?: string) {
 
 export function App() {
   const [messages, setMessages] = useState<ChatEntry[]>([]);
-  const [isRunning, setIsRunning] = useState(false);
+  const [runningChatIds, setRunningChatIds] = useState<string[]>([]);
   const [lastResult, setLastResult] = useState<AskResponse | null>(null);
   const [lastQuestion, setLastQuestion] = useState("");
   const [debugResult, setDebugResult] = useState<DebugResponse | null>(null);
@@ -356,12 +371,16 @@ export function App() {
   const [activeProjectId, setActiveProjectId] = useState("");
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [activeChatId, setActiveChatId] = useState("");
+  const activeChatIdRef = useRef("");
   const [workspaceSettings, setWorkspaceSettings] = useState<Record<string, unknown>>({});
   const [workspaceError, setWorkspaceError] = useState("");
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [uploadResult, setUploadResult] = useState<UploadResponse | null>(null);
   const [uploadError, setUploadError] = useState("");
   const [isUploading, setIsUploading] = useState(false);
+  const [documents, setDocuments] = useState<DocumentRecord[]>([]);
+  const [documentsError, setDocumentsError] = useState("");
+  const [isLoadingDocuments, setIsLoadingDocuments] = useState(false);
   const [models, setModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState("");
   const [modelError, setModelError] = useState("");
@@ -374,6 +393,12 @@ export function App() {
   const activeProject = activeProjectId
     ? projects.find((project) => project.id === activeProjectId) ?? DEFAULT_PROJECT
     : FREE_CHAT_WORKSPACE;
+  const isRunning = Boolean(activeChatId && runningChatIds.includes(activeChatId));
+  const hasRunningChats = runningChatIds.length > 0;
+
+  useEffect(() => {
+    activeChatIdRef.current = activeChatId;
+  }, [activeChatId]);
 
   useEffect(() => {
     window.localStorage.setItem(THEME_KEY, theme);
@@ -395,6 +420,26 @@ export function App() {
   const loadMessages = useCallback(async (chatId: string) => {
     const data = await getJson<{ items: MessageRecord[] }>(`/api/chats/${chatId}/messages`, API_TIMEOUT_MS);
     setMessages(data.items.map(messageFromRecord));
+  }, []);
+
+  const loadDocuments = useCallback(async (projectId: string, chatId: string) => {
+    if (!projectId && !chatId) {
+      setDocuments([]);
+      return;
+    }
+    setIsLoadingDocuments(true);
+    setDocumentsError("");
+    try {
+      const path = projectId
+        ? `/api/projects/${projectId}/documents`
+        : `/api/documents?chat_id=${encodeURIComponent(chatId)}`;
+      const data = await getJson<{ items: DocumentRecord[] }>(path, API_TIMEOUT_MS);
+      setDocuments(data.items);
+    } catch (error) {
+      setDocumentsError(error instanceof Error ? error.message : "Не удалось загрузить список документов");
+    } finally {
+      setIsLoadingDocuments(false);
+    }
   }, []);
 
   const syncWorkspace = useCallback(async (projectId: string | null, chatId: string) => {
@@ -450,8 +495,12 @@ export function App() {
     void loadWorkspace();
   }, [loadModels, loadWorkspace]);
 
+  useEffect(() => {
+    void loadDocuments(activeProjectId, activeChatId);
+  }, [activeChatId, activeProjectId, loadDocuments]);
+
   const changeModel = useCallback(async (model: string) => {
-    if (!model || model === selectedModel || isChangingModel || isRunning) return;
+    if (!model || model === selectedModel || isChangingModel || hasRunningChats) return;
     setIsChangingModel(true);
     setModelError("");
     try {
@@ -462,7 +511,7 @@ export function App() {
     } finally {
       setIsChangingModel(false);
     }
-  }, [isChangingModel, isRunning, selectedModel]);
+  }, [hasRunningChats, isChangingModel, selectedModel]);
 
   const createChat = useCallback(async (projectId: string) => {
     const record = await postJson<ChatRecord>(`/api/projects/${projectId}/chats`, { title: "Новый чат" }, API_TIMEOUT_MS);
@@ -642,6 +691,7 @@ export function App() {
   const onNew = useCallback(async (message: AppendMessage) => {
     const question = extractText(message);
     if (!question || !activeChatId) return;
+    const requestChatId = activeChatId;
 
     const userMessage: ChatEntry = {
       id: createId(),
@@ -658,7 +708,7 @@ export function App() {
     };
 
     setMessages((current) => [...current, userMessage, assistantMessage]);
-    setIsRunning(true);
+    setRunningChatIds((current) => current.includes(requestChatId) ? current : [...current, requestChatId]);
     setLastResult(null);
     setLastQuestion(question);
     setDebugResult(null);
@@ -666,59 +716,35 @@ export function App() {
     setActiveTab("system");
 
     try {
-      await postJson<MessageRecord>(`/api/chats/${activeChatId}/messages`, { role: "user", content: question }, API_TIMEOUT_MS);
-      const data = await postJson<AskResponse>("/api/ask", { question, chat_id: activeChatId }, ASK_TIMEOUT_MS);
-      await postJson<MessageRecord>(`/api/chats/${activeChatId}/messages`, {
-        role: "assistant",
-        content: data.answer || "Пустой ответ.",
-        content_html: data.html_answer || "",
-        status: "complete",
-        metadata: { model_label: data.llm?.label, sources: data.sources, usage: data.usage }
-      }, API_TIMEOUT_MS);
+      await postJson<MessageRecord>(`/api/chats/${requestChatId}/messages`, { role: "user", content: question }, API_TIMEOUT_MS);
+      const data = await postJson<AskResponse>("/api/ask", { question, chat_id: requestChatId }, ASK_TIMEOUT_MS);
 
-      const currentChat = chats.find((chat) => chat.id === activeChatId);
+      const currentChat = chats.find((chat) => chat.id === requestChatId);
       if (currentChat && currentChat.title === "Новый чат") {
         const title = question.slice(0, 48);
-        await patchJson<ChatRecord>(`/api/chats/${activeChatId}`, { title }, API_TIMEOUT_MS);
-        setChats((current) => current.map((chat) => chat.id === activeChatId ? { ...chat, title } : chat));
+        await patchJson<ChatRecord>(`/api/chats/${requestChatId}`, { title }, API_TIMEOUT_MS);
+        setChats((current) => current.map((chat) => chat.id === requestChatId ? { ...chat, title } : chat));
       }
 
-      setLastResult(data);
-      setMessages((current) =>
-        current.map((item) =>
-          item.id === assistantId
-            ? {
-                ...item,
-                text: data.answer || "Пустой ответ.",
-                html: data.html_answer,
-                modelLabel: data.llm?.label,
-                status: "complete"
-              }
-            : item
-        )
-      );
+      if (activeChatIdRef.current === requestChatId) {
+        setLastResult(data);
+        await loadMessages(requestChatId);
+      }
     } catch (error) {
       const text = error instanceof Error ? error.message : "Ошибка запроса";
-      void postJson<MessageRecord>(`/api/chats/${activeChatId}/messages`, {
-        role: "assistant",
-        content: text,
-        status: "error"
-      }, API_TIMEOUT_MS).catch(() => undefined);
-      setMessages((current) =>
-        current.map((item) =>
-          item.id === assistantId
-            ? {
-                ...item,
-                text,
-                status: "error"
-              }
-            : item
-        )
-      );
+      if (activeChatIdRef.current === requestChatId) {
+        try {
+          await loadMessages(requestChatId);
+        } catch {
+          setMessages((current) =>
+            current.map((item) => item.id === assistantId ? { ...item, text, status: "error" } : item)
+          );
+        }
+      }
     } finally {
-      setIsRunning(false);
+      setRunningChatIds((current) => current.filter((chatId) => chatId !== requestChatId));
     }
-  }, [activeChatId, chats]);
+  }, [activeChatId, chats, loadMessages]);
 
   const adapter = useMemo<ExternalStoreAdapter<ChatEntry>>(
     () => ({
@@ -761,6 +787,8 @@ export function App() {
     if (!selectedFiles.length || isUploading) return;
     const form = new FormData();
     selectedFiles.forEach((file) => form.append("files", file));
+    if (activeProjectId) form.append("project_id", activeProjectId);
+    if (activeChatId) form.append("chat_id", activeChatId);
 
     setIsUploading(true);
     setUploadError("");
@@ -770,12 +798,20 @@ export function App() {
       const data = await postFormData<UploadResponse>("/api/upload", form, UPLOAD_TIMEOUT_MS);
       setUploadResult(data);
       setSelectedFiles([]);
+      await loadDocuments(activeProjectId, activeChatId);
+      const pendingJobs = data.files.map((file) => file.job_id).filter(Boolean);
+      for (let attempt = 0; attempt < 150 && pendingJobs.length; attempt += 1) {
+        const states = await Promise.all(pendingJobs.map((jobId) => getJson<{ status: string }>(`/api/jobs/${jobId}`, API_TIMEOUT_MS)));
+        if (states.every((state) => ["completed", "failed", "cancelled"].includes(state.status))) break;
+        await new Promise((resolve) => window.setTimeout(resolve, 2_000));
+      }
+      await loadDocuments(activeProjectId, activeChatId);
     } catch (error) {
       setUploadError(error instanceof Error ? error.message : "Ошибка загрузки файлов");
     } finally {
       setIsUploading(false);
     }
-  }, [isUploading, selectedFiles]);
+  }, [activeChatId, activeProjectId, isUploading, loadDocuments, selectedFiles]);
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
@@ -831,7 +867,7 @@ export function App() {
           isDebugging={isDebugging}
           isChangingModel={isChangingModel}
           isLoadingModels={isLoadingModels}
-          isRunning={isRunning}
+          isRunning={hasRunningChats}
           lastQuestion={lastQuestion}
           modelError={modelError}
           models={models}
@@ -840,6 +876,9 @@ export function App() {
           onChangeModel={changeModel}
           onDebug={runDebug}
           error={uploadError}
+          documents={documents}
+          documentsError={documentsError}
+          isLoadingDocuments={isLoadingDocuments}
           isUploading={isUploading}
           onProviderSettingsChange={setActiveProvider}
           onProjectMemoryChange={(memory) => void updateProjectMemory(memory)}
@@ -1404,6 +1443,9 @@ function ModelSelector({
 
 function KnowledgeLoader({
   error,
+  documents,
+  documentsError,
+  isLoadingDocuments,
   isUploading,
   result,
   selectedFiles,
@@ -1411,6 +1453,9 @@ function KnowledgeLoader({
   onUpload
 }: {
   error: string;
+  documents: DocumentRecord[];
+  documentsError: string;
+  isLoadingDocuments: boolean;
   isUploading: boolean;
   result: UploadResponse | null;
   selectedFiles: File[];
@@ -1463,7 +1508,7 @@ function KnowledgeLoader({
       {result ? (
         <div className="upload-status success">
           <CheckCircle2 size={14} />
-          <span>{result.files.length} файл(ов), {result.chunks} чанков</span>
+          <span>{result.files.length} файл(ов) поставлено в очередь</span>
         </div>
       ) : null}
       {error ? (
@@ -1472,6 +1517,39 @@ function KnowledgeLoader({
           <span>{error}</span>
         </div>
       ) : null}
+      <div className="memory-documents" aria-live="polite">
+        <div className="memory-documents-heading">
+          <span>Документы в памяти</span>
+          <span>{documents.length}</span>
+        </div>
+        {isLoadingDocuments ? <div className="loader-muted">Обновляем список…</div> : null}
+        {documentsError ? (
+          <div className="upload-status error"><AlertTriangle size={14} /><span>{documentsError}</span></div>
+        ) : null}
+        {!isLoadingDocuments && !documentsError && !documents.length ? (
+          <div className="loader-muted">В этом проекте пока нет документов.</div>
+        ) : null}
+        {documents.map((document) => (
+          <a
+            className="memory-document"
+            href={`/api/documents/${document.id}/content`}
+            key={document.id}
+            rel="noreferrer"
+            target="_blank"
+            title={document.file_name}
+          >
+            <FileText size={13} />
+            <span className="memory-document-name">{document.file_name}</span>
+            <span className={`memory-document-status ${document.status}`}>
+              {document.status === "ready"
+                ? `${document.metadata?.chunks ?? 0} чанков`
+                : document.status === "processing"
+                  ? `${document.processing_state?.progress ?? 0}%`
+                  : document.status}
+            </span>
+          </a>
+        ))}
+      </div>
     </section>
   );
 }
@@ -1699,7 +1777,10 @@ function EvidencePanel({
   onRefreshModels,
   onTabChange,
   onThemeChange,
+  documents,
+  documentsError,
   error,
+  isLoadingDocuments,
   isUploading,
   selectedFiles,
   uploadResult,
@@ -1728,7 +1809,10 @@ function EvidencePanel({
   onRefreshModels: () => void;
   onTabChange: (tab: PanelTab) => void;
   onThemeChange: (theme: AppTheme) => void;
+  documents: DocumentRecord[];
+  documentsError: string;
   error: string;
+  isLoadingDocuments: boolean;
   isUploading: boolean;
   selectedFiles: File[];
   uploadResult: UploadResponse | null;
@@ -1814,7 +1898,10 @@ function EvidencePanel({
             />
           ) : null}
           <KnowledgeLoader
+            documents={documents}
+            documentsError={documentsError}
             error={error}
+            isLoadingDocuments={isLoadingDocuments}
             isUploading={isUploading}
             result={uploadResult}
             selectedFiles={selectedFiles}
@@ -1921,7 +2008,11 @@ function SourcesPanel({ result }: { result: AskResponse }) {
           <div className="source-item" key={`${source.file}-${index}`}>
             <div className="source-file">
               <FileText size={14} />
-              <span>{source.file}</span>
+              {source.url ? (
+                <a href={source.url} rel="noreferrer" target="_blank">{source.file}</a>
+              ) : (
+                <span>{source.file}</span>
+              )}
             </div>
             <div className="source-meta">
               {source.section ? <span>{source.section}</span> : null}

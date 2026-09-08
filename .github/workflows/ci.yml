@@ -20,17 +20,17 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.docker.txt
 
       - name: Check Python syntax
-        run: python -m py_compile web_ui.py db_store.py rag_agent.py response_cache.py document_ingestion.py docx_parser.py
+        run: python -m compileall -q asgi_app.py web_ui.py db_store.py rag_agent.py response_cache.py document_ingestion.py docx_parser.py ingestion_worker.py ingestion_task.py
 
       - name: Run Python tests
-        run: python -m unittest test_response_cache.py test_flow_modes.py test_prism.py
+        run: python -m unittest discover -v
 
       - name: Validate Compose configuration
         run: docker compose config -q
@@ -97,11 +97,11 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
 
       - name: Install backend dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.docker.txt
 
       - name: Apply migrations and create default workspace
         run: python -c "import db_store; db_store.run_migrations(); db_store.get_workspace('python', 'ollama', 'qwen2.5:14b')"
@@ -119,5 +119,5 @@ jobs:
           c=ResponseCache(); c.set('ci-smoke', {'answer':'ok','sources':[]});
           assert c.get('ci-smoke')['answer']=='ok'; c.clear()"
 
-      - name: Run workspace API integration tests
-        run: python -m unittest test_workspace_integration.py
+      - name: Run backend tests with PostgreSQL and Redis
+        run: python -m unittest discover -v

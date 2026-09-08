@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from jobs import JobQueue
+from ingestion_worker import ingest_document_job
 
 
 class JobQueueTests(unittest.IsolatedAsyncioTestCase):
@@ -18,6 +19,23 @@ class JobQueueTests(unittest.IsolatedAsyncioTestCase):
 
         arq_job.abort.assert_awaited_once_with()
         store.update_job.assert_called_once()
+
+    async def test_worker_cancellation_updates_document_registry(self) -> None:
+        store = Mock()
+        store.get_job.return_value = {"cancel_requested": True}
+
+        with patch("ingestion_worker.get_store", return_value=store), \
+             patch("ingestion_worker.update_document", return_value={}) as update_document:
+            result = await ingest_document_job(
+                {},
+                "job-1",
+                {"document_id": "document-1", "path": "manual.pdf"},
+            )
+
+        self.assertEqual(result, {"cancelled": True})
+        store.update_job.assert_called_once_with("job-1", status="cancelled", finished_at=unittest.mock.ANY)
+        self.assertEqual(update_document.call_args.args[0], "document-1")
+        self.assertEqual(update_document.call_args.args[1]["status"], "cancelled")
 
 
 if __name__ == "__main__":

@@ -9,13 +9,15 @@ class FakeAgent:
     def __init__(self):
         self.calls = []
 
-    def ask(self, question, prompt, prompt_id, retrieval_query=None):
+    def ask(self, question, prompt, prompt_id, retrieval_query=None, excluded_sources=None):
         self.calls.append(("ask", question))
         if retrieval_query is not None:
             self.calls.append(("retrieval_query", retrieval_query))
+        if excluded_sources:
+            self.calls.append(("excluded_sources", excluded_sources))
         return "python answer", [{"file": "python.docx", "section": "1", "score": 1, "text_preview": "evidence"}], False
 
-    def retrieve_context(self, question, top_k):
+    def retrieve_context(self, question, top_k, spec=None, excluded_sources=None):
         self.calls.append(("retrieve", question))
         return [context_item("python")]
 
@@ -132,6 +134,29 @@ class FlowModeTests(unittest.TestCase):
     def test_standalone_retrieval_question_is_not_expanded(self):
         question = "Объясни порядок расчета ИВ0 по шагам"
         self.assertEqual(web_ui.contextualize_retrieval_question(question, {"messages": []}, "chat-1"), question)
+
+    def test_project_scope_excludes_documents_from_other_projects_and_chats(self):
+        documents = [
+            {"source_path": "C:/uploads/global.pdf", "project_id": None, "chat_id": None},
+            {"source_path": "C:/uploads/current.pdf", "project_id": "project-1", "chat_id": "chat-1"},
+            {"source_path": "C:/uploads/same-project.pdf", "project_id": "project-1", "chat_id": "chat-2"},
+            {"source_path": "C:/uploads/private-chat.pdf", "project_id": None, "chat_id": "chat-1"},
+            {"source_path": "C:/uploads/other-project.pdf", "project_id": "project-2", "chat_id": "chat-9"},
+            {"source_path": "C:/uploads/other-chat.pdf", "project_id": None, "chat_id": "chat-9"},
+        ]
+        with patch.object(web_ui, "list_documents", return_value=documents):
+            excluded = web_ui.excluded_document_sources({"project_id": "project-1"}, "chat-1")
+        self.assertEqual(excluded, {"other-project.pdf", "other-chat.pdf"})
+
+    def test_scoped_context_filter_uses_source_basename(self):
+        items = [
+            {"file": "C:/uploads/current.pdf"},
+            {"file": "C:/uploads/other.pdf"},
+        ]
+        self.assertEqual(
+            web_ui.filter_scoped_context(items, {"other.pdf"}),
+            [{"file": "C:/uploads/current.pdf"}],
+        )
 
 
 if __name__ == "__main__":

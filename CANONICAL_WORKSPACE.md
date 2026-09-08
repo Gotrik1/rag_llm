@@ -9,37 +9,31 @@ Use branch `dev` for code, tests, documentation, and runtime operations. The
 only long-lived branches are `dev`, `test`, `prod`, and `main`. Do not use
 Codex worktrees or safety copies as a second active checkout.
 
-Current runtime endpoints:
+Local legacy-development endpoints (only when `docker-compose.yml` is chosen explicitly):
 
 - frontend: `http://127.0.0.1:5173`
 - backend: `http://127.0.0.1:8080`
 - Qdrant: `http://127.0.0.1:6333`
 - Ollama: `http://127.0.0.1:11434`
 
+The authoritative production file is `compose.yaml`, project
+`rag-assistant`: loopback HTTP proxy `:8080`, external TLS proxy `:8443`, and
+loopback Grafana `:3000`. Databases, Qdrant, API workers, and vLLM are internal.
+
 Before editing, inspect `git status --short`. Runtime files live only under
 `.data/`; code resolves them through `RAG_DATA_DIR` (locally `.data`, in the
 backend container `/app/.data`).
 
-The local `docker-compose.yml` bind-mounts the committed `./.data` snapshot.
-The production `compose.yaml` intentionally uses a separate `app_data` Docker
-volume at `/app/.data`; production runtime changes do not modify the checkout.
-The local backend starts the ASGI compatibility service, applies Alembic and
-workspace migrations before it becomes ready, and runs a separate ARQ ingestion
-worker. Its `job-queue` Redis uses AOF and `noeviction`; `response-cache`
-remains a separate, disposable answer cache.
+The legacy `docker-compose.yml` bind-mounts `./.data` and must be named
+explicitly when used. Production `compose.yaml` bind-mounts
+`${RAG_DATA_ROOT}/app` at `/app/.data`, applies migrations through a one-shot
+service, and starts a separate single-writer ARQ ingestion worker. One Redis
+instance uses AOF/noeviction for durable queue transport and a separate key
+namespace/TTL for disposable exact answer-cache entries.
 
-## Isolated preview
-
-An optional local preview can be started without replacing the main stack:
-
-- preview UI: `http://127.0.0.1:5174`
-- preview API: `http://127.0.0.1:8081`
-- preview PostgreSQL: `127.0.0.1:5434`
-- preview Redis: `127.0.0.1:6380`
-
-The stable UI remains on ports `5173/8080`. The preview uses the same UI
-contract through an ASGI compatibility facade, while adding SSO-ready RBAC,
-ABAC policies, audit events, persistent jobs, SSE and telemetry.
+Because both Compose files exist, never run an implicit `docker compose ...`
+command in automation. Always pass `-f compose.yaml` for production or
+`-f docker-compose.yml` for the legacy local stack.
 
 ## GigaChat certificates
 

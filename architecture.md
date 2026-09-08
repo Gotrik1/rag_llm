@@ -1,272 +1,167 @@
-# Архитектура RAG Assistant
+# Architecture: RAG Assistant
 
-Документ описывает фактическую архитектуру Docker-стека. C3-схемы разделяют контекст системы, контейнеры и компоненты backend-сервера. Пользовательские сценарии, технические pipeline и CI вынесены отдельно, чтобы не смешивать уровни абстракции.
+This document describes the runtime implemented by `compose.yaml` and the
+current request paths. `compose.yaml` is authoritative; `docker-compose.yml` is
+retained only for legacy development compatibility.
 
-## Принципы
-
-- Python-индекс является основным источником доказательств для Web UI.
-- Rust-индекс дополняет Python evidence в режимах `rust` и `hybrid`, но не заменяет его.
-- Кэш ответов точный, а не семантический: похожие вопросы по нормативным документам могут требовать разных ответов.
-- PostgreSQL хранит состояние продукта, RBAC/ABAC, audit и историю чатов. Redis разделён на временный кэш ответов и устойчивую очередь ingestion-задач.
-
-## C1. Контекст системы
+## System context
 
 ```mermaid
 flowchart LR
-    U["Пользователь"]
-    S["RAG Assistant\nВеб-приложение для поиска по документам"]
-    O["Ollama или облачный LLM-провайдер\nГенерация и эмбеддинги"]
-    D["Документы пользователя\nDOCX, PDF, MD, TXT"]
-
-    U -->|"Вопросы, проекты, загрузка документов"| S
-    S -->|"LLM и embeddings API"| O
-    D -->|"Индексация"| S
+    U[Browser user]
+    R[RAG Assistant]
+    I[OIDC identity provider]
+    D[DOCX PDF MD TXT]
+    M[vLLM Qwen model]
+    U -->|HTTPS questions uploads projects chats| R
+    R -->|validate bearer token and claims| I
+    D -->|queued ingestion| R
+    R -->|OpenAI-compatible generation| M
 ```
 
-| Элемент | Назначение | Технологии |
-| --- | --- | --- |
-| Пользователь | Работает с чатами, проектами и базой знаний | Браузер |
-| RAG Assistant | Ищет evidence и формирует проверяемые ответы | React, Python, Rust, PostgreSQL, Qdrant, Redis |
-| LLM-провайдер | Формирует ответы и эмбеддинги | Ollama, OpenAI-compatible API, GigaChat, YandexGPT |
-| Документы | Источник знаний для поиска | DOCX, PDF, Markdown, text |
-
-## C2. Контейнеры
-
-```mermaid
-flowchart LR
-    B["Браузер\nReact + TypeScript"]
-    F["Контейнер frontend\nNginx 1.27\nСтатическая сборка Vite"]
-    A["Контейнер backend\nPython 3.12\nASGI facade"]
-    W["Контейнер ingestion-worker\nARQ worker"]
-    P[("PostgreSQL 16\nWorkspace, RBAC, audit, jobs")]
-    R[("Redis 7.4\nТочный кэш ответов")]
-    J[("Redis 7.4\nAOF job queue")]
-    Q[("Qdrant 1.13\nВекторные коллекции")]
-    C["Rust CLI\nПроцесс llm-rust"]
-    L["Ollama или облачный провайдер\nLLM и эмбеддинги"]
-
-    B -->|"HTTP или HTTPS"| F
-    F -->|"Прокси /api"| A
-    A -->|"SQL через psycopg"| P
-    A -->|"RESP через redis-py"| R
-    A -->|"ARQ"| J
-    A -->|"HTTP и gRPC"| Q
-    A -->|"JSON через stdin/stdout"| C
-    A -->|"HTTP"| L
-    C -->|"HTTP"| L
-    W -->|"ARQ"| J
-    W -->|"SQL"| P
-    W -->|"HTTP и gRPC"| Q
-```
-
-| Контейнер или процесс | Ответственность | Постоянное состояние |
-| --- | --- | --- |
-| `frontend` | Отдаёт React UI и проксирует API-вызовы | Нет |
-| `backend` | ASGI API, RBAC/ABAC, SSE, telemetry и compatibility facade для RAG | Bind-mount `.data/` |
-| `ingestion-worker` | Выполнение и отмена долгих ingestion-задач через ARQ | Bind-mount `.data/`, PostgreSQL jobs |
-| `postgres` | Проекты, чаты, RBAC/ABAC, audit, jobs и миграции | Том `postgres_data` |
-| `qdrant` | Коллекции векторов `rag_docs_v10` и `knowledge_base` | `.data/qdrant/` |
-| `response-cache` | Точный кэш сгенерированных ответов | Нет, намеренно временный |
-| `job-queue` | Устойчивая Redis/ARQ доставка ingestion-задач | Том `queue_data`, AOF/noeviction |
-| `llm-rust` | Rust CLI поиска и генерации, запускаемый backend | Qdrant и Ollama; опциональный CLI-том |
-| Ollama | Локальные модели и модель эмбеддингов, опциональный Compose-профиль | Том `ollama_data` при включённом профиле |
-
-`response-cache` доступен только во внутренней сети Compose и не публикует порт на хост.
-
-### Доступные интерфейсы
-
-| Интерфейс | Ссылка | Назначение |
-| --- | --- | --- |
-| Frontend | [http://127.0.0.1:5173](http://127.0.0.1:5173) | Пользовательский интерфейс чатов, проектов и базы знаний |
-| Swagger UI | [http://127.0.0.1:8080/docs](http://127.0.0.1:8080/docs) | Интерактивная документация backend API |
-| OpenAPI | [http://127.0.0.1:8080/api/openapi.json](http://127.0.0.1:8080/api/openapi.json) | Машиночитаемая спецификация API |
-| Backend API | [http://127.0.0.1:8080/api/](http://127.0.0.1:8080/api/) | HTTP API для frontend и интеграций |
-| Qdrant Dashboard | [http://127.0.0.1:6333/dashboard](http://127.0.0.1:6333/dashboard) | Просмотр коллекций и состояния Qdrant |
-| Qdrant HTTP API | [http://127.0.0.1:6333](http://127.0.0.1:6333) | Векторный API Qdrant |
-
-Redis и PostgreSQL не имеют веб-интерфейса и не публикуют административные порты для браузера.
-
-## C3. Компоненты backend
+## Production containers
 
 ```mermaid
 flowchart TB
-    H["ASGI facade\nasgi_app.py"]
-    G["Legacy RAG adapter\nweb_ui.py"]
-    W["Хранилище workspace\ndb_store.py"]
-    O["RAG-оркестратор\nrag_agent.py"]
-    I["Сервис индексации\ndocument_ingestion.py"]
-    K["Точный кэш ответов\nresponse_cache.py"]
-    L["LLM-адаптеры\nllm_providers.py и Ollama client"]
-    X["Rust-мост\nJSON-протокол subprocess"]
-
-    H --> W
-    H --> G
-    H --> O
-    H --> I
-    H --> X
-    O --> K
-    O --> L
-    X --> K
+    U[Browser] --> TLS[tls-proxy :8443]
+    TLS --> PX[proxy :8080 internal]
+    PX --> APP[app FastAPI x N workers]
+    APP --> PG[(PostgreSQL)]
+    APP --> RD[(Redis AOF)]
+    APP --> QD[(Qdrant)]
+    APP --> LB[llm-bridge]
+    LB --> VL[vLLM GPU]
+    APP -->|enqueue| RD
+    IW[ingestion-worker single writer] -->|consume| RD
+    IW --> PG
+    IW --> QD
+    IW --> BM[(shared BM25 snapshot)]
+    APP -->|mtime hot reload| BM
+    APP --> OT[OpenTelemetry Collector]
+    OT --> TP[(Tempo)]
+    OT --> PR[(Prometheus)]
+    AL[Alloy] --> LK[(Loki)]
+    GR[Grafana] --> PR
+    GR --> TP
+    GR --> LK
 ```
 
-| Компонент | Ответственность | Основные зависимости |
+The backend network is internal. Only `tls-proxy` is externally bound by
+default; `proxy` and Grafana bind to loopback unless explicitly changed.
+
+## Component ownership
+
+| Component | Owns | Does not own |
 | --- | --- | --- |
-| `asgi_app.py` | HTTP API, RBAC/ABAC, SSE, jobs, metrics и telemetry | FastAPI, OpenTelemetry, ARQ |
-| `web_ui.py` | Legacy RAG-маршруты, flow, промт с контекстом проекта и payload ответа | Compatibility adapter, subprocess-мост |
-| `db_store.py` | Транзакции, миграции и CRUD workspace | `psycopg 3`, PostgreSQL |
-| `rag_agent.py` | Python-поиск, выбор evidence, генерация и валидация | LlamaIndex, Qdrant, BM25, Ollama или provider adapter |
-| `document_ingestion.py` | Извлечение текста и метаданных документа | XML parser, Mammoth, PDF readers |
-| `response_cache.py` | Точный кэш с TTL и безопасной деградацией при недоступности Redis | `redis-py`, Redis |
-| `llm_providers.py` | Адаптеры OpenAI-compatible и региональных провайдеров | `requests`, HTTP API провайдеров |
-| Rust-мост | Вызывает `llm-rust` JSON-командами | `subprocess.run`, Rust CLI |
+| FastAPI (`asgi_app.py`) | HTTP contract, OIDC/RBAC, request IDs, durable assistant-message lifecycle, upload validation, job API | retrieval algorithms |
+| Compatibility orchestration (`web_ui.py`) | chat-aware query contextualization, project prompt scope, Python/Rust flow selection, source enrichment and document isolation | persistence schema |
+| RAG agent (`rag_agent.py`) | section-aware chunking, Qdrant/BM25 retrieval, reranking, prompt construction, exact answer cache keys, formula cleanup | project/chat lifecycle |
+| PostgreSQL (`db_store.py`) | projects, chats, messages, document registry, policies, roles, jobs/audit references | vector content |
+| ARQ worker (`ingestion_worker.py`) | single-writer ingestion execution, cancellation, progress and terminal status | interactive answers |
+| Redis | persistent ARQ queue and exact response cache with separate key namespaces | source of record for chats |
+| Qdrant | vector embeddings and chunk metadata | chat history |
+| BM25 JSON snapshot | lexical nodes shared by worker and API processes | transactional product state |
 
-## Пользовательский baseline
-
-```mermaid
-flowchart LR
-    U["Пользователь"] --> F["Открывает Frontend"]
-    F --> W["Выбирает проект и чат"]
-    W --> Q["Задаёт вопрос или загружает документ"]
-    Q --> R["Получает ответ или результат индексации"]
-    R --> E["Просматривает источники, контекст и таблицы"]
-    E --> W
-```
-
-Baseline описывает действия пользователя. Внутренние контейнеры и алгоритмы не показаны здесь намеренно: они описаны на уровнях C2/C3 и в технических pipeline ниже.
-
-## Pipeline поиска и генерации
-
-### Индексация
-
-```mermaid
-flowchart LR
-    D["Документ"] --> E["Извлечение текста\ndocument_ingestion.py"]
-    E --> S["Построение разделов и метаданных\nrag_agent.py"]
-    S --> C["SentenceSplitter\n1024 токена, overlap 128"]
-    C --> V["Эмбеддинги\nnomic-embed-text через Ollama"]
-    V --> Q[("Qdrant\nrag_docs_v10")]
-    C --> B[("Хранилище BM25\n.data/bm25")]
-    Q --> I["Инвалидация Redis-кэша ответов"]
-    B --> I
-```
-
-### Сценарий: пользователь задаёт вопрос
+## Ask lifecycle and refresh survival
 
 ```mermaid
 sequenceDiagram
-    participant U as Пользователь
     participant UI as React UI
-    participant API as web_ui.py
-    participant Cache as Redis
-    participant RAG as rag_agent.py
-    participant Index as Qdrant и BM25
-    participant LLM as Ollama или провайдер
-
-    U->>UI: Вводит и отправляет вопрос
-    UI->>API: POST /api/ask
-    API->>RAG: Выбранный flow и контекст проекта
-    RAG->>Cache: Точный поиск ответа
-    alt Есть запись в кэше
-        Cache-->>RAG: Ответ и метаданные источников
-    else Записи нет
-        RAG->>Index: Поиск evidence
-        Index-->>RAG: Отобранный контекст
-        RAG->>LLM: Запрос на генерацию
-        LLM-->>RAG: Ответ модели
-        RAG->>Cache: Сохранение записи с TTL
+    participant API as FastAPI
+    participant DB as PostgreSQL
+    participant RAG as RAG worker thread
+    UI->>DB: POST user message through API
+    UI->>API: POST /api/ask with chat_id
+    API->>DB: insert assistant status=running
+    API->>RAG: start server-owned task
+    alt Browser remains connected
+        RAG-->>API: answer and evidence
+        API->>DB: assistant status=complete/error
+        API-->>UI: answer + message_id
+    else Browser refreshes or disconnects
+        UI-xAPI: HTTP delivery cancelled
+        RAG-->>API: task continues in process
+        API->>DB: assistant status=complete/error
+        UI->>DB: reload chat messages through API
     end
-    RAG-->>API: Ответ, источники, предупреждения
-    API-->>UI: JSON-ответ
-    UI-->>U: Рендерит Markdown, источники и контекст
 ```
 
-### Сценарий: пользователь загружает документ
+The browser never owns the authoritative assistant record. A refresh can stop
+delivery to that browser, but it does not cancel the server-owned task. A full
+service/process restart is a different failure mode and requires a future
+durable generation queue if zero-loss in-flight generation across deployments
+is required.
 
-```mermaid
-sequenceDiagram
-    participant U as Пользователь
-    participant UI as React UI
-    participant API as web_ui.py
-    participant ING as Сервис индексации
-    participant IDX as Qdrant и BM25
-    participant Cache as Redis
+## Ingestion lifecycle
 
-    U->>UI: Выбирает файл и отправляет загрузку
-    UI->>API: POST /api/upload
-    API->>ING: Извлечение текста и разбиение на разделы
-    ING->>IDX: Обновление векторов и BM25-узлов
-    ING->>Cache: Очистка кэша ответов
-    API-->>UI: Результат индексации
-    UI-->>U: Показывает число обработанных фрагментов
-```
+1. `/api/upload` validates count, extension, file name, and the 50 MiB limit.
+2. The API writes a unique file under `.data/uploads`, creates a PostgreSQL
+   document record, and enqueues an ARQ job in Redis.
+3. The single ingestion worker extracts text, preserves section/formula
+   boundaries, creates 1024-token chunks with 128-token overlap, writes vectors
+   to Qdrant, and publishes BM25 JSON with atomic `os.replace`.
+4. API workers compare the snapshot `mtime` before retrieval and hot-reload a
+   completed snapshot. A partial/unreadable snapshot leaves the previous index
+   serving and is retried on the next request.
+5. The document registry moves through queued, processing, ready, failed, or
+   cancelled states and exposes progress/chunk counts to the UI.
+6. Corpus changes invalidate the exact answer-cache namespace.
 
-### Режимы обработки
+`RAG_WORKER_CONCURRENCY=1` is an integrity requirement for the current shared
+BM25 file. Scale ingestion by sharding indices or replacing the file with a
+transactional/immutable index service before increasing concurrency.
 
-| Режим | Доказательства | Генерация | Область кэша |
-| --- | --- | --- | --- |
-| `python` | Python Qdrant и BM25, выбор PRISM | Python LLM adapter | Полный ответ и генерация |
-| `rust` | Python-first fusion с Rust retrieval | Rust CLI и Ollama | Точная Rust-генерация |
-| `hybrid` | Python-first fusion с Rust retrieval | Python LLM adapter | Точная Python-генерация |
+## Retrieval and prompt budget
 
-Python и Rust используют разные физические индексы. Fusion резервирует большинство слотов для Python evidence и использует Rust evidence как дополнение. Это исключает использование устаревшей Rust-коллекции как единственного источника фактов.
+The prompt contains the system policy, bounded project memory/history, the user
+question, and up to `TOP_K=10` selected evidence chunks. It never injects an
+entire project corpus into the system prompt. Retrieval combines:
 
-## Владение данными и политика кэша
+- section/formula/exact-concept seed matches;
+- vector candidates from Qdrant;
+- lexical BM25 candidates;
+- deterministic reranking, diversification, and PRISM evidence selection;
+- prompt-injection filtering before generation.
 
-| Хранилище | Данные | Хранение и инвалидация |
-| --- | --- | --- |
-| PostgreSQL | Проекты, чаты, сообщения, настройки workspace | Постоянный Docker-том; миграции применяет backend |
-| Qdrant | Эмбеддинги и метаданные Python- и Rust-коллекций | `.data/qdrant/`; обновляется при индексации |
-| Хранилище BM25 | Узлы Python retrieval | `.data/bm25/`; перестраивается или обновляется при индексации |
-| Redis | Хэш ключа, ответ модели, метаданные источника `file`, `section`, `score` | TTL 7 дней, 128 МБ, `allkeys-lru`, без записи на диск |
-| `.data/state`, `.data/uploads`, `.data/cache` | Выбор провайдера, flow, uploads и локальные артефакты | Единый runtime-каталог; его согласованный снимок хранится в Git |
+Documents linked to another project/chat are excluded before reranking and the
+same exclusion set is included in the answer cache key. Global legacy corpora
+remain visible; documents attached to the current project are visible across
+its chats, while free-chat documents remain chat-local.
 
-Redis не хранит API-ключи, полные промты, вопросы, историю чатов и текстовые превью источников. Обновление корпуса, явная очистка кэша, смена провайдера/модели и смена flow инвалидируют кэш ответов.
+## Cache semantics
 
-## Pipeline доставки
+Redis holds two logical workloads:
 
-```mermaid
-flowchart LR
-    T["Push или pull request\ndev, test, prod, main"] --> Q["Задача quality"]
-    Q --> PY["Синтаксис и unit-тесты Python"]
-    Q --> RS["Проверка и тесты Rust"]
-    Q --> UI["Тесты UI и production-сборка"]
-    T --> IS["Задача infrastructure-smoke"]
-    IS --> PG["Миграции PostgreSQL и тест workspace"]
-    IS --> RC["Smoke-тест Redis response-cache"]
-    PY --> OK["Результат CI"]
-    RS --> OK
-    UI --> OK
-    PG --> OK
-    RC --> OK
-    OK --> REL["Тег v*\nrelease-артефакт"]
-```
+- ARQ queue/job transport, protected by AOF and `noeviction`;
+- exact generated responses under the `rag:response:` namespace with TTL.
 
-Release workflow упаковывает backend, Rust-исходники, Compose-файлы, миграции, архитектуру и production-сборку Vite. В артефакт входит `response_cache.py`, поэтому реализация runtime-кэша сохраняется в релизе.
+Cache keys include prompt profile, model, original question, contextualized
+retrieval query, project context, and document-scope exclusions. Similar but
+non-identical questions are intentionally not treated as cache hits. Fail-open
+cache behavior preserves answers during a Redis read failure, while readiness
+still reports mandatory dependency health in production.
 
-## Команды эксплуатации
+## Formula and source contract
 
-```powershell
-# Запуск полного стека
-docker compose up --build -d
+Chunk metadata carries file name, section path, status, and chunk type. API
+responses expose source score/preview plus a stable document download URL when
+the source came through the registry. React renders Markdown/GFM and KaTeX;
+legacy HTML formulas use sanitized MathJax rendering. Raw document HTML is not
+executed.
 
-# Проверка состояния сервисов
-docker compose ps
+## Persistence and scaling boundaries
 
-# Метрики и логи кэша
-docker compose logs -f response-cache
-docker compose exec response-cache redis-cli INFO memory
+- PostgreSQL is the source of truth for product/session state.
+- Qdrant and BM25 are rebuildable knowledge indices; uploaded originals must be backed up.
+- Redis queue data is persistent but exact answer cache entries are disposable.
+- Two API workers may serve concurrent chats; database connections are isolated per worker thread.
+- vLLM batches model requests via `VLLM_MAX_NUM_SEQS`; increase only after GPU memory/latency measurements.
+- Multi-host API is possible when all hosts share PostgreSQL, Redis, Qdrant, and an immutable/shared BM25 publication mechanism.
 
-# Очистка кэша сгенерированных ответов через API приложения
-Invoke-RestMethod -Method Post http://127.0.0.1:8080/api/cache/clear
-```
+## Security boundaries
 
-## Карта исходного кода
-
-- UI: `ui/src/App.tsx`, `ui/src/styles.css`
-- API и маршрутизация: `web_ui.py`
-- Постоянное состояние workspace: `db_store.py`, `migrations/`
-- Python RAG: `rag_agent.py`, `document_ingestion.py`, `docx_parser.py`
-- Кэш ответов: `response_cache.py`
-- Адаптеры провайдеров: `llm_providers.py`
-- Rust CLI: `src/main.rs`, `src/agent.rs`, `src/retrieval.rs`, `src/llm.rs`
-- CI и релиз: `.github/workflows/ci.yml`, `.github/workflows/release.yml`
+Production uses OIDC bearer validation and policy checks. Secrets are mounted as
+Compose files and converted to process environment only inside the container
+entrypoint. Nginx enforces body limits, request rate limits, security headers,
+and disabled SSE buffering. Logs/traces must contain operation metadata, not
+prompts, document chunks, answers, bearer tokens, or secret values.

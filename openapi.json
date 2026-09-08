@@ -3,7 +3,7 @@
   "info": {
     "title": "RAG Assistant API",
     "version": "1.0.0",
-    "description": "HTTP API for the RAG assistant, workspace state, projects, chats, messages, model settings, and document ingestion. Authentication and RBAC enforcement are intentionally not enabled yet. UUID, tenant_id, and user_id fields reserve the contract for future multi-tenant access control.\n\nProject, chat, and message updates use PATCH. Their DELETE endpoints perform a soft delete."
+    "description": "Legacy compatibility snapshot. Production serves the authoritative live FastAPI schema at /api/openapi.json with authentication, RBAC, persistent chats, asynchronous ingestion jobs, document registry, source downloads, and observability endpoints.\n\nProject, chat, and message updates use PATCH. Their DELETE endpoints perform a soft delete."
   },
   "servers": [{ "url": "/", "description": "Current RAG Assistant server" }],
   "tags": [

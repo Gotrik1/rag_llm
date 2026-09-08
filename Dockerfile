@@ -44,7 +44,7 @@ RUN set -eux; \
     done; \
     update-ca-certificates; \
     rm -rf /usr/local/share/ca-certificates/gigachat
-COPY requirements.txt ./
+COPY requirements.docker.txt ./requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --upgrade pip && \
     python -m pip install --requirement requirements.txt && \

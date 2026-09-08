@@ -4,29 +4,44 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from opentelemetry.trace import format_trace_id, get_current_span
 from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from audit import record as audit_record
+from db_store import create_document, create_message, get_document, list_documents, update_document, update_message
 from jobs import JobQueue
 from legacy_adapter import invoke_legacy
 from persistence import get_store
 from security import AuthenticationError, AuthorizationError, Principal, RAG_ACCESS, authorize, configured_identity_provider
 from telemetry import AUTH_DECISIONS, JOBS, PIPELINE_SECONDS, REQUESTS, REQUEST_SECONDS, configure_logging, configure_telemetry, tracer
+from runtime_paths import UPLOAD_DIR
 
 
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=20_000)
     chat_id: str | None = None
+
+
+ALLOWED_UPLOAD_SUFFIXES = {".docx", ".pdf", ".md", ".txt"}
+MAX_UPLOAD_BYTES = int(os.getenv("RAG_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+MAX_UPLOAD_FILES = int(os.getenv("RAG_MAX_UPLOAD_FILES", "20"))
+
+
+def safe_upload_name(filename: str) -> str:
+    name = Path(filename).name.strip() or "upload.bin"
+    name = re.sub(r"[^A-Za-zА-Яа-яЁё0-9._ -]+", "_", name)
+    return name[:180] or "upload.bin"
 
 
 def run_ask(payload: dict | str) -> dict:
@@ -94,6 +109,38 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="RAG service", version="0.1.0", lifespan=lifespan)
 jobs = JobQueue()
+_persistent_ask_tasks: set[asyncio.Task] = set()
+
+
+def _forget_persistent_ask(task: asyncio.Task) -> None:
+    _persistent_ask_tasks.discard(task)
+    if not task.cancelled():
+        task.exception()  # Consume detached failures after a client disconnect.
+
+
+async def _run_and_persist_ask(request_payload: dict, assistant_message: dict) -> dict:
+    message_id = str(assistant_message["id"])
+    try:
+        result = await asyncio.to_thread(run_ask, request_payload)
+    except Exception as exc:
+        await asyncio.to_thread(update_message, message_id, {"content": str(exc), "status": "error"})
+        raise
+    await asyncio.to_thread(
+        update_message,
+        message_id,
+        {
+            "content": str(result.get("answer", "")),
+            "content_html": str(result.get("html_answer", "")),
+            "status": "complete",
+            "metadata": {
+                "model_label": (result.get("llm") or {}).get("label"),
+                "sources": result.get("sources") or [],
+                "usage": result.get("usage") or {},
+            },
+        },
+    )
+    result["message_id"] = message_id
+    return result
 cors_origins = [origin.strip() for origin in os.getenv("RAG_CORS_ORIGINS", "http://127.0.0.1:5173").split(",") if origin.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"], allow_headers=["Authorization", "Content-Type", "X-Request-ID"], expose_headers=["X-Request-ID", "X-Trace-ID"])
 
@@ -189,7 +236,22 @@ async def ask(payload: AskRequest, principal: Principal = Depends(current_princi
         span.set_attribute("rag.principal_provider", principal.provider)
         started = time.perf_counter()
         request_payload = payload.model_dump(exclude_none=True)
-        result = await asyncio.to_thread(run_ask, request_payload if payload.chat_id else question)
+        assistant_message: dict | None = None
+        if payload.chat_id:
+            assistant_message = await asyncio.to_thread(
+                create_message,
+                payload.chat_id,
+                {"role": "assistant", "content": "", "status": "running", "metadata": {"principal": principal.subject}},
+            )
+        if assistant_message:
+            task = asyncio.create_task(_run_and_persist_ask(request_payload, assistant_message))
+            _persistent_ask_tasks.add(task)
+            task.add_done_callback(_forget_persistent_ask)
+            # Client cancellation stops delivery only. The server-owned task
+            # persists its terminal state for the next page load.
+            result = await asyncio.shield(task)
+        else:
+            result = await asyncio.to_thread(run_ask, question)
         PIPELINE_SECONDS.labels("ask", result["flow_mode"]).observe(time.perf_counter() - started)
         return JSONResponse(result)
 
@@ -237,6 +299,101 @@ async def submit_ingestion(payload: dict, _: Principal = Depends(current_princip
     return JSONResponse(job, status_code=202)
 
 
+@app.post("/api/upload")
+async def upload_documents(
+    files: list[UploadFile] = File(...),
+    project_id: str = Form(""),
+    chat_id: str = Form(""),
+    _: Principal = Depends(current_principal),
+):
+    """Persist uploads and enqueue ingestion without holding the request open."""
+    if not files or len(files) > MAX_UPLOAD_FILES:
+        raise HTTPException(400, f"upload between 1 and {MAX_UPLOAD_FILES} files")
+    normalized_project = project_id.strip() or None
+    normalized_chat = chat_id.strip() or None
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    queued: list[dict] = []
+    for upload in files:
+        display_name = safe_upload_name(upload.filename or "upload.bin")
+        if Path(display_name).suffix.lower() not in ALLOWED_UPLOAD_SUFFIXES:
+            raise HTTPException(415, f"unsupported document type: {display_name}")
+        target = UPLOAD_DIR / f"{uuid.uuid4().hex}_{display_name}"
+        size = 0
+        try:
+            with target.open("xb") as output:
+                while chunk := await upload.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > MAX_UPLOAD_BYTES:
+                        raise HTTPException(413, f"file is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB: {display_name}")
+                    output.write(chunk)
+        except Exception:
+            target.unlink(missing_ok=True)
+            raise
+        document = await asyncio.to_thread(
+            create_document,
+            normalized_project,
+            normalized_chat,
+            {
+                "file_name": display_name,
+                "source_path": str(target),
+                "mime_type": upload.content_type or "application/octet-stream",
+                "status": "queued",
+                "metadata": {"size_bytes": size},
+            },
+        )
+        try:
+            job = await jobs.submit("ingestion", {"path": str(target), "document_id": str(document["id"])})
+        except Exception as exc:
+            await asyncio.to_thread(
+                update_document,
+                str(document["id"]),
+                {"status": "failed", "processing_state": {"error": str(exc)[:1000]}},
+            )
+            raise HTTPException(503, f"ingestion queue unavailable for {display_name}") from exc
+        await asyncio.to_thread(
+            update_document,
+            str(document["id"]),
+            {"processing_state": {"job_id": job["id"], "progress": 0}},
+        )
+        queued.append({
+            "id": str(document["id"]),
+            "file": display_name,
+            "size_bytes": size,
+            "status": "queued",
+            "job_id": job["id"],
+            "url": f"/api/documents/{document['id']}/content",
+        })
+    return JSONResponse({"files": queued, "chunks": 0, "queued": True}, status_code=202)
+
+
+@app.get("/api/projects/{project_id}/documents")
+async def project_documents(project_id: str, _: Principal = Depends(current_principal)):
+    return {"items": await asyncio.to_thread(list_documents, project_id, None)}
+
+
+@app.get("/api/documents")
+async def documents(project_id: str = "", chat_id: str = "", _: Principal = Depends(current_principal)):
+    return {"items": await asyncio.to_thread(list_documents, project_id.strip() or None, chat_id.strip() or None)}
+
+
+@app.get("/api/documents/{document_id}/content")
+async def document_content(document_id: str, _: Principal = Depends(current_principal)):
+    document = await asyncio.to_thread(get_document, document_id)
+    if document is None:
+        raise HTTPException(404, "document not found")
+    path = Path(str(document.get("source_path", ""))).resolve()
+    upload_root = UPLOAD_DIR.resolve()
+    if upload_root not in path.parents or not path.is_file():
+        raise HTTPException(404, "document content is unavailable")
+    return FileResponse(path, media_type=str(document.get("mime_type") or "application/octet-stream"), filename=str(document["file_name"]))
+
+
+@app.get("/api/openapi.json", include_in_schema=False)
+async def api_openapi(_: Principal = Depends(current_principal)):
+    """Expose the live FastAPI contract instead of the legacy static snapshot."""
+    return app.openapi()
+
+
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str, _: Principal = Depends(current_principal)):
     job = await jobs.get(job_id)
@@ -254,7 +411,11 @@ async def cancel_job(job_id: str, _: Principal = Depends(current_principal)):
     return {"id": job_id, "status": "cancelled"}
 
 
-@app.api_route("/api/{operation:path}", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
+@app.api_route(
+    "/api/{operation:path}",
+    methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
+    include_in_schema=False,
+)
 async def legacy_api(operation: str, request: Request, _: Principal = Depends(current_principal)):
     """Protected async facade for remaining legacy API endpoints."""
     path = f"/api/{operation}"

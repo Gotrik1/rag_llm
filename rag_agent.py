@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import zipfile
 from contextlib import contextmanager
@@ -176,7 +177,7 @@ SYSTEM_PROMPT = """\
 
 
 GROUNDED_SYSTEM_PROMPT = """\
-Ты — точный ассистент по нормативным документам. Работай как проверяемый RAG-ответчик.
+Ты — точный ассистент по документам. Работай как проверяемый RAG-ответчик для технических, нормативных, офисных и смешанных документов.
 
 Правила:
 1. Отвечай только по блоку "КОНТЕКСТ". Утверждение включай, только если оно подтверждено контекстом, относится к сущности из вопроса и помогает ответить на него.
@@ -190,6 +191,7 @@ GROUNDED_SYSTEM_PROMPT = """\
 9. Не показывай внутренние сообщения RAG, сведения о нехватке контекста, retrieval, reranking или технических блоках. Если дополнительная информация не найдена, просто не добавляй её.
 10. Игнорируй нерелевантные фрагменты контекста, даже если они фактически верны. Перед ответом проверь: речь идёт об одной сущности, сценарий завершён, нет сведений из соседних разделов и пустых искусственных секций.
 11. Форматируй ответ строго в CommonMark Markdown. Абзацы разделяй одной пустой строкой. Для перечислений используй `- пункт` или `1. пункт`; заголовки `##` и `###` — только для длинных ответов. Таблицы GFM используй только для сравнения однотипных сущностей с короткими значениями; если ячейка требует несколько пунктов, вместо таблицы используй подзаголовок и маркированный список. Не используй HTML и не оставляй незакрытые Markdown-маркеры.
+12. После фактического утверждения указывай краткую текстовую ссылку вида `[Источник: имя файла — раздел]`. Используй только имя и раздел из КОНТЕКСТА; не придумывай URL или номер страницы. Кликабельные ссылки приложение добавит отдельно.
 """
 
 
@@ -1397,13 +1399,21 @@ class RAGAgent:
 
         # ── Exact response cache ──────────────────────────────
         self.response_cache = ResponseCache()
-        self._last_generation_from_cache = False
+        self._generation_state = threading.local()
+        self._generation_state.from_cache = False
+        self._index_refresh_lock = threading.Lock()
 
         # ── Ноды для BM25 (в памяти) ─────────────────────────
         self._all_nodes: list = []
         self._load_nodes_from_docstore()
+        self._docstore_mtime_ns = self.docstore_path.stat().st_mtime_ns if self.docstore_path.exists() else 0
 
         print(f"✓ Агент готов. Документов в docstore: {len(self._all_nodes)} чанков")
+
+    @property
+    def last_generation_from_cache(self) -> bool:
+        """Return cache state for the current request thread only."""
+        return bool(getattr(self._generation_state, "from_cache", False))
 
     @staticmethod
     def _create_ollama_llm(model: str) -> Ollama:
@@ -1464,6 +1474,39 @@ class RAGAgent:
                 node_id = getattr(d, "doc_id", None) or getattr(d, "id_", None) or getattr(d, "id", None)
                 nodes.append(TextNode(text=d.text, metadata=d.metadata, id_=node_id))
             self._all_nodes = nodes
+
+    def _refresh_docstore_if_changed(self) -> None:
+        """Reload BM25/docstore state written by the dedicated ingestion worker."""
+        try:
+            current_mtime = self.docstore_path.stat().st_mtime_ns
+        except OSError:
+            return
+        if current_mtime == self._docstore_mtime_ns:
+            return
+        with self._index_refresh_lock:
+            try:
+                current_mtime = self.docstore_path.stat().st_mtime_ns
+            except OSError:
+                return
+            if current_mtime == self._docstore_mtime_ns:
+                return
+            try:
+                refreshed_docstore = SimpleDocumentStore.from_persist_path(str(self.docstore_path))
+            except Exception:
+                # A writer may be between replace operations. Keep serving the
+                # previous snapshot and retry on the next request.
+                return
+            self.docstore = refreshed_docstore
+            storage_ctx = StorageContext.from_defaults(
+                vector_store=self.vector_store,
+                docstore=self.docstore,
+            )
+            self.index = VectorStoreIndex.from_vector_store(
+                self.vector_store,
+                storage_context=storage_ctx,
+            )
+            self._load_nodes_from_docstore()
+            self._docstore_mtime_ns = current_mtime
 
     def _build_query_engine(self, top_k: int = TOP_K):
         """Строим гибридный query engine с текущими нодами."""
@@ -1537,13 +1580,22 @@ class RAGAgent:
 
         self.index.insert_nodes(nodes)
 
-        # Сохраняем docstore для BM25
-        self.docstore.persist(persist_path=str(self.docstore_path))
+        # Publish one complete snapshot. API workers watch this mtime and must
+        # never observe a half-written JSON document store.
+        temp_docstore_path = self.docstore_path.with_name(
+            f".{self.docstore_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            self.docstore.persist(persist_path=str(temp_docstore_path))
+            os.replace(temp_docstore_path, self.docstore_path)
+        finally:
+            temp_docstore_path.unlink(missing_ok=True)
 
         # Обновляем ноды в памяти для BM25
         self._all_nodes = list(nodes) + [
             n for n in self._all_nodes if n.id_ not in {nd.id_ for nd in nodes}
         ]
+        self._docstore_mtime_ns = self.docstore_path.stat().st_mtime_ns
 
         # A changed corpus invalidates every generated answer, even when the
         # question itself is identical.
@@ -1558,14 +1610,16 @@ class RAGAgent:
         system_prompt: str | None = None,
         prompt_id: str = "rag-grounded",
         retrieval_query: str | None = None,
+        excluded_sources: set[str] | None = None,
     ) -> tuple[str, list[dict], bool]:
         """
         Возвращает (answer, sources, from_cache).
         sources — список dict с ключами file, section, score.
         """
         search_question = (retrieval_query or question).strip()
+        scope_key = "\n".join(sorted(source.casefold() for source in (excluded_sources or set())))
         qhash = _question_hash(
-            f"{prompt_id}\n{system_prompt or GROUNDED_SYSTEM_PROMPT}\n{question}\n{search_question}"
+            f"{prompt_id}\n{system_prompt or GROUNDED_SYSTEM_PROMPT}\n{question}\n{search_question}\n{scope_key}"
         )
 
         with _pipeline_span("cache.lookup") as span:
@@ -1579,6 +1633,7 @@ class RAGAgent:
                     pass
                 return answer, sources, True
 
+        self._refresh_docstore_if_changed()
         if not self._all_nodes:
             return (
                 "База знаний пуста. Загрузите документы командой :load <путь>",
@@ -1590,7 +1645,7 @@ class RAGAgent:
         # of its own.  Build the PRISM contract from the contextual retrieval
         # query so deterministic formula extraction retains the subject too.
         spec = refine_prism_query(search_question)
-        context = self.retrieve_context(search_question, TOP_K, spec)
+        context = self.retrieve_context(search_question, TOP_K, spec, excluded_sources)
         calculations = extract_formula_lines_from_texts([item["text"] for item in context], search_question)
         answer = self._generate_grounded_answer(
             question,
@@ -1625,7 +1680,7 @@ class RAGAgent:
         system_prompt: str | None = None,
         evidence_question: str | None = None,
     ) -> str:
-        self._last_generation_from_cache = False
+        self._generation_state.from_cache = False
         spec = spec or refine_prism_query(question)
         if spec.answer_mode == "formulas_only":
             return generate_formula_only_answer(evidence_question or question, context, calculations, spec)
@@ -1634,7 +1689,7 @@ class RAGAgent:
             return extractive
 
         context_text = "\n\n---\n\n".join(
-            f"[Источник: {item['file']}, score={item['score']}]\n{item['text']}"
+            f"[Источник: {item['file']}; раздел: {item.get('section_path', '')}; score={item['score']}]\n{item['text']}"
             for item in context
         )
         normalized_question = question.lower()
@@ -1665,7 +1720,7 @@ class RAGAgent:
         generation_key = _question_hash(f"generation\n{self.llm_model}\n{prompt}")
         cached = self.response_cache.get(generation_key)
         if isinstance(cached, dict) and isinstance(cached.get("answer"), str):
-            self._last_generation_from_cache = True
+            self._generation_state.from_cache = True
             return str(cached["answer"])
         with _pipeline_span(
             "llm.generate",
@@ -2003,10 +2058,17 @@ class RAGAgent:
         candidates = primary_matches or matches
         return [item for _, item in sorted(candidates, key=lambda pair: pair[0], reverse=True)[:result_limit]]
 
-    def retrieve_context(self, question: str, top_k: int = 10, spec: PrismQuery | None = None) -> list[dict]:
+    def retrieve_context(
+        self,
+        question: str,
+        top_k: int = 10,
+        spec: PrismQuery | None = None,
+        excluded_sources: set[str] | None = None,
+    ) -> list[dict]:
         """Вернуть найденные чанки без вызова LLM."""
+        self._refresh_docstore_if_changed()
         spec = spec or refine_prism_query(question)
-        candidate_k = max(top_k * 5, 40)
+        candidate_k = max(top_k * (12 if excluded_sources else 5), 100 if excluded_sources else 40)
         qe = self._build_query_engine(candidate_k)
         merged: dict[str, dict] = {}
         for item in self._procedural_seed_results(question):
@@ -2057,7 +2119,12 @@ class RAGAgent:
                 if score > float(current.get("score", 0.0)):
                     current["score"] = round(score, 4)
                     current.update(chunk_meta)
-        results = [item for item in merged.values() if not contains_prompt_injection(str(item.get("text", "")))]
+        excluded = {Path(str(source)).name.casefold() for source in (excluded_sources or set())}
+        results = [
+            item for item in merged.values()
+            if Path(str(item.get("file", ""))).name.casefold() not in excluded
+            and not contains_prompt_injection(str(item.get("text", "")))
+        ]
         ranked = rerank_context_results(results, question)
         diversified = diversify_context_results(ranked, question, top_k)
         selected = select_prism_evidence(diversified, spec, top_k)

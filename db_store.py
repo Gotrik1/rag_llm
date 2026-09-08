@@ -19,7 +19,7 @@ MIGRATIONS_DIR = Path("migrations")
 ENV_PATH = Path(".env")
 
 _db_lock = threading.Lock()
-_db_conn: psycopg.Connection | None = None
+_db_local = threading.local()
 
 
 def load_dotenv() -> None:
@@ -47,23 +47,40 @@ def database_url() -> str:
 
 
 def db() -> psycopg.Connection:
-    global _db_conn
+    """Return one reusable connection per worker thread.
+
+    psycopg connections are not safe for concurrent transactions.  Uvicorn's
+    ``to_thread`` workers therefore must not share the single process-global
+    connection that the original compatibility layer used.
+    """
     with _db_lock:
-        if _db_conn is None or _db_conn.closed:
-            _db_conn = psycopg.connect(database_url(), row_factory=dict_row, autocommit=False)
-        elif _db_conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
+        connection = getattr(_db_local, "connection", None)
+        if connection is None or connection.closed:
+            connection = psycopg.connect(database_url(), row_factory=dict_row, autocommit=False)
+            _db_local.connection = connection
+        elif connection.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
             # PostgreSQL refuses every subsequent query after a failed statement
             # until the transaction is rolled back. The HTTP handlers reuse this
             # connection, so recover it before serving the next request.
-            _db_conn.rollback()
-        return _db_conn
+            connection.rollback()
+        return connection
 
 
 def rollback_transaction() -> None:
     """Clear a failed transaction before returning an HTTP error response."""
     with _db_lock:
-        if _db_conn is not None and not _db_conn.closed:
-            _db_conn.rollback()
+        connection = getattr(_db_local, "connection", None)
+        if connection is not None and not connection.closed:
+            connection.rollback()
+
+
+def close_thread_connection() -> None:
+    """Close the current worker thread's cached connection, if any."""
+    with _db_lock:
+        connection = getattr(_db_local, "connection", None)
+        if connection is not None and not connection.closed:
+            connection.close()
+        _db_local.connection = None
 
 
 def run_migrations() -> None:
@@ -328,6 +345,76 @@ def update_message(message_id: str, payload: dict) -> dict | None:
 
 def delete_message(message_id: str) -> bool:
     return _soft_delete("messages", message_id)
+
+
+def list_documents(project_id: str | None = None, chat_id: str | None = None) -> list[dict]:
+    query = "SELECT * FROM documents WHERE deleted_at IS NULL"
+    params: list[object] = []
+    if project_id:
+        query += " AND project_id = %s"
+        params.append(project_id)
+    if chat_id:
+        query += " AND chat_id = %s"
+        params.append(chat_id)
+    query += " ORDER BY created_at DESC"
+    with db().cursor() as cur:
+        cur.execute(query, params)
+        return [dict(row) for row in cur.fetchall()]
+
+
+def create_document(project_id: str | None, chat_id: str | None, payload: dict) -> dict:
+    conn = db()
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO documents
+               (project_id, chat_id, file_name, source_path, mime_type, status, processing_state, metadata)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+            (
+                project_id or None,
+                chat_id or None,
+                str(payload.get("file_name", "")).strip(),
+                str(payload.get("source_path", "")).strip(),
+                str(payload.get("mime_type", "")).strip(),
+                str(payload.get("status", "queued")).strip() or "queued",
+                json.dumps(payload.get("processing_state") or {}, ensure_ascii=False),
+                json.dumps(payload.get("metadata") or {}, ensure_ascii=False),
+            ),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return dict(row)
+
+
+def get_document(document_id: str) -> dict | None:
+    with db().cursor() as cur:
+        cur.execute("SELECT * FROM documents WHERE id = %s AND deleted_at IS NULL", (document_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def update_document(document_id: str, payload: dict) -> dict | None:
+    fields, values = _update_values(payload, ("file_name", "source_path", "mime_type", "status"), ("processing_state", "metadata"))
+    if not fields:
+        return get_document(document_id)
+    return _update_entity("documents", document_id, fields, values)
+
+
+def document_sources(source_names: list[str]) -> dict[str, dict]:
+    """Resolve retrieval metadata names to active uploaded document records."""
+    names = {str(name).strip() for name in source_names if str(name).strip()}
+    if not names:
+        return {}
+    with db().cursor() as cur:
+        cur.execute("SELECT * FROM documents WHERE deleted_at IS NULL AND status = 'ready'")
+        rows = [dict(row) for row in cur.fetchall()]
+    resolved: dict[str, dict] = {}
+    for row in rows:
+        stored_name = Path(str(row.get("source_path", ""))).name
+        display_name = str(row.get("file_name", ""))
+        for candidate in names:
+            if candidate == stored_name or candidate == display_name:
+                resolved[candidate] = row
+    return resolved
 
 
 def get_workspace(default_mode: str, default_provider: str, default_model: str) -> dict:

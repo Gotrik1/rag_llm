@@ -241,9 +241,9 @@ services:
       retries: 5
     restart: unless-stopped
     tmpfs:
-      - /var/cache/nginx
-      - /var/run
-      - /tmp
+      - /var/cache/nginx:uid=101,gid=101,mode=0750
+      - /var/run:uid=101,gid=101,mode=0750
+      - /tmp:uid=101,gid=101,mode=1777
     security_opt:
       - no-new-privileges:true
     logging: *common-logging

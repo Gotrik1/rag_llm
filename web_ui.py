@@ -42,7 +42,7 @@ from db_store import (
     update_workspace,
 )
 from llm_providers import DEFAULTS, ProviderLLM
-from rag_agent import CACHE_VERSION, DATA_DIR, GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, refine_prism_query, validate_retrieval
+from rag_agent import CACHE_VERSION, DATA_DIR, GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, format_formula_for_display, refine_prism_query, validate_retrieval
 from runtime_paths import MATHML_CACHE_DIR, STATE_DIR, UPLOAD_DIR
 from system_prompts import get_profile, profiles
 from opentelemetry.trace import Status, StatusCode
@@ -301,6 +301,18 @@ def _fuse_contexts(python_items: list[dict], rust_items: list[dict], top_k: int 
 def filter_rust_context(question: str, items: list[dict]) -> list[dict]:
     """Reject Rust evidence that matches a word but not the requested operation."""
     normalized = question.lower().replace("ё", "е")
+    # The Rust store is a complementary runtime and can lag the authoritative
+    # Python/UI collection. Formula answers require linked clause+formula
+    # evidence, which the Rust format does not currently preserve.
+    if refine_prism_query(question).answer_mode == "formulas_only":
+        return []
+    # The current R12 regulation is indexed in the Python collection with
+    # linked clauses and formulas.  Rust evidence is intentionally excluded
+    # for these terms until it uses the same document structure.
+    if any(marker in normalized for marker in (
+        "гтп", "виэ", "ценопринима", "оцз", "переток", "внешн", "собствен",
+    )):
+        return []
     asks_parameter = "параметр" in normalized
     asks_creation = any(marker in normalized for marker in ("добав", "созда", "новый", "завест"))
     filtered: list[dict] = []
@@ -1060,7 +1072,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({
             "answer": answer,
             "html_answer": render_text(answer),
-            "formulas": [{"text": f, "html": render_text(f)} for f in formulas],
+            "formulas": [{"text": f, "html": render_text(format_formula_for_display(f))} for f in formulas],
             "warnings": warnings,
             "sources": [
                 {**s, "html_preview": render_text(str(s.get("text_preview", "")))}
@@ -1090,7 +1102,7 @@ class Handler(BaseHTTPRequestHandler):
         formulas = extract_formula_lines(context, question)
         warnings = validate_retrieval(question, context)
         self.send_json({
-            "formulas": [{"text": f, "html": render_text(f)} for f in formulas],
+            "formulas": [{"text": f, "html": render_text(format_formula_for_display(f))} for f in formulas],
             "warnings": warnings,
             "context": [
                 {**c, "html_text": render_text(c["text"])}

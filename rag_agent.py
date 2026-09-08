@@ -55,7 +55,7 @@ LLM_MODEL       = os.environ.get("LLM_MODEL", "qwen2.5:14b")
 EMBED_MODEL      = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 
 QDRANT_URL       = os.environ.get("QDRANT_URL", "http://127.0.0.1:6333")
-QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "rag_docs_v10")
+QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "rag_docs_v12")
 
 CHUNK_SIZE       = 1024
 CHUNK_OVERLAP    = 128
@@ -63,8 +63,10 @@ TOP_K            = 10      # финальных чанков в контекст
 BM25_TOP_K       = 12      # кандидатов от BM25
 VECTOR_TOP_K     = 12      # кандидатов от вектора
 
-BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25"))
-CACHE_VERSION    = "v21-redis-exact-response-cache"
+# A semantic/chunking change must never reuse an older docstore or vector
+# collection: the two indexes must describe precisely the same corpus.
+BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25_v12"))
+CACHE_VERSION    = "v26-regulation-formula-linked-chunks"
 MAX_OUTPUT_TOKENS = 4056
 
 PROMPT_INJECTION_MARKERS = (
@@ -213,11 +215,23 @@ class PrismQuery:
     answer_mode: str
 
 
+FORMULA_QUERY_MARKERS = (
+    "формула", "формуле", "формулу", "формулы", "формул",
+    "уравнение", "уравнении", "расчетное правило", "расчётное правило",
+)
+
+
+def is_formula_question(question: str) -> bool:
+    """Recognise every common Russian grammatical form of a formula request."""
+    normalized = (question or "").lower().replace("ё", "е")
+    return any(marker in normalized for marker in FORMULA_QUERY_MARKERS)
+
+
 def refine_prism_query(question: str) -> PrismQuery:
     """Turn a user question into a small, inspectable PRISM retrieval contract."""
     normalized = question.lower()
     target_sections = requested_section_numbers(question)
-    asks_for_formulas = any(marker in normalized for marker in ("формул", "формула", "уравнен", "расчетное правило"))
+    asks_for_formulas = is_formula_question(question)
     intent = "formula_extraction" if asks_for_formulas else detect_query_intent(question)
     answer_mode = "formulas_only" if asks_for_formulas else "grounded_answer"
 
@@ -317,7 +331,12 @@ def _cleanup_formula_noise(text: str) -> str:
     text = re.sub(r"\bИВО-1\b", "ИВ0-1", text)
     text = re.sub(r"\bИВО\b", "ИВ0", text)
     text = re.sub(r"(?:\[\]\s*){2,}", " ", text)
-    text = re.sub(r"\s{2,}", " ", text)
+    # Preserve paragraph boundaries: Markdown headings carry the semantic
+    # structure used by the RAG chunker.  Collapsing ``\n\n`` here silently
+    # turns an entire regulation into one anonymous section.
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text
 
 
@@ -438,7 +457,7 @@ def extract_chunk_metadata(text: str) -> dict:
     status_scope = f"{section_path}\n{cleaned[:900]}".lower()
 
     status = "deleted" if re.search(
-        r"утратил[аио]?\s+силу|пункт\s+удален|исключен[оа]?|не\s+применяется",
+        r"утратил[аио]?\s+силу|пункт\s+(?:удален|исключен)|исключен[оа]?\s+из\s+регламента|не\s+применяется",
         status_scope,
     ) else "active"
 
@@ -653,11 +672,48 @@ def _plain_evidence_text(text: str) -> str:
 def clean_formula_artifacts(text: str) -> str:
     """Remove empty placeholders left by partially parsed Word formulas."""
     text = text or ""
+    text = re.sub(r"<a\s+id=[\"'][^\"']+[\"']\s*></a>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<!--\s*F-\d{4}\s*-->", "", text)
     text = re.sub(r"\(\s*\)", "", text)
     text = re.sub(r"\[\s*\]", "", text)
     text = re.sub(r"[ \t]+([,.;:])", r"\1", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
+
+
+def format_formula_for_display(formula: str) -> str:
+    """Make legacy Word/WMF LaTeX readable in Markdown without KaTeX errors.
+
+    The source uses Cyrillic ``\\mathrm`` payloads and escaped Word spacing
+    commands.  KaTeX rejects those fragments, while a compact textual formula
+    preserves the operator and every index for verification.
+    """
+    value = clean_formula_artifacts(formula).replace("$", "")
+    previous = None
+    while previous != value:
+        previous = value
+        value = re.sub(r"\\mathrm\{([^{}]*)\}", r"\1", value)
+    value = value.replace("\\_", "_").replace("\\ ", " ").replace("\\.", ".")
+    value = re.sub(r"\\(?:left|right|bigl|bigr|displaystyle)\s*", "", value)
+    value = value.replace("МIN", "MIN").replace("МAX", "MAX")
+    value = re.sub(r"\s+", " ", value)
+    value = re.sub(r"\s*([,.;:])\s*", r"\1 ", value)
+    value = re.sub(r"(?<=[A-Za-zА-Яа-я]),\s+(?=[A-Za-zА-Яа-я])", ",", value)
+    value = re.sub(r"\s+}", "}", value)
+    return value.strip()
+
+
+def format_formula_for_katex(formula: str) -> str:
+    """Return valid inline KaTeX for a legacy formula when possible."""
+    value = clean_formula_artifacts(formula).replace("$", "")
+    value = value.replace("\\_", "_").replace("\\ ", " ").replace("\\.", ".")
+    # Every legacy ``\\mathrm`` payload here is a flat Word run.  Rendering it
+    # as ``\\text`` lets KaTeX display Cyrillic labels without treating them as
+    # unsupported math commands.
+    value = re.sub(r"\\mathrm\{([^{}]*)\}", lambda match: f"\\text{{{match.group(1)}}}", value)
+    value = value.replace("МIN", r"\min").replace("МAX", r"\max")
+    value = re.sub(r"\s*\.\s*$", "", value).strip()
+    return f"${value}$"
 
 
 def _split_evidence_sentences(text: str) -> list[str]:
@@ -798,7 +854,76 @@ def build_section_documents(text: str, source_path: Path, backend: str) -> list[
         return compacted
 
     cleaned = _cleanup_formula_noise(text)
+    # Converter bookkeeping precedes Markdown headings in the source.  It is
+    # not normative text and must not become part of the previous section.
+    cleaned = re.sub(r"<a\s+id=[\"'][^\"']+[\"']\s*></a>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"(?m)^\d+(?:\.\d+)*\.\s+Раздел\s*\n", "", cleaned)
+    cleaned = re.sub(r"(?m)^<!--\s*rag-heading-level:[^>]*-->\s*\n?", "", cleaned)
     matches = list(re.finditer(r"\[SECTION:\s*([^\]]+)\]", cleaned))
+    if not matches:
+        # RAG-ready Markdown stores every numbered semantic unit as a heading.
+        # Preserve that boundary instead of splitting the entire file as one
+        # anonymous document; otherwise a precise regulation clause cannot be
+        # selected over neighbouring formulas with similar vocabulary.
+        markdown_matches = list(re.finditer(r"^(#{1,6})\s+(.+?)\s*$", cleaned, re.MULTILINE))
+        if markdown_matches:
+            documents: list[Document] = []
+            preamble = cleaned[:markdown_matches[0].start()].strip()
+            if preamble:
+                documents.append(Document(
+                    text=preamble,
+                    doc_id=f"{source_path.name}_preamble",
+                    metadata=compact_meta({
+                        "file_name": source_path.name,
+                        "file_path": str(source_path),
+                        "ingestion_backend": backend,
+                        "section_path": "",
+                        "section_title": "",
+                        "parent_section": "",
+                        "status": "active",
+                        "chunk_type": "unknown",
+                    }),
+                ))
+
+            # Word often stores an equation as the paragraph immediately after
+            # its governing clause.  The RAG conversion renders that paragraph
+            # as a Markdown heading (for example ``= MIN(...)``).  It is not a
+            # semantic section.  Keep it in the preceding clause so retrieval
+            # can never return a rate description without its exact formula.
+            section_units: list[dict[str, str]] = []
+            for index, match in enumerate(markdown_matches):
+                section_path = match.group(2).strip()
+                end = markdown_matches[index + 1].start() if index + 1 < len(markdown_matches) else len(cleaned)
+                body = cleaned[match.end():end].strip()
+                formula_heading = bool(re.match(r"^(?:=|≈|≠|≤|≥|\$?\\?[A-Za-zА-Яа-яΔСТ])", section_path)) and (
+                    "=" in section_path or re.search(r"\b(?:min|max)\s*\(", section_path, re.IGNORECASE)
+                )
+                if formula_heading and section_units:
+                    formula = section_path
+                    if body:
+                        formula += f"\n{body}"
+                    section_units[-1]["formula"] = "\n\n[FORMULA]\n" + formula
+                    continue
+                section_units.append({"title": section_path, "body": body, "formula": ""})
+
+            for index, unit in enumerate(section_units):
+                section_path = unit["title"]
+                section_text = f"[SECTION: {section_path}]" + unit["formula"]
+                if unit["body"]:
+                    section_text += f"\n{unit['body']}"
+                section_meta = extract_chunk_metadata(section_text)
+                section_key = hashlib.sha256(section_path.encode("utf-8")).hexdigest()[:10]
+                documents.append(Document(
+                    text=section_text,
+                    doc_id=f"{source_path.name}_section_{section_key}_{index}",
+                    metadata=compact_meta({
+                        "file_name": source_path.name,
+                        "file_path": str(source_path),
+                        "ingestion_backend": backend,
+                        **section_meta,
+                    }),
+                ))
+            return documents
     if not matches:
         meta = {
             "file_name": source_path.name,
@@ -871,6 +996,15 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
     seen: set[str] = set()
     requested = requested_formula_terms(question)
     intent = detect_query_intent(question)
+    formula_request = is_formula_question(question)
+    question_terms = tuple(term.replace("ё", "е") for term in section_query_terms(question))
+    generic_formula_terms = {
+        "формуле", "формулу", "формулы", "формул", "определяется",
+    }
+    specific_terms = tuple(
+        term for term in question_terms
+        if len(term) >= 7 and term not in generic_formula_terms
+    )
 
     def add(candidate: str, *, requested_term_already_matched: bool = False) -> None:
         candidate = clean_formula_artifacts(_plain_evidence_text(candidate))
@@ -887,6 +1021,40 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
 
     for raw in texts:
         cleaned = _cleanup_formula_noise(raw)
+        searchable = cleaned.lower().replace("ё", "е")
+
+        if formula_request:
+            linked_formulas = re.findall(
+                r"\[FORMULA\]\s*(?:#{1,6}\s*)?([^\n]+)",
+                cleaned,
+            )
+            for formula in linked_formulas:
+                if "=" in formula:
+                    add(formula)
+                    return calculations[:1]
+            # Prefer a compact equality from a section that actually matches the
+            # question.  This prevents a formula-only answer from turning into a
+            # dump of adjacent narrative rules.
+            matched_terms = sum(contains_term(searchable, term) for term in question_terms)
+            matched_specific_terms = sum(contains_term(searchable, term) for term in specific_terms)
+            enough_overlap = matched_specific_terms >= min(2, len(specific_terms)) if specific_terms else matched_terms >= 2
+            if enough_overlap:
+                equations = re.findall(
+                    r"=\s*[^\s\n(]{1,8}\s*\([^\n)]{1,500}\)\.?",
+                    cleaned,
+                )
+                if equations:
+                    add(equations[0])
+                    return calculations[:1]
+                # In the RAG Markdown, a normative rule can be the heading
+                # itself (with no following paragraph). Keep that wording as
+                # the evidence instead of discarding it as section metadata.
+                section_headers = re.findall(r"\[SECTION:\s*([^\]]+)\]", cleaned)
+                if section_headers and "определяется" in section_headers[-1].lower():
+                    add(section_headers[-1])
+                    if calculations:
+                        return calculations[:1]
+
         symbolic_patterns = re.findall(
             r"(\[С_sub\([^\]]+\)\]\s*=\s*\[ΔО_sub\([^\]]+\)\]\s*\*\s*\[Т_sub\([^\]]+\)\](?:\s*[+*]\s*[^.\n]+)?\.?)",
             cleaned,
@@ -896,13 +1064,17 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
                 continue
             add(candidate)
 
-        if intent == "value":
+        # A formula can define a price or rate, so cost intent must not suppress
+        # calculation extraction merely because the question contains "ставка".
+        if intent == "value" or formula_request:
             text = _plain_evidence_text(cleaned)
             sections = re.findall(r"\[SECTION:\s*([^\]]+)\]", cleaned)
             section_haystack = sections[-1] if sections else ""
             section_terms = [term for term in requested if contains_term(section_haystack, term)]
             sentences = _split_evidence_sentences(text)
             for sentence in sentences:
+                if formula_request and re.search(r"[çæøï]", sentence):
+                    continue
                 lower = sentence.lower()
                 if not (
                     "определяется" in lower
@@ -921,29 +1093,65 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
                     add(sentence)
                 if len(calculations) >= 12:
                     return calculations[:12]
+            # For a formula request, one clause with strong lexical coverage is
+            # safer than concatenating neighbouring formulas from other rules.
+            if formula_request and enough_overlap and calculations:
+                return calculations[:1]
 
     return calculations[:12]
 
 
 def generate_formula_only_answer(question: str, context: list[dict], calculations: list[str], spec: PrismQuery) -> str:
-    """Answer formula extraction requests without prose synthesis or unrelated rules."""
-    if not calculations:
-        target = f" пункта {', '.join(spec.target_sections)}" if spec.target_sections else ""
-        return f"В отобранном evidence{target} формулы или расчетные правила не найдены."
+    """Return only a rule that is tied to one confirmed regulation clause."""
+    confirmed = next(
+        (item for item in context if "formula-clause-exact" in item.get("matched_queries", [])),
+        None,
+    )
+    if confirmed is None and spec.target_sections:
+        confirmed = next(
+            (item for item in context if any(
+                re.search(rf"(?<!\d){re.escape(section)}(?:\.|\b)(?!\d)", str(item.get("section_path", "")))
+                for section in spec.target_sections
+            )),
+            None,
+        )
+    if confirmed is None:
+        # The caller may already have extracted a calculation from an explicit
+        # section query.  It remains deterministic evidence, even when the
+        # in-memory context fixture has no metadata (for example CLI/tests).
+        if calculations:
+            target = f" п. {', '.join(spec.target_sections)}" if spec.target_sections else " извлечённого контекста"
+            return clean_formula_artifacts(
+                f"**Источник:**{target}.\n\n" + "\n".join(f"- {item}" for item in calculations[:1])
+            )
+        return "Недостаточно подтверждённых данных: для формулы не найден конкретный пункт Регламента."
 
-    lines: list[str] = []
-    if spec.target_sections:
-        lines.append(f"Расчетные правила из пункта {', '.join(spec.target_sections)}:")
-    else:
-        lines.append("Расчетные правила из извлеченного контекста:")
-    lines.extend(f"- {calculation}" for calculation in calculations)
-    return clean_formula_artifacts("\n".join(lines))
+    confirmed_calculations = extract_formula_lines_from_texts([str(confirmed.get("text", ""))], question)
+    if not confirmed_calculations:
+        return "Недостаточно подтверждённых данных: в найденном пункте нет извлечённой формулы или расчётного правила."
+
+    section = str(confirmed.get("section_path", "")).strip()
+    section_number = re.match(r"(\d+(?:\.\d+)*)", section)
+    source = f"п. {section_number.group(1)}" if section_number else "подтверждённый пункт Регламента"
+    return clean_formula_artifacts(
+        f"**Источник:** {source}.\n\n" + "\n".join(
+            f"- {format_formula_for_katex(item)}" for item in confirmed_calculations[:1]
+        )
+    )
 
 
 def rerank_context_results(results: list[dict], question: str) -> list[dict]:
     intent = detect_query_intent(question)
     requested = requested_formula_terms(question)
     normalized_question = question.lower().replace("ё", "е")
+    formula_request = is_formula_question(question)
+    generic_formula_terms = {
+        "формуле", "определяется", "ставка", "объемов", "собственной", "инициативе",
+    }
+    formula_terms = tuple(
+        term for term in section_query_terms(question)
+        if len(term) >= 7 and term not in generic_formula_terms
+    )
     is_parameter_creation = (
         "параметр" in normalized_question
         and any(marker in normalized_question for marker in ("добав", "созда", "новый", "завест"))
@@ -957,6 +1165,12 @@ def rerank_context_results(results: list[dict], question: str) -> list[dict]:
         section_title = str(item.get("section_title", "")).lower()
         chunk_type = item.get("chunk_type", "unknown")
         status = item.get("status", "active")
+
+        if formula_request and formula_terms:
+            matches = sum(contains_term(lower, term) for term in formula_terms)
+            score += matches * 0.14
+            if matches == 0:
+                score -= 0.22
 
         if is_parameter_creation:
             target = f"{section_path}\n{section_title}\n{lower[:800]}".replace("ё", "е")
@@ -1094,6 +1308,24 @@ def sanitize_grounded_answer(answer: str, question: str, allowed_calculations: l
         cleaned_lines.append(line)
 
     answer = "\n".join(cleaned_lines)
+    # The model must not expand regulatory abbreviations from general language.
+    # The source may contain the abbreviation without its definition; retaining
+    # it is safer than emitting an invented expansion such as "группа точек
+    # производства" or "группа технологического процесса".
+    answer = re.sub(r"(?i)групп[аы]\s+точек\s+производства\s*\(\s*гтп\s*\)", "ГТП", answer)
+    answer = re.sub(r"(?i)групп[аы]\s+технологическ\w*\s+процесс\w*\s*\(\s*гтп\s*\)", "ГТП", answer)
+    answer = re.sub(r"(?i)энергоблок\w*\s*\(\s*его\s*\)", "ЕГО", answer)
+    answer = re.sub(r"(?i)(?:координационн\w*|координирующ\w*)\s+орган\s*\(\s*ко\s*\)", "КО", answer)
+    # Keep regulatory shorthand verbatim unless its expansion was supplied as
+    # an explicit source fact.  Qwen otherwise invents plausible-looking
+    # expansions (for example "Группа Технических Условий") that change the
+    # legal meaning of an answer.
+    answer = re.sub(
+        r"\b(ГТП|ЕГО|ОРЭ|КО)\s*\(\s*[^()\n]{2,100}\s*\)",
+        r"\1",
+        answer,
+    )
+    answer = re.sub(r"(?im)^.*учредител\w*\s+пдг.*(?:\n|$)", "", answer)
     answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
     return answer
 
@@ -1580,6 +1812,156 @@ class RAGAgent:
                 seeds.append(best[1])
         return seeds
 
+    def _formula_clause_seed_results(self, question: str) -> list[dict]:
+        """Seed the clause whose wording most exactly matches a formula request."""
+        normalized = question.lower().replace("ё", "е")
+        if not is_formula_question(question):
+            return []
+
+        generic_terms = {
+            "формула", "формулы", "формуле", "приведи", "покажи", "объясни",
+            "объяснить", "обозначения", "расчетное", "расчётное", "правило",
+            "определяется", "величина", "электроэнергии", "операционных", "суток",
+        }
+        terms = tuple(
+            term.replace("ё", "е") for term in section_query_terms(question)
+            if len(term) >= 5 and term not in generic_terms
+        )
+        if len(terms) < 2:
+            return []
+
+        requires_own_increase = (
+            "собствен" in normalized
+            and any(token in normalized for token in ("увеличен", "увеличить", "увеличения"))
+        )
+        requires_own_decrease = (
+            "собствен" in normalized
+            and any(token in normalized for token in ("снижен", "уменьшен", "сокращен"))
+        )
+        required_anchors = tuple(
+            anchor for anchor in ("вынужден", "внешн", "собствен", "экспорт", "импорт", "виэ", "гаэс")
+            if anchor in normalized
+        )
+
+        matches: list[tuple[float, dict]] = []
+        primary_matches: list[tuple[float, dict]] = []
+        for node in self._all_nodes:
+            meta = node.metadata or {}
+            text = node.text or ""
+            lower = text.lower().replace("ё", "е")
+            if any(not contains_term(lower, anchor) for anchor in required_anchors):
+                continue
+            # A cost formula can contain both price directions.  Its governing
+            # clause must explicitly state the requested own-initiative
+            # direction, otherwise min/max and the price index are unsafe.
+            own_direction_scope = f"{meta.get('section_path', '')}\n{lower[:1800]}"
+            if requires_own_increase and not re.search(
+                r"собствен\w*\s+инициатив\w*.{0,100}(?:в\s+сторону\s+)?увелич",
+                own_direction_scope,
+                re.IGNORECASE | re.DOTALL,
+            ):
+                continue
+            if requires_own_decrease and not re.search(
+                r"собствен\w*\s+инициатив\w*.{0,100}(?:в\s+сторону\s+)?(?:снижен|уменьшен|сокращен)",
+                own_direction_scope,
+                re.IGNORECASE | re.DOTALL,
+            ):
+                continue
+            matched = sum(contains_term(lower, term) for term in terms)
+            if matched < 2:
+                continue
+            coverage = matched / len(terms)
+            if coverage < 0.60:
+                continue
+            chunk_meta = {
+                **extract_chunk_metadata(text),
+                **{k: v for k, v in meta.items() if k in {
+                    "section_path", "section_title", "parent_section", "status", "chunk_type",
+                } and v},
+            }
+            if chunk_meta.get("status") == "deleted":
+                continue
+            score = 1.0 + coverage
+            if text.lstrip().startswith("[SECTION:"):
+                score += 0.30
+            if "определяется" in lower:
+                score += 0.15
+            if "$" in text:
+                score += 0.10
+            result = (score, {
+                "file": meta.get("file_name", meta.get("file_path", "?")),
+                "score": round(score, 4),
+                "text": text,
+                "matched_queries": ["formula-clause-exact"],
+                **chunk_meta,
+            })
+            matches.append(result)
+        return [item for _, item in sorted(matches, key=lambda pair: pair[0], reverse=True)[:3]]
+
+    def _regulation_concept_seed_results(self, question: str) -> list[dict]:
+        """Return only the governing clause for recurring regulation concepts.
+
+        These anchors are intentionally based on the document's own headings
+        and terms, not on generated answers.  They prevent a later cost/rate
+        clause from outranking the base rule merely because it repeats the
+        same abbreviation.
+        """
+        normalized = question.lower().replace("ё", "е")
+        required: tuple[str, ...] = ()
+        preferred: tuple[str, ...] = ()
+        result_limit = 1
+        if all(token in normalized for token in ("планов", "переток", "экспорт", "импорт")):
+            required = ("планов", "переток", "экспорт", "импорт")
+            preferred = ("конкурентного отбора ценовых заявок",)
+        elif "допустим" in normalized and "диапазон" in normalized and "виэ" in normalized:
+            required = ("допустимый диапазон", "виэ")
+            preferred = ("10", "установленной мощности")
+        elif "оперативн" in normalized and ("ценопринима" in normalized or "оцз" in normalized):
+            required = ("оперативн", "ценопринима")
+            preferred = ("ко определяет величины", "не учитывает объем")
+            result_limit = 2
+        elif "внешн" in normalized and "собствен" in normalized and "инициатив" in normalized:
+            required = ("внешн", "собствен", "инициатив")
+            preferred = ("виды инициатив отклонений", "причине его возникновения")
+        if not required:
+            return []
+
+        matches: list[tuple[float, dict]] = []
+        primary_matches: list[tuple[float, dict]] = []
+        for node in self._all_nodes:
+            meta = node.metadata or {}
+            text = node.text or ""
+            lower = text.lower().replace("ё", "е")
+            if any(token not in lower for token in required):
+                continue
+            if required == ("планов", "переток", "экспорт", "импорт") and "планового объема перетока" not in lower:
+                continue
+            if required == ("внешн", "собствен", "инициатив") and "виды инициатив отклонений" not in lower:
+                continue
+            chunk_meta = {**extract_chunk_metadata(text), **{
+                key: value for key, value in meta.items()
+                if key in {"section_path", "section_title", "parent_section", "status", "chunk_type"} and value
+            }}
+            if chunk_meta.get("status") == "deleted":
+                continue
+            score = 2.0 + sum(0.35 for phrase in preferred if phrase in lower)
+            # Cost-specific paragraphs mentioning OЦЗ are supporting evidence,
+            # never the governing rule for an "учет ОЦЗ" question.
+            if "оперативн" in required and ("расчетные показатели стоимости" in lower or "ставка" in lower):
+                score -= 0.80
+            result = (score, {
+                "file": meta.get("file_name", meta.get("file_path", "?")),
+                "score": round(score, 4),
+                "text": text,
+                "matched_queries": ["regulation-concept-exact"],
+                **chunk_meta,
+            })
+            matches.append(result)
+            if str(meta.get("file_name", "")).lower().endswith("_r12_rag.md"):
+                primary_matches.append(result)
+        candidates = primary_matches or matches
+        return [item for _, item in sorted(candidates, key=lambda pair: pair[0], reverse=True)[:result_limit]]
+
     def retrieve_context(self, question: str, top_k: int = 10, spec: PrismQuery | None = None) -> list[dict]:
         """Вернуть найденные чанки без вызова LLM."""
         spec = spec or refine_prism_query(question)
@@ -1593,6 +1975,13 @@ class RAGAgent:
             key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
             merged[key] = item
         for item in self._section_seed_results(question):
+            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
+            merged[key] = item
+        for item in self._formula_clause_seed_results(question):
+            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
+            merged[key] = item
+        concept_seeds = self._regulation_concept_seed_results(question)
+        for item in concept_seeds:
             key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
             merged[key] = item
         for query in build_targeted_queries(question):
@@ -1631,6 +2020,14 @@ class RAGAgent:
         ranked = rerank_context_results(results, question)
         diversified = diversify_context_results(ranked, question, top_k)
         selected = select_prism_evidence(diversified, spec, top_k)
+        concept_selected = [
+            item for item in selected
+            if "regulation-concept-exact" in item.get("matched_queries", [])
+        ]
+        if concept_selected:
+            # A narrowly matched governing clause is safer than mixing in
+            # similarly-worded exceptions from later chapters.
+            return concept_selected[:3]
         normalized = question.lower().replace("ё", "е")
         if "параметр" in normalized and any(
             marker in normalized for marker in ("добав", "созда", "новый", "завест")

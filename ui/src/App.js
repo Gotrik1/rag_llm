@@ -1,9 +1,12 @@
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
 import { AssistantRuntimeProvider, ComposerPrimitive, MessagePrimitive, ThreadPrimitive, useExternalStoreRuntime, useMessage } from "@assistant-ui/react";
 import ReactMarkdown from "react-markdown";
+import "katex/dist/katex.min.css";
+import rehypeKatex from "rehype-katex";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import { AlertTriangle, Bot, Bug, CheckCircle2, Copy, Database, Cpu, FileText, Files, Folder, FolderInput, Maximize2, PanelRight, PanelLeftClose, PanelLeftOpen, Paintbrush, Pencil, Pin, Plus, RefreshCw, Save, Send, Settings2, Sigma, Sparkles, TestTube2, Trash2, UploadCloud, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -772,7 +775,7 @@ function Message() {
     return (_jsx(MessagePrimitive.Root, { className: `message-row ${isAssistant ? "assistant" : "user"}`, children: _jsxs("div", { className: "message-body", children: [isAssistant && typeof modelLabel === "string" && modelLabel ? (_jsxs("div", { className: "model-badge", children: ["\u041E\u0442\u0432\u0435\u0442\u0438\u043B: ", modelLabel] })) : null, isAssistant ? (_jsx(MarkdownAnswer, { markdown: text })) : (_jsx(MessagePrimitive.Content, {})), _jsxs("div", { className: "message-actions", children: [_jsx("button", { className: "icon-button", type: "button", onClick: () => void copyMessage(), title: "\u041A\u043E\u043F\u0438\u0440\u043E\u0432\u0430\u0442\u044C \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435", "aria-label": "\u041A\u043E\u043F\u0438\u0440\u043E\u0432\u0430\u0442\u044C \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435", children: _jsx(Copy, { size: 14 }) }), _jsx("span", { className: `message-copy-feedback ${copied ? "visible" : ""}`, "aria-live": "polite", children: "\u0421\u043A\u043E\u043F\u0438\u0440\u043E\u0432\u0430\u043D\u043E" })] })] }) }));
 }
 function MarkdownAnswer({ markdown }) {
-    return (_jsx(ReactMarkdown, { className: "answer-markdown", remarkPlugins: [remarkGfm], rehypePlugins: [rehypeRaw, rehypeSanitize], components: { table: ({ children }) => _jsx(MarkdownTable, { children: children }) }, children: normalizeMarkdown(markdown) }));
+    return (_jsx(ReactMarkdown, { className: "answer-markdown", remarkPlugins: [remarkGfm, remarkMath], rehypePlugins: [rehypeRaw, rehypeSanitize, rehypeKatex], components: { table: ({ children }) => _jsx(MarkdownTable, { children: children }) }, children: normalizeMarkdown(markdown) }));
 }
 function normalizeMarkdown(markdown) {
     const normalized = markdown

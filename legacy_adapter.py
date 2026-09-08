@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from email.message import Message
 from io import BytesIO
 from typing import Any
 
@@ -33,10 +34,14 @@ def invoke_legacy(
     handler = object.__new__(Handler)
     handler.path = path
     handler.command = method.upper()
-    handler.headers = {
-        "Content-Type": content_type or "application/json",
-        "Content-Length": str(len(raw_body)),
-    }
+    # ``cgi.FieldStorage`` expects the email-style header interface provided by
+    # ``BaseHTTPRequestHandler``. A plain dict loses multipart boundary parsing
+    # in the ASGI compatibility path, making every uploaded file list appear
+    # empty to the legacy handler.
+    headers = Message()
+    headers["Content-Type"] = content_type or "application/json"
+    headers["Content-Length"] = str(len(raw_body))
+    handler.headers = headers
     handler.rfile = BytesIO(raw_body)
     handler.send_json = lambda payload, status=200: captured.update(payload=payload, status=status)
 

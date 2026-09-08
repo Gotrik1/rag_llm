@@ -8,6 +8,7 @@
   --muted: #66717f;
   --blue: #2563eb;
   --blue-2: #1d4ed8;
+  --interaction-highlight: #898995;
   --green: #0f766e;
   --amber: #b45309;
   --warn-bg: #fff7ed;
@@ -128,7 +129,7 @@ textarea {
 }
 
 .new-thread:hover {
-  background: #1d2228;
+  background: var(--interaction-highlight);
 }
 
 .sidebar-topbar {
@@ -164,7 +165,7 @@ textarea {
 }
 
 .sidebar-collapse:hover {
-  background: #1c1c1c;
+  background: var(--interaction-highlight);
   color: #ffffff;
 }
 
@@ -222,8 +223,8 @@ textarea {
 }
 
 .nav-add-project:hover {
-  background: #898995;
-  border-color: #898995;
+  background: var(--interaction-highlight);
+  border-color: var(--interaction-highlight);
   color: #fff;
 }
 
@@ -279,7 +280,7 @@ textarea {
 }
 
 .nav-menu-action:hover {
-  background: #72727f;
+  background: var(--interaction-highlight);
 }
 
 .nav-menu-action.danger {
@@ -320,7 +321,7 @@ textarea {
 }
 
 .nav-inline-action:hover {
-  background: #1c1c1c;
+  background: var(--interaction-highlight);
   color: #fff;
 }
 
@@ -388,7 +389,7 @@ textarea {
 }
 
 .nav-move-menu button:hover:not(:disabled) {
-  background: #292929;
+  background: var(--interaction-highlight);
 }
 
 .nav-move-menu button:disabled {
@@ -465,7 +466,7 @@ textarea {
 }
 
 .nav-item:hover {
-  background: #383838;
+  background: var(--interaction-highlight);
   color: #ffffff;
 }
 
@@ -504,7 +505,7 @@ textarea {
 }
 
 .show-more:hover {
-  color: #d7e5ff;
+  color: var(--interaction-highlight);
 }
 
 .sidebar-empty {
@@ -639,8 +640,8 @@ textarea {
 }
 
 .refresh-models:hover:not(:disabled) {
-  background: #202833;
-  color: #f6f8fb;
+  background: var(--interaction-highlight);
+  color: #ffffff;
 }
 
 .refresh-models:disabled {
@@ -709,8 +710,8 @@ textarea {
 }
 
 .file-picker:hover {
-  border-color: #6b7788;
-  background: #1b232c;
+  border-color: var(--interaction-highlight);
+  background: var(--interaction-highlight);
 }
 
 .file-picker span,
@@ -770,7 +771,7 @@ textarea {
 }
 
 .upload-button:hover {
-  background: #1d4ed8;
+  background: var(--interaction-highlight);
 }
 
 .upload-button:disabled {
@@ -976,6 +977,26 @@ textarea {
 
 .answer-markdown pre code { padding: 0; background: transparent; }
 
+/* Keep long display equations readable on narrow chat panels. */
+.answer-markdown .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 4px 0;
+}
+
+/* Compact superscripts and subscripts in dense regulatory notation. */
+.answer-markdown .katex .msupsub {
+  font-size: 0.60em !important;
+}
+
+.answer-markdown .katex .msupsub .vlist-t2 > .vlist-r:first-child > .vlist > span:first-child {
+  transform: translateY(2px);
+}
+
+.answer-markdown .katex .msupsub .vlist-t2 > .vlist-r:first-child > .vlist > span:nth-child(2) {
+  transform: translateY(-2px);
+}
+
 .markdown-table { margin: 0 0 12px; border: 1px solid var(--border); border-radius: 9px; overflow: hidden; }
 
 .markdown-table-toolbar,
@@ -1012,7 +1033,10 @@ textarea {
 }
 
 .markdown-table-toolbar button:hover,
-.markdown-table-modal-heading button:hover { border-color: var(--accent); color: var(--accent); }
+.markdown-table-modal-heading button:hover {
+  border-color: var(--interaction-highlight);
+  color: var(--interaction-highlight);
+}
 
 .markdown-table-scroll { overflow-x: auto; }
 
@@ -1122,9 +1146,9 @@ sub {
 }
 
 .icon-button:hover {
-  border-color: var(--border);
-  background: var(--surface-2);
-  color: var(--text);
+  border-color: var(--interaction-highlight);
+  background: var(--interaction-highlight);
+  color: #ffffff;
 }
 
 .thread-footer {
@@ -1185,7 +1209,7 @@ sub {
 }
 
 .send-button:hover {
-  background: var(--blue-2);
+  background: var(--interaction-highlight);
 }
 
 .send-button:disabled {
@@ -1315,8 +1339,8 @@ sub {
 }
 
 .chat-list-item:hover {
-  border-color: var(--border);
-  background: var(--surface);
+  border-color: var(--interaction-highlight);
+  background: var(--interaction-highlight);
 }
 
 .chat-list-item span {
@@ -1574,8 +1598,8 @@ sub {
 
 .theme-portal .new-thread:hover,
 .theme-portal .new-thread:focus-visible {
-  border-color: #898995;
-  background: #898995;
+  border-color: var(--interaction-highlight);
+  background: var(--interaction-highlight);
   color: #ffffff;
   outline: 0;
 }
@@ -1589,8 +1613,8 @@ sub {
 }
 
 .theme-portal .sidebar-collapse:hover {
-  background: var(--sidebar-hover-bg);
-  color: var(--sidebar-hover-text);
+  background: var(--interaction-highlight);
+  color: #ffffff;
 }
 
 .theme-portal .nav-section-title {
@@ -1607,8 +1631,8 @@ sub {
 
 .theme-portal .nav-row:hover > .nav-item,
 .theme-portal .nav-item:hover {
-  border-color: #898995;
-  background: #898995;
+  border-color: var(--interaction-highlight);
+  background: var(--interaction-highlight);
   box-shadow: none;
   color: #ffffff;
 }
@@ -1628,8 +1652,8 @@ sub {
 }
 
 .theme-portal .nav-item.active:hover {
-  background: #898995;
-  border-color: #898995;
+  background: var(--interaction-highlight);
+  border-color: var(--interaction-highlight);
   box-shadow: none;
   color: #ffffff;
 }
@@ -1643,8 +1667,8 @@ sub {
 }
 
 .theme-portal .nav-inline-action:hover {
-  background: var(--sidebar-hover-bg);
-  color: var(--sidebar-hover-text);
+  background: var(--interaction-highlight);
+  color: #ffffff;
 }
 
 .theme-portal .nav-move-menu {
@@ -1662,12 +1686,13 @@ sub {
 }
 
 .theme-portal .nav-move-menu button:hover:not(:disabled) {
-  background: var(--sidebar-hover-bg);
+  background: var(--interaction-highlight);
+  color: #ffffff;
 }
 
 .theme-portal .nav-add-project:hover {
-  background: #898995;
-  border-color: #898995;
+  background: var(--interaction-highlight);
+  border-color: var(--interaction-highlight);
   color: #ffffff;
 }
 
@@ -1695,7 +1720,7 @@ sub {
 .theme-portal .send-button:hover,
 .theme-portal .evidence-panel .upload-button:hover,
 .theme-portal .evidence-panel .provider-actions .provider-save:hover {
-  background: #d97422;
+  background: var(--interaction-highlight);
 }
 
 .theme-portal .thread-footer {
@@ -1730,7 +1755,8 @@ sub {
 }
 
 .theme-portal .panel-tabs button.active {
-  color: #9f483d;
+  background: var(--interaction-highlight);
+  color: #ffffff;
 }
 
 .panel-heading {
@@ -1778,8 +1804,8 @@ sub {
 }
 
 .panel-tabs button.active {
-  background: white;
-  color: var(--text);
+  background: var(--interaction-highlight);
+  color: #ffffff;
   box-shadow: 0 1px 4px rgba(31, 42, 55, 0.08);
 }
 
@@ -1891,7 +1917,8 @@ sub {
 }
 
 .debug-button:hover {
-  background: #e1ecff;
+  background: var(--interaction-highlight);
+  color: #ffffff;
 }
 
 .debug-button:disabled {

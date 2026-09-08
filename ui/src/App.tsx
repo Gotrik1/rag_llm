@@ -10,9 +10,12 @@ import {
   type ThreadMessageLike
 } from "@assistant-ui/react";
 import ReactMarkdown from "react-markdown";
+import "katex/dist/katex.min.css";
+import rehypeKatex from "rehype-katex";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import {
   AlertTriangle,
   Bot,
@@ -1539,8 +1542,8 @@ function MarkdownAnswer({ markdown }: { markdown: string }) {
   return (
     <ReactMarkdown
       className="answer-markdown"
-      remarkPlugins={[remarkGfm]}
-      rehypePlugins={[rehypeRaw, rehypeSanitize]}
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[rehypeRaw, rehypeSanitize, rehypeKatex]}
       components={{ table: ({ children }) => <MarkdownTable>{children}</MarkdownTable> }}
     >
       {normalizeMarkdown(markdown)}

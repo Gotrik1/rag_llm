@@ -1,15 +1,56 @@
 import unittest
+from pathlib import Path
 
 from rag_agent import (
+    build_section_documents,
+    extract_formula_lines_from_texts,
+    format_formula_for_display,
+    format_formula_for_katex,
     generate_formula_only_answer,
     refine_prism_query,
     rerank_context_results,
+    sanitize_grounded_answer,
     select_prism_evidence,
     validate_retrieval,
 )
 
 
 class PrismQueryTests(unittest.TestCase):
+    def test_formula_heading_is_linked_to_the_governing_clause(self):
+        markdown = """#### 4.4.2.6. Ставка по собственной инициативе в сторону увеличения определяется как минимальная величина:\n\n#### = MIN(Ц_i,q^-, Т_i,q).\n"""
+
+        docs = build_section_documents(markdown, Path("r12_rag.md"), "xml")
+
+        self.assertEqual(len(docs), 1)
+        self.assertIn("[FORMULA]", docs[0].text)
+        self.assertIn("= MIN(Ц_i,q^-, Т_i,q)", docs[0].text)
+        formulas = extract_formula_lines_from_texts([docs[0].text], "По какой формуле определяется ставка по собственной инициативе?")
+        self.assertEqual(formulas, ["= MIN(Ц_i,q^-, Т_i,q)."])
+
+    def test_removes_hallucinated_regulation_abbreviation_expansions(self):
+        answer = sanitize_grounded_answer(
+            "ГТП (Группа Технических Условий) и КО (Контролирующий Орган).",
+            "Что такое ГТП?",
+            [],
+        )
+
+        self.assertEqual(answer, "ГТП и КО.")
+
+    def test_legacy_formula_is_safe_for_markdown_display(self):
+        displayed = format_formula_for_display(
+            r"= МIN ($\mathrm{Ц}_{\mathrm{i,q}}^{\mathrm{-}}$, $\mathrm{Т}_{\mathrm{i,q}}^{\mathrm{э/э\ пост\ \_мощн\.\ вын\.\ реж\.}}$)."
+        )
+
+        self.assertEqual(displayed, "= MIN (Ц_{i,q}^{-}, Т_{i,q}^{э/э пост _мощн. вын. реж.}).")
+        self.assertNotIn("\\mathrm", displayed)
+
+    def test_legacy_formula_is_converted_to_valid_katex(self):
+        katex = format_formula_for_katex(
+            r"= МIN ($\mathrm{Ц}_{\mathrm{i,q}}^{\mathrm{-}}$,$\mathrm{Т}_{\mathrm{i,q}}^{\mathrm{э/э\ пост\ \_мощн\.\ вын\.\ реж\.}}$)."
+        )
+
+        self.assertEqual(katex, r"$= \min (\text{Ц}_{\text{i,q}}^{\text{-}},\text{Т}_{\text{i,q}}^{\text{э/э пост _мощн. вын. реж.}})$")
+
     def test_formula_request_refines_to_exact_section_mode(self):
         spec = refine_prism_query("дай формулы из пункта 2.1.4")
 

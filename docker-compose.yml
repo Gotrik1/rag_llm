@@ -74,7 +74,7 @@ services:
       RAG_REDIS_REQUIRED: "true"
       RESPONSE_CACHE_TTL_SECONDS: ${RESPONSE_CACHE_TTL_SECONDS:-604800}
       RAG_DATA_DIR: /app/.data
-      BM25_PERSIST_DIR: /app/.data/bm25
+      BM25_PERSIST_DIR: /app/.data/bm25_v12
       RUST_DATA_DIR: /app/.data/rust
       RUST_CLI_PATH: /usr/local/bin/llm-rust
     ports:
@@ -114,7 +114,7 @@ services:
       LLM_MODEL: ${LLM_MODEL:-qwen2.5:14b}
       RAG_REDIS_URL: redis://job-queue:6379/0
       RAG_DATA_DIR: /app/.data
-      BM25_PERSIST_DIR: /app/.data/bm25
+      BM25_PERSIST_DIR: /app/.data/bm25_v12
       RUST_DATA_DIR: /app/.data/rust
       RUST_CLI_PATH: /usr/local/bin/llm-rust
     volumes:

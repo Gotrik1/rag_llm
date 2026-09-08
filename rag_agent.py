@@ -240,8 +240,18 @@ def refine_prism_query(question: str) -> PrismQuery:
     normalized = question.lower()
     target_sections = requested_section_numbers(question)
     asks_for_formulas = is_formula_question(question)
-    intent = "formula_extraction" if asks_for_formulas else detect_query_intent(question)
-    answer_mode = "formulas_only" if asks_for_formulas else "grounded_answer"
+    # A request can contain an independent fact lookup and a calculation in the
+    # same turn (for example, "назови код; приведи формулу"). Formula-only mode
+    # must not discard the non-formula part of such a compound request.
+    non_formula_fact_request = any(
+        not re.search(r"формул|рассчит|вычисл", clause)
+        and re.search(r"\b(?:код|назов|перечисл|кто|где|когда|что\s+такое|како(?:й|е|я|ие))\b", clause)
+        for clause in re.split(r"[.!?;]+", normalized)
+        if clause.strip()
+    )
+    formula_only = asks_for_formulas and not non_formula_fact_request
+    intent = "formula_extraction" if formula_only else detect_query_intent(question)
+    answer_mode = "formulas_only" if formula_only else "grounded_answer"
 
     excluded: list[str] = ["history"]
     is_value_question = detect_query_intent(question) == "value"
@@ -1017,7 +1027,8 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
     def add(candidate: str, *, requested_term_already_matched: bool = False) -> None:
         candidate = clean_formula_artifacts(_plain_evidence_text(candidate))
         candidate = candidate.strip(" ,;\t")
-        if not candidate or len(candidate) < 20:
+        minimum_length = 5 if "=" in candidate else 20
+        if not candidate or len(candidate) < minimum_length:
             return
         if requested and not requested_term_already_matched and not any(contains_term(candidate, term) for term in requested):
             return
@@ -1032,6 +1043,16 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
         searchable = cleaned.lower().replace("ё", "е")
 
         if formula_request:
+            # Keep ordinary Markdown/LaTeX equations as first-class evidence.
+            # This covers uploaded technical notes without requiring the
+            # regulation-specific [FORMULA] marker used by converted DOCX files.
+            markdown_equations = re.findall(r"\$\$\s*([^$\n][\s\S]{0,500}?)\s*\$\$", cleaned)
+            markdown_equations.extend(re.findall(r"(?<!\$)\$([^$\n]{1,300}=[^$\n]{1,300})\$(?!\$)", cleaned))
+            for equation in markdown_equations:
+                if "=" in equation:
+                    add(equation)
+                    if calculations:
+                        return calculations[:1]
             linked_formulas = re.findall(
                 r"\[FORMULA\]\s*(?:#{1,6}\s*)?([^\n]+)",
                 cleaned,
@@ -1107,6 +1128,69 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
                 return calculations[:1]
 
     return calculations[:12]
+
+
+def formula_sibling_results(nodes: list, merged: dict[str, dict], question: str) -> list[dict]:
+    """Add formula chunks from a source already retrieved for a compound query."""
+    if not is_formula_question(question) or not merged:
+        return []
+
+    source_scores: dict[str, float] = {}
+    normalized_question = re.sub(r"\s+", " ", question.strip().lower())
+    for item in merged.values():
+        matched_queries = {
+            re.sub(r"\s+", " ", str(query).strip().lower())
+            for query in item.get("matched_queries", [])
+        }
+        if normalized_question not in matched_queries:
+            continue
+        source = Path(str(item.get("file", ""))).name.casefold()
+        if source:
+            source_scores[source] = max(source_scores.get(source, float("-inf")), float(item.get("score", 0.0)))
+    if not source_scores:
+        for item in merged.values():
+            source = Path(str(item.get("file", ""))).name.casefold()
+            if source:
+                source_scores[source] = max(source_scores.get(source, float("-inf")), float(item.get("score", 0.0)))
+    preferred_sources = {
+        source for source, _ in sorted(source_scores.items(), key=lambda pair: pair[1], reverse=True)[:3]
+    }
+
+    siblings: list[dict] = []
+    for node in nodes:
+        meta = node.metadata or {}
+        text = node.text or ""
+        source_name = meta.get("file_name", meta.get("file_path", "?"))
+        source = Path(str(source_name)).name.casefold()
+        if source not in preferred_sources:
+            continue
+        section = f"{meta.get('section_path', '')} {meta.get('section_title', '')}".lower()
+        has_equation = bool(
+            "[FORMULA]" in text
+            or re.search(r"\$\$[\s\S]{0,600}=[\s\S]{0,600}\$\$", text)
+            or re.search(r"(?m)^\s*[A-Za-zА-Яа-я][\w{}\\,^\- ]{0,40}\s*=\s*\S+", text)
+            or ("formula" in section and "=" in text)
+        )
+        if not has_equation:
+            continue
+        chunk_meta = {
+            **extract_chunk_metadata(text),
+            **{k: v for k, v in meta.items() if k in {
+                "section_path", "section_title", "parent_section", "status", "chunk_type",
+            } and v},
+        }
+        if chunk_meta.get("status") == "deleted":
+            continue
+        siblings.append({
+            "file": source_name,
+            "score": round(source_scores[source] + 0.35, 4),
+            "text": text,
+            "matched_queries": ["formula-sibling"],
+            **chunk_meta,
+        })
+        if len(siblings) >= 6:
+            break
+    return siblings
 
 
 def generate_formula_only_answer(question: str, context: list[dict], calculations: list[str], spec: PrismQuery) -> str:
@@ -2119,6 +2203,14 @@ class RAGAgent:
                 if score > float(current.get("score", 0.0)):
                     current["score"] = round(score, 4)
                     current.update(chunk_meta)
+        for item in formula_sibling_results(self._all_nodes, merged, question):
+            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
+            current = merged.get(key)
+            if current is None:
+                merged[key] = item
+            else:
+                current.setdefault("matched_queries", []).extend(item["matched_queries"])
+                current["score"] = max(float(current.get("score", 0.0)), float(item["score"]))
         excluded = {Path(str(source)).name.casefold() for source in (excluded_sources or set())}
         results = [
             item for item in merged.values()

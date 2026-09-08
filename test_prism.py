@@ -4,6 +4,7 @@ from pathlib import Path
 from rag_agent import (
     build_section_documents,
     extract_formula_lines_from_texts,
+    formula_sibling_results,
     format_formula_for_display,
     format_formula_for_katex,
     generate_formula_only_answer,
@@ -57,6 +58,42 @@ class PrismQueryTests(unittest.TestCase):
         self.assertEqual(spec.intent, "formula_extraction")
         self.assertEqual(spec.target_sections, ("2.1.4",))
         self.assertEqual(spec.answer_mode, "formulas_only")
+
+    def test_compound_fact_and_formula_request_keeps_grounded_answer_mode(self):
+        spec = refine_prism_query(
+            "Какой внутренний код у Project Borealis? Приведи формулу тока и рассчитай ток."
+        )
+
+        self.assertEqual(spec.answer_mode, "grounded_answer")
+
+    def test_short_markdown_equation_is_kept(self):
+        formulas = extract_formula_lines_from_texts(
+            ["For the example:\n\n$$\nI = \\frac{U}{R}\n$$"],
+            "Приведи формулу тока",
+        )
+
+        self.assertEqual(formulas, [r"I = \frac{U}{R}"])
+
+    def test_formula_sibling_from_retrieved_source_is_added(self):
+        class Node:
+            def __init__(self, text, metadata):
+                self.text = text
+                self.metadata = metadata
+
+        merged = {
+            "fact": {"file": "acceptance.md", "score": 0.31, "text": "NEBULA-742"},
+            "noise": {"file": "other.md", "score": 0.05, "text": "irrelevant"},
+        }
+        nodes = [
+            Node("$$\nI = \\frac{U}{R}\n$$", {"file_name": "acceptance.md", "section_title": "Formula"}),
+            Node("$$\nX = Y\n$$", {"file_name": "unseen.md", "section_title": "Formula"}),
+        ]
+
+        siblings = formula_sibling_results(nodes, merged, "Приведи формулу тока")
+
+        self.assertEqual(len(siblings), 1)
+        self.assertEqual(siblings[0]["file"], "acceptance.md")
+        self.assertIn("formula-sibling", siblings[0]["matched_queries"])
 
     def test_explicit_section_rejects_other_sections_and_deleted_evidence(self):
         spec = refine_prism_query("дай формулы из пункта 2.1.4")

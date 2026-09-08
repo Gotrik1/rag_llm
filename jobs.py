@@ -13,6 +13,10 @@ from arq.jobs import Job
 from persistence import get_store
 
 
+INGESTION_QUEUE_NAME = os.getenv("RAG_INGESTION_QUEUE_NAME", "arq:queue:ingestion")
+GENERATION_QUEUE_NAME = os.getenv("RAG_GENERATION_QUEUE_NAME", "arq:queue:generation")
+
+
 def _mark_payload_cancelled(job_id: str, payload: dict[str, Any]) -> None:
     """Close registry state even when ARQ aborts a job before it starts."""
     from db_store import close_thread_connection, update_document, update_message
@@ -56,18 +60,24 @@ class JobQueue:
         store = get_store()
         if not store.enabled:
             raise RuntimeError("RAG_DATABASE_URL is required for persistent jobs")
-        function_name = {
-            "ingestion": "ingest_document_job",
-            "generation": "generate_answer_job",
+        route = {
+            "ingestion": ("ingest_document_job", INGESTION_QUEUE_NAME),
+            "generation": ("generate_answer_job", GENERATION_QUEUE_NAME),
         }.get(kind)
-        if function_name is None:
+        if route is None:
             raise ValueError(f"unsupported job kind: {kind}")
+        function_name, queue_name = route
         job = await asyncio.to_thread(store.create_job, kind, payload)
         try:
             await self.connect()
             # The potentially sensitive payload stays in PostgreSQL. Redis
             # carries only the opaque job id used for delivery and retries.
-            await self._redis.enqueue_job(function_name, job["id"], _job_id=job["id"])
+            await self._redis.enqueue_job(
+                function_name,
+                job["id"],
+                _job_id=job["id"],
+                _queue_name=queue_name,
+            )
         except Exception as exc:
             await asyncio.to_thread(
                 store.update_job,

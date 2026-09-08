@@ -1,9 +1,9 @@
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from jobs import JobQueue
-from generation_worker import generate_answer_job
-from ingestion_worker import ingest_document_job
+from jobs import GENERATION_QUEUE_NAME, INGESTION_QUEUE_NAME, JobQueue
+from generation_worker import WorkerSettings as GenerationWorkerSettings, generate_answer_job
+from ingestion_worker import WorkerSettings as IngestionWorkerSettings, ingest_document_job
 
 
 class JobQueueTests(unittest.IsolatedAsyncioTestCase):
@@ -31,7 +31,30 @@ class JobQueueTests(unittest.IsolatedAsyncioTestCase):
             "generate_answer_job",
             "job-generation",
             _job_id="job-generation",
+            _queue_name=GENERATION_QUEUE_NAME,
         )
+
+    async def test_submit_routes_ingestion_to_dedicated_worker(self) -> None:
+        store = Mock(enabled=True)
+        store.create_job.return_value = {"id": "job-ingestion"}
+        queue = JobQueue("redis://example.invalid:6379/0")
+        queue._redis = Mock()
+        queue._redis.enqueue_job = AsyncMock()
+
+        with patch("jobs.get_store", return_value=store):
+            await queue.submit("ingestion", {"path": "manual.pdf"})
+
+        queue._redis.enqueue_job.assert_awaited_once_with(
+            "ingest_document_job",
+            "job-ingestion",
+            _job_id="job-ingestion",
+            _queue_name=INGESTION_QUEUE_NAME,
+        )
+
+    def test_workers_consume_distinct_dedicated_queues(self) -> None:
+        self.assertEqual(IngestionWorkerSettings.queue_name, INGESTION_QUEUE_NAME)
+        self.assertEqual(GenerationWorkerSettings.queue_name, GENERATION_QUEUE_NAME)
+        self.assertNotEqual(IngestionWorkerSettings.queue_name, GenerationWorkerSettings.queue_name)
 
     async def test_submit_rejects_unknown_job_kind_before_persisting(self) -> None:
         store = Mock(enabled=True)

@@ -8,6 +8,7 @@ import time
 from arq.connections import RedisSettings
 
 from db_store import close_thread_connection, update_message
+from jobs import GENERATION_QUEUE_NAME
 from persistence import get_store
 
 
@@ -107,6 +108,7 @@ async def generate_answer_job(ctx: dict, job_id: str, payload: dict | None = Non
 
 class WorkerSettings:
     functions = [generate_answer_job]
+    queue_name = GENERATION_QUEUE_NAME
     redis_settings = RedisSettings.from_dsn(os.getenv("RAG_REDIS_URL", "redis://localhost:6379/0"))
     allow_abort_jobs = True
     max_jobs = int(os.getenv("RAG_GENERATION_CONCURRENCY", "4"))

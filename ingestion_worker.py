@@ -12,6 +12,7 @@ from arq.connections import RedisSettings
 
 from persistence import get_store
 from db_store import update_document
+from jobs import INGESTION_QUEUE_NAME
 
 
 async def ingest_document_job(ctx: dict, job_id: str, payload: dict | None = None) -> dict:
@@ -104,6 +105,7 @@ async def purge_expired_audit_events(ctx: dict) -> int:
 
 class WorkerSettings:
     functions = [ingest_document_job]
+    queue_name = INGESTION_QUEUE_NAME
     cron_jobs = [cron(purge_expired_audit_events, hour=3, minute=15)]
     redis_settings = RedisSettings.from_dsn(os.getenv("RAG_REDIS_URL", "redis://localhost:6379/0"))
     allow_abort_jobs = True

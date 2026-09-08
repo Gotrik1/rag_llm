@@ -49,7 +49,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --upgrade pip && \
     python -m pip install --requirement requirements.txt && \
     python -c "import importlib.metadata as m, subprocess, sys; names=[d.metadata['Name'] for d in m.distributions() if (d.metadata.get('Name') or '').lower().startswith(('nvidia-', 'cuda-', 'triton'))]; subprocess.check_call([sys.executable, '-m', 'pip', 'uninstall', '--yes', *names]) if names else None" && \
-    python -m pip install --index-url https://download.pytorch.org/whl/cpu --upgrade --force-reinstall torch torchvision
+    python -m pip install --index-url https://download.pytorch.org/whl/cpu --upgrade --force-reinstall torch torchvision && \
+    python -m pip install --upgrade "setuptools>=80.9.0" && \
+    python -m pip check
 
 RUN groupadd --gid 10001 rag && \
     useradd --uid 10001 --gid rag --create-home --shell /usr/sbin/nologin rag

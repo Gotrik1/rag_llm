@@ -82,6 +82,24 @@ class PrismQueryTests(unittest.TestCase):
         self.assertIn("ИВ1: величина определяется как разность объемов.", answer)
         self.assertNotIn("Краткий вывод", answer)
 
+    def test_ivo_worded_difference_is_rendered_as_explicit_formula(self):
+        question = "Что такое ИВ0? Как рассчитывается? А по какой формуле?"
+        rule = (
+            "ИВ0: величина равна разности между объемом электроэнергии, "
+            "определенным согласно УДГ, и объемом электроэнергии, "
+            "определенном в плановом ДГ."
+        )
+        answer = generate_formula_only_answer(
+            question,
+            [{"text": rule, "section_path": "Внешняя инициатива ИВ0", "matched_queries": ["formula-clause-exact"]}],
+            [rule],
+            refine_prism_query(question),
+        )
+
+        self.assertIn("ИВ0 = объём электроэнергии по УДГ − объём электроэнергии по плановому ДГ", answer)
+        self.assertIn(rule, answer)
+        self.assertIn("Источник:** Внешняя инициатива ИВ0", answer)
+
     def test_validator_reports_missing_requested_section(self):
         spec = refine_prism_query("дай формулы из пункта 2.1.4")
         warnings = validate_retrieval("дай формулы из пункта 2.1.4", [], spec=spec)

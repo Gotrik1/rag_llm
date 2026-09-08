@@ -66,7 +66,7 @@ VECTOR_TOP_K     = 12      # кандидатов от вектора
 # A semantic/chunking change must never reuse an older docstore or vector
 # collection: the two indexes must describe precisely the same corpus.
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25_v12"))
-CACHE_VERSION    = "v26-regulation-formula-linked-chunks"
+CACHE_VERSION    = "v27-contextual-formula-answers"
 MAX_OUTPUT_TOKENS = 4056
 
 PROMPT_INJECTION_MARKERS = (
@@ -1138,11 +1138,24 @@ def generate_formula_only_answer(question: str, context: list[dict], calculation
 
     section = str(confirmed.get("section_path", "")).strip()
     section_number = re.match(r"(\d+(?:\.\d+)*)", section)
-    source = f"п. {section_number.group(1)}" if section_number else "подтверждённый пункт Регламента"
-    return clean_formula_artifacts(
-        f"**Источник:** {source}.\n\n" + "\n".join(
-            f"- {format_formula_for_katex(item)}" for item in confirmed_calculations[:1]
+    source = f"п. {section_number.group(1)}" if section_number else (section or "подтверждённый пункт Регламента")
+    rendered = [
+        format_formula_for_katex(item) if "=" in item else clean_formula_artifacts(item)
+        for item in confirmed_calculations[:1]
+    ]
+    requested = requested_formula_terms(question)
+    rule = " ".join(confirmed_calculations).lower().replace("ё", "е")
+    if "ИВ0" in requested and all(marker in rule for marker in (
+        "равна разности",
+        "согласно удг",
+        "в плановом дг",
+    )):
+        rendered.insert(
+            0,
+            "**ИВ0 = объём электроэнергии по УДГ − объём электроэнергии по плановому ДГ.**",
         )
+    return clean_formula_artifacts(
+        f"**Источник:** {source}.\n\n" + "\n\n".join(rendered)
     )
 
 
@@ -1573,10 +1586,20 @@ class RAGAgent:
                 False,
             )
 
-        spec = refine_prism_query(question)
+        # A short follow-up (for example, "а по какой формуле?") has no entity
+        # of its own.  Build the PRISM contract from the contextual retrieval
+        # query so deterministic formula extraction retains the subject too.
+        spec = refine_prism_query(search_question)
         context = self.retrieve_context(search_question, TOP_K, spec)
-        calculations = extract_formula_lines_from_texts([item["text"] for item in context], question)
-        answer = self._generate_grounded_answer(question, context, calculations, spec, system_prompt)
+        calculations = extract_formula_lines_from_texts([item["text"] for item in context], search_question)
+        answer = self._generate_grounded_answer(
+            question,
+            context,
+            calculations,
+            spec,
+            system_prompt,
+            evidence_question=search_question,
+        )
 
         sources = [{
             "file": item["file"],
@@ -1600,11 +1623,12 @@ class RAGAgent:
         calculations: list[str],
         spec: PrismQuery | None = None,
         system_prompt: str | None = None,
+        evidence_question: str | None = None,
     ) -> str:
         self._last_generation_from_cache = False
         spec = spec or refine_prism_query(question)
         if spec.answer_mode == "formulas_only":
-            return generate_formula_only_answer(question, context, calculations, spec)
+            return generate_formula_only_answer(evidence_question or question, context, calculations, spec)
         extractive = generate_extractive_value_answer(question, context)
         if extractive:
             return extractive

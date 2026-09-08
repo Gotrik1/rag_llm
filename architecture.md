@@ -83,6 +83,9 @@ sequenceDiagram
         RAG-->>API: task continues in process
         API->>DB: assistant status=complete/error
         UI->>DB: reload chat messages through API
+        loop while assistant status=running
+            UI->>DB: poll chat messages every 1.5 s through API
+        end
     end
 ```
 

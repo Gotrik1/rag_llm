@@ -34,10 +34,8 @@ def invoke_legacy(
     handler = object.__new__(Handler)
     handler.path = path
     handler.command = method.upper()
-    # ``cgi.FieldStorage`` expects the email-style header interface provided by
-    # ``BaseHTTPRequestHandler``. A plain dict loses multipart boundary parsing
-    # in the ASGI compatibility path, making every uploaded file list appear
-    # empty to the legacy handler.
+    # Keep the email-style header interface expected by BaseHTTPRequestHandler
+    # and the compatibility multipart parser.
     headers = Message()
     headers["Content-Type"] = content_type or "application/json"
     headers["Content-Length"] = str(len(raw_body))
@@ -45,5 +43,11 @@ def invoke_legacy(
     handler.rfile = BytesIO(raw_body)
     handler.send_json = lambda payload, status=200: captured.update(payload=payload, status=status)
 
-    handler_method(handler)
+    try:
+        handler_method(handler)
+    finally:
+        # The adapter bypasses BaseHTTPRequestHandler.finish(), so it owns the
+        # per-worker psycopg connection lifecycle explicitly.
+        from db_store import close_thread_connection
+        close_thread_connection()
     return captured.get("payload", {"error": "empty legacy response"}), captured.get("status", 500)

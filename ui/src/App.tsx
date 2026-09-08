@@ -273,6 +273,10 @@ function messageFromRecord(record: MessageRecord): ChatEntry {
   };
 }
 
+export function hasRunningAssistantMessage(records: Array<Pick<MessageRecord, "role" | "status">>): boolean {
+  return records.some((record) => record.role === "assistant" && record.status === "running");
+}
+
 function readStored<T>(key: string, fallback: T): T {
   try {
     const value = window.localStorage.getItem(key);
@@ -395,6 +399,9 @@ export function App() {
     : FREE_CHAT_WORKSPACE;
   const isRunning = Boolean(activeChatId && runningChatIds.includes(activeChatId));
   const hasRunningChats = runningChatIds.length > 0;
+  const activeChatHasRunningMessage = messages.some(
+    (message) => message.role === "assistant" && message.status === "running"
+  );
 
   useEffect(() => {
     activeChatIdRef.current = activeChatId;
@@ -420,6 +427,13 @@ export function App() {
   const loadMessages = useCallback(async (chatId: string) => {
     const data = await getJson<{ items: MessageRecord[] }>(`/api/chats/${chatId}/messages`, API_TIMEOUT_MS);
     setMessages(data.items.map(messageFromRecord));
+    setRunningChatIds((current) => {
+      const persistedRunning = hasRunningAssistantMessage(data.items);
+      if (persistedRunning) {
+        return current.includes(chatId) ? current : [...current, chatId];
+      }
+      return current.filter((runningChatId) => runningChatId !== chatId);
+    });
   }, []);
 
   const loadDocuments = useCallback(async (projectId: string, chatId: string) => {
@@ -498,6 +512,14 @@ export function App() {
   useEffect(() => {
     void loadDocuments(activeProjectId, activeChatId);
   }, [activeChatId, activeProjectId, loadDocuments]);
+
+  useEffect(() => {
+    if (!activeChatId || !activeChatHasRunningMessage) return;
+    const timer = window.setInterval(() => {
+      void loadMessages(activeChatId).catch(() => undefined);
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [activeChatHasRunningMessage, activeChatId, loadMessages]);
 
   const changeModel = useCallback(async (model: string) => {
     if (!model || model === selectedModel || isChangingModel || hasRunningChats) return;

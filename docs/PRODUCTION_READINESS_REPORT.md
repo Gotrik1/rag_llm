@@ -7,9 +7,9 @@ the deployed VM revision must be recorded separately after deployment.
 
 | Area | Result | Verification |
 | --- | --- | --- |
-| Refresh-safe chat generation | assistant placeholder/result owned by server; detached task survives client cancellation | ASGI contract + cancellation regression test |
+| Refresh-safe chat generation | assistant placeholder/result owned by server; detached task survives client cancellation; restored UI polls `running` records to a terminal state | ASGI cancellation contract + UI state tests |
 | Concurrent chats | request captures original `chat_id`; UI running state is per chat; global model settings remain locked during any generation | TypeScript build and review of state transitions |
-| PostgreSQL concurrency | removed process-global psycopg connection; connections are isolated per worker thread | Python contracts; PostgreSQL integration pending local Engine recovery |
+| PostgreSQL concurrency | removed process-global psycopg connection; connections are isolated per worker thread and closed after each request | clean PostgreSQL 18 integration suite with `ResourceWarning` promoted to error |
 | Async ingestion | bounded multipart upload creates document + ARQ job; worker reports progress/terminal state | upload/job API tests |
 | BM25 publication | worker uses atomic snapshot replacement; API workers hot-reload changed snapshot | two docstore refresh tests |
 | Document registry | project/chat listing, status, progress, chunks and source download links exposed in UI/API | ASGI registry tests + UI build |
@@ -25,18 +25,20 @@ the deployed VM revision must be recorded separately after deployment.
 
 Latest completed local runs:
 
-- Python unit/contract suite: `61 passed, 6 skipped`; four skips are the PostgreSQL integration cases gated by `DATABASE_URL`, two are opt-in live tests.
-- UI Vitest: `7 passed`.
+- Python Pytest suite against a clean PostgreSQL 18 cluster: `73 passed, 2 skipped`; both skips are opt-in live model tests. The equivalent CI `unittest discover` run executes 75 tests with 2 skips.
+- Python branch coverage: `51.7%` overall with a CI regression floor of 50%; document ingestion is `77.9%`, deterministic DOCX parsing `62.2%`, persistence `83.7%`, the legacy adapter `87.1%`, and ASGI routes `64.6%`. CI publishes `coverage.xml`.
+- UI Vitest: `9 passed`.
 - UI production build: success, 2522 modules; application code is split from the assistant and Markdown/KaTeX dependency chunks.
 - Rust: `cargo test` succeeds; the crate currently contains zero Rust unit tests.
 - Compose static validation: succeeds for `compose.yaml`.
 
-The full PostgreSQL integration suite could not run on this workstation because
-Docker Desktop 4.71 crashes in its optional Model Runner before the Engine
-starts. The exact failing AF_UNIX runtime directories were moved aside without
-touching volumes; the second launch exposed the same product bug on newly
-created Model Runner sockets. Do not misreport these four tests as passing until
-they run against a real PostgreSQL instance or the VM.
+The PostgreSQL integration suite was verified without Docker by initializing a
+clean temporary PostgreSQL 18 cluster, applying `alembic upgrade head` followed
+by the workspace SQL migrations, and running the complete test suite with
+`ResourceWarning` treated as an error. This exposed and fixed request-thread
+connection cleanup. Docker
+Desktop 4.71 still crashes in its optional Model Runner before the Engine starts,
+so the full Compose runtime remains a required VM acceptance gate.
 
 ## Required VM acceptance evidence
 

@@ -6,6 +6,10 @@ ui/node_modules/.tmp/
 .venv
 .test-venv/
 .codebase-memory/
+.coverage
+coverage.xml
+htmlcov/
+.tmp/
 .env
 bm25_index*/
 tantivy_index/

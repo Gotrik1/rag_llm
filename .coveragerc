@@ -1,0 +1,30 @@
+[run]
+branch = True
+source =
+    asgi_app
+    audit
+    db_store
+    document_ingestion
+    docx_parser
+    ingestion_task
+    ingestion_worker
+    jobs
+    legacy_adapter
+    llm_providers
+    persistence
+    policy
+    rag_agent
+    response_cache
+    runtime_paths
+    security
+    telemetry
+    web_ui
+
+[report]
+precision = 1
+show_missing = True
+skip_empty = True
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    if __name__ == .__main__.:

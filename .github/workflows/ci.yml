@@ -81,7 +81,7 @@ jobs:
           --health-timeout 5s
           --health-retries 20
       redis:
-        image: redis:7.4-alpine
+        image: redis:8.8.0-alpine
         ports:
           - 6379:6379
         options: >-
@@ -101,16 +101,20 @@ jobs:
           cache: pip
 
       - name: Install backend dependencies
-        run: pip install -r requirements.docker.txt
+        run: pip install -r requirements.docker.txt "coverage>=7.6,<8"
 
       - name: Apply migrations and create default workspace
-        run: python -c "import db_store; db_store.run_migrations(); db_store.get_workspace('python', 'ollama', 'qwen2.5:14b')"
+        run: |
+          python -m alembic upgrade head
+          python -c "import db_store; db_store.run_migrations(); db_store.get_workspace('python', 'ollama', 'qwen2.5:14b')"
 
       - name: Verify schema
         run: >-
           python -c "import db_store; c=db_store.db();
           names={r['table_name'] for r in c.execute(\"select table_name from information_schema.tables where table_schema='public'\").fetchall()};
-          required={'projects','chats','messages','documents','evidence_sources','request_errors','workspace_settings'};
+          required={'projects','chats','messages','documents','evidence_sources','request_errors','workspace_settings',
+          'principals','roles','permissions','principal_roles','role_permissions','abac_policies','audit_events','jobs',
+          'alembic_version','schema_migrations'};
           assert required <= names, required-names"
 
       - name: Verify Redis response cache
@@ -120,4 +124,13 @@ jobs:
           assert c.get('ci-smoke')['answer']=='ok'; c.clear()"
 
       - name: Run backend tests with PostgreSQL and Redis
-        run: python -m unittest discover -v
+        run: |
+          coverage run -m unittest discover -v
+          coverage report --fail-under=50
+          coverage xml -o coverage.xml
+
+      - name: Upload Python coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-coverage
+          path: coverage.xml

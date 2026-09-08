@@ -96,6 +96,41 @@ class AsgiFoundationTests(unittest.TestCase):
         self.assertEqual(result["message_id"], "message-1")
         self.assertEqual(update_message.call_args.args[1]["status"], "complete")
 
+    def test_two_chat_generations_run_concurrently(self):
+        barrier = threading.Barrier(2)
+        state_lock = threading.Lock()
+        active = 0
+        maximum_active = 0
+
+        def concurrent_ask(payload):
+            nonlocal active, maximum_active
+            with state_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            try:
+                barrier.wait(timeout=2)
+                return {
+                    "answer": f"answer for {payload['chat_id']}",
+                    "html_answer": "<p>answer</p>",
+                    "flow_mode": "python",
+                }
+            finally:
+                with state_lock:
+                    active -= 1
+
+        async def scenario():
+            return await asyncio.gather(
+                asgi_app._run_and_persist_ask({"question": "one", "chat_id": "chat-1"}, {"id": "message-1"}),
+                asgi_app._run_and_persist_ask({"question": "two", "chat_id": "chat-2"}, {"id": "message-2"}),
+            )
+
+        with patch("asgi_app.run_ask", side_effect=concurrent_ask), \
+             patch("asgi_app.update_message", return_value={}):
+            results = asyncio.run(scenario())
+
+        self.assertEqual(maximum_active, 2)
+        self.assertEqual({item["message_id"] for item in results}, {"message-1", "message-2"})
+
     def test_sse_stream_emits_answer_deltas_and_completion(self):
         payload = {"answer": "streamed answer", "html_answer": "ignored", "flow_mode": "python"}
         def streamed(_question, callback):

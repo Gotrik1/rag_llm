@@ -29,6 +29,7 @@ class WorkspacePersistenceIntegrationTests(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
         cls.thread.join(timeout=5)
+        db_store.close_thread_connection()
 
     def request_json(self, method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
@@ -199,6 +200,46 @@ class WorkspacePersistenceIntegrationTests(unittest.TestCase):
                 self.request_json("DELETE", f"/api/chats/{chat_id}")
             if project_id:
                 self.request_json("DELETE", f"/api/projects/{project_id}")
+
+    def test_document_registry_tracks_scope_status_and_source_name(self) -> None:
+        suffix = uuid.uuid4().hex
+        project_id = chat_id = document_id = None
+        try:
+            project = db_store.create_project({"name": f"documents-{suffix}"})
+            project_id = str(project["id"])
+            chat = db_store.create_chat(project_id, {"title": "documents"}, "python", "ollama", "test-model")
+            chat_id = str(chat["id"])
+            stored_name = f"{suffix}_manual.pdf"
+            document = db_store.create_document(project_id, chat_id, {
+                "file_name": "manual.pdf",
+                "source_path": f"/app/.data/uploads/{stored_name}",
+                "mime_type": "application/pdf",
+                "status": "queued",
+                "processing_state": {"progress": 0},
+            })
+            document_id = str(document["id"])
+            ready = db_store.update_document(document_id, {
+                "status": "ready",
+                "processing_state": {"progress": 100},
+                "metadata": {"chunks": 12},
+            })
+
+            self.assertEqual(ready["status"], "ready")
+            self.assertEqual(ready["metadata"]["chunks"], 12)
+            self.assertEqual([str(item["id"]) for item in db_store.list_documents(project_id)], [document_id])
+            sources = db_store.document_sources([stored_name, "manual.pdf", "other.pdf"])
+            self.assertEqual(str(sources[stored_name]["id"]), document_id)
+            self.assertEqual(str(sources["manual.pdf"]["id"]), document_id)
+            self.assertNotIn("other.pdf", sources)
+        finally:
+            if document_id:
+                with db_store.db().cursor() as cursor:
+                    cursor.execute("DELETE FROM documents WHERE id = %s", (document_id,))
+                db_store.db().commit()
+            if chat_id:
+                db_store.delete_chat(chat_id)
+            if project_id:
+                db_store.delete_project(project_id)
 
     def test_project_conversation_isolated_and_moves_with_chat(self) -> None:
         project_ids: list[str] = []

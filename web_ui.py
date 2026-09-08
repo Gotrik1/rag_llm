@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import cgi
 import hashlib
 import json
 import os
@@ -11,6 +10,8 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,6 +21,7 @@ from urllib.request import urlopen
 from urllib.error import URLError
 
 from db_store import (
+    close_thread_connection,
     create_chat,
     create_message,
     create_project,
@@ -58,6 +60,37 @@ SYSTEM_PROMPT_CONFIG_PATH = STATE_DIR / "system_prompt.json"
 FLOW_CONFIG_PATH = STATE_DIR / "flow_mode.json"
 FLOW_MODES = {"python", "rust", "hybrid"}
 OPENAPI_SPEC_PATH = Path("openapi.json")
+MAX_LEGACY_UPLOAD_BYTES = 50 * 1024 * 1024
+
+
+def parse_multipart_files(content_type: str, body: bytes) -> list[dict]:
+    """Parse only uploaded file fields without the removed stdlib cgi module."""
+    if "\r" in content_type or "\n" in content_type:
+        return []
+    if "multipart/form-data" not in content_type.lower() or not body:
+        return []
+    header = (
+        f"Content-Type: {content_type}\r\n"
+        "MIME-Version: 1.0\r\n\r\n"
+    ).encode("utf-8")
+    message = BytesParser(policy=email_policy).parsebytes(header + body)
+    if not message.is_multipart():
+        return []
+
+    files: list[dict] = []
+    for part in message.iter_parts():
+        if part.get_content_disposition() != "form-data":
+            continue
+        field_name = part.get_param("name", header="content-disposition")
+        filename = part.get_filename()
+        if field_name not in {"files", "file"} or not filename:
+            continue
+        content = part.get_payload(decode=True) or b""
+        if content:
+            files.append({"filename": filename, "content": content})
+        if len(files) >= 20:
+            break
+    return files
 
 
 @contextmanager
@@ -851,6 +884,12 @@ $("cacheBtn").onclick = async () => {
 
 
 class Handler(BaseHTTPRequestHandler):
+    def finish(self) -> None:
+        try:
+            super().finish()
+        finally:
+            close_thread_connection()
+
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         if path == "/docs":
@@ -1281,34 +1320,9 @@ class Handler(BaseHTTPRequestHandler):
             return []
 
         length = int(self.headers.get("Content-Length", "0"))
-        environ = {
-            "REQUEST_METHOD": "POST",
-            "CONTENT_TYPE": content_type,
-            "CONTENT_LENGTH": str(length),
-        }
-        form = cgi.FieldStorage(
-            fp=self.rfile,
-            headers=self.headers,
-            environ=environ,
-            keep_blank_values=True,
-        )
-        files = []
-
-        for field_name in ("files", "file"):
-            if field_name not in form:
-                continue
-            items = form[field_name]
-            if not isinstance(items, list):
-                items = [items]
-            for item in items:
-                filename = getattr(item, "filename", "") or ""
-                if not filename:
-                    continue
-                content = item.file.read()
-                if content:
-                    files.append({"filename": filename, "content": content})
-
-        return files
+        if length <= 0 or length > MAX_LEGACY_UPLOAD_BYTES:
+            return []
+        return parse_multipart_files(content_type, self.rfile.read(length))
 
     @staticmethod
     def safe_upload_name(filename: str) -> str:

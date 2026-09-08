@@ -6,9 +6,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
-COPY requirements.txt ./
+COPY deploy/llm-bridge/requirements.txt ./requirements.txt
 RUN python -m pip install --requirement requirements.txt
-COPY app.py ./
+COPY deploy/llm-bridge/app.py ./app.py
 
 RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin bridge && \
     mkdir -p /data/fastembed && chown -R bridge:bridge /app /data

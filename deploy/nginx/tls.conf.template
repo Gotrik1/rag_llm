@@ -36,6 +36,11 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
+        # Basic Auth belongs to this edge only. Forwarding it would make the
+        # application identity provider interpret it as its own bearer token
+        # and return 401, causing browsers to challenge on every API request.
+        proxy_set_header Authorization "";
+        proxy_set_header Proxy-Authorization "";
         proxy_set_header Connection "";
         proxy_connect_timeout 10s;
         proxy_send_timeout 3600s;

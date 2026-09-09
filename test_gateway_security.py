@@ -16,6 +16,8 @@ class GatewaySecurityTests(unittest.TestCase):
         self.assertNotIn("auth_basic", health)
         self.assertIn('auth_basic "RAG Assistant";', protected)
         self.assertIn("auth_basic_user_file /run/secrets/gateway_htpasswd;", protected)
+        self.assertIn('proxy_set_header Authorization "";', protected)
+        self.assertIn('proxy_set_header Proxy-Authorization "";', protected)
 
     def test_compose_mounts_gateway_password_as_a_secret(self):
         compose = yaml.safe_load((ROOT / "compose.yaml").read_text(encoding="utf-8"))

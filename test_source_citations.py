@@ -92,8 +92,8 @@ class SourceCitationTests(unittest.TestCase):
 
     def test_repeated_identical_inline_citations_are_collapsed(self):
         answer = (
-            "Первый факт. [Источник: manual.pdf — Запуск]\n\n"
-            "Второй факт. [Источник: manual.pdf — Запуск]"
+            "Первый факт. [Источник: manual.pdf — Запуск].\n\n"
+            "Второй факт. [Источник: manual.pdf — Запуск]."
         )
         source = {
             "file": "manual.pdf", "section": "Запуск", "locator": "раздел «Запуск»",
@@ -104,6 +104,7 @@ class SourceCitationTests(unittest.TestCase):
 
         self.assertEqual(enriched.count("Источник: manual.pdf"), 1)
         self.assertIn("Второй факт.", enriched)
+        self.assertNotIn("\n.\n", enriched)
 
     def test_non_formula_question_has_no_formula_payload(self):
         chunks = [{"text": "Константы используются в формулах через функцию Const."}]

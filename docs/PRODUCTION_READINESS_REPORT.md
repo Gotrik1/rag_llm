@@ -1,6 +1,6 @@
 # Production readiness report
 
-Date: 2026-09-09. Branch: `dev`. Application release `3c9e780e6` is deployed on
+Date: 2026-09-09. Branch: `dev`. Application release `528c7dd1e` is deployed on
 VM `iprg001` and is available at `https://5.35.120.112:8443/`. The external TLS
 gateway requires Basic Auth; anonymous and invalid credentials are rejected.
 O2 Cloud Edge Firewall permits public ingress only to TCP/8443 for this service;
@@ -34,6 +34,9 @@ audit attribution.
 
 Latest completed release-gate runs:
 
+- TLS gateway hotfix: `2 passed` in the production application image; the
+  regression contract requires the edge to consume Basic Auth and strip both
+  `Authorization` and `Proxy-Authorization` before proxying to the application.
 - Final application image: `109` Python unit/contract tests executed, `102` passed and `7` environment-dependent tests skipped; `pip check` reports no broken requirements.
 - Earlier clean PostgreSQL 18 integration run: `86 passed, 2 skipped`; both skips are opt-in live model tests.
 - Python branch coverage: `52.2%` overall with a CI regression floor of 50%; document ingestion is `77.9%`, deterministic DOCX parsing `62.2%`, durable generation worker `79.7%`, persistence `83.8%`, the legacy adapter `87.1%`, and ASGI routes `63.7%`. CI publishes `coverage.xml`.
@@ -54,7 +57,7 @@ so the full Compose runtime remains a required VM acceptance gate.
 
 | Check | Result | Evidence |
 | --- | --- | --- |
-| Target/release | passed | `iprg001`; `/opt/rag_llm/current` resolves to `/opt/rag_llm/releases/3c9e780e6`; archive SHA-256 `76fa17674745ccb85a8a642a2e86d6159b67270da14bc54f13836dcc5e3e11fe` is recorded in root-only `/opt/rag_llm/shared/deployed-release.txt` |
+| Target/release | passed | `iprg001`; `/opt/rag_llm/current` resolves to `/opt/rag_llm/releases/528c7dd1e`; archive SHA-256 `a8237357aa78948c55d7e34e7bf30d2f411abd8a5be8afed452a76b6111b45e5` is recorded in root-only `/opt/rag_llm/shared/deployed-release.txt` |
 | Release artifact | passed | archive was built from tracked files only; runtime data, generated artifacts and secrets were not included; SHA-256 was verified before extraction |
 | Backup/rollback | passed | latest backup `/opt/rag_llm/shared/backups/pre-3c9e780e6-20260909T092335Z`; PostgreSQL dump, Qdrant snapshot, app-data archive and `SHA256SUMS`; a failing release test stopped candidate `d870003fa` before activation, proving the test gate and rollback path |
 | Migrations/services | passed | migration container exited successfully; app/proxy/LLM bridge healthy; PostgreSQL, Redis, Qdrant, ingestion worker, generation worker, vLLM and telemetry containers running |
@@ -69,7 +72,7 @@ so the full Compose runtime remains a required VM acceptance gate.
 | Cache | passed at contract level | namespace/TTL, scope key, flow invalidation and corpus invalidation tests pass; a separate live repeat/mutation benchmark was not run because chat history intentionally changes the grounded cache key |
 | Project isolation | passed at integration-contract level | cross-project exclusion test passes; a destructive live two-project corpus mutation was not performed on the retained VM data |
 | Observability | partially verified | Prometheus, Grafana, Loki, Tempo, Alloy and OpenTelemetry containers are running; dashboard contents and alert delivery were not manually certified in this pass |
-| External authentication | passed for restricted single-admin operation | `/nginx-health` returns `200`; anonymous UI access and an invalid password return `401`; valid gateway credentials return `200`; plaintext recovery credentials are mode `0600`, the salted htpasswd hash is `0644` inside a root-only directory |
+| External authentication | passed for restricted single-admin operation | `/nginx-health` returns `200`; anonymous UI access and an invalid password return `401`; valid gateway credentials return `200`; five consecutive authenticated UI/API requests returned `200`, including repeated `/api/me`; the gateway consumes Basic Auth and removes it before the application identity provider, preventing repeated browser challenges; plaintext recovery credentials are mode `0600`, the salted htpasswd hash is `0644` inside a root-only directory |
 | Public internet ingress | passed | O2 Cloud Edge rule `RAG_8443_public` allows source `ANY` only through application profile `RAG_HTTPS_8443` (`TCP/8443`) to `192.168.30.2`; independent TCP probes succeeded from five internet nodes (Hungary, Indonesia, Netherlands, Russia and Turkey); an external anonymous HTTPS request returned `401`, an authenticated request returned `200 text/html`, and the VM DNAT counter recorded 8 packets on port 8443 |
 | Per-user authentication | remaining enterprise hardening | application auth remains `development` behind the mandatory gateway. Corporate OIDC is still required before issuing individual accounts or claiming per-user RBAC/audit attribution |
 | Final runtime audit | passed | `19` services running, internal health `{"status":"ok"}`, default/ingestion/generation queue lengths `0,0,0`; PostgreSQL contains 1 project, 13 acceptance chats, 49 messages and 1 registered document |

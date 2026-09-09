@@ -4,6 +4,7 @@ source =
     asgi_app
     audit
     db_store
+    document_catalog
     document_ingestion
     docx_parser
     generation_worker
@@ -12,6 +13,7 @@ source =
     jobs
     legacy_adapter
     llm_providers
+    local_auth
     persistence
     policy
     quality_eval
@@ -19,6 +21,7 @@ source =
     response_cache
     runtime_paths
     security
+    system_prompts
     telemetry
     web_ui
 

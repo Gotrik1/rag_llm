@@ -1,4 +1,7 @@
+import json
 import unittest
+import uuid
+from datetime import datetime, timezone
 
 from document_catalog import (
     annotate_document_versions,
@@ -8,6 +11,23 @@ from document_catalog import (
 
 
 class DocumentCatalogTests(unittest.TestCase):
+    def test_catalog_result_is_safe_for_durable_queue_serialization(self):
+        document_id = uuid.uuid4()
+        result = build_document_catalog_answer(
+            "Проект",
+            [{
+                "id": document_id,
+                "file_name": "Регламент.docx",
+                "created_at": datetime(2026, 9, 9, 9, 0, tzinfo=timezone.utc),
+                "metadata": {"reviewed_at": datetime(2026, 9, 9, 10, 0, tzinfo=timezone.utc)},
+            }],
+        )
+
+        encoded = json.dumps(result, ensure_ascii=False)
+
+        self.assertIn(str(document_id), encoded)
+        self.assertIn("2026-09-09T09:00:00+00:00", encoded)
+
     def test_inventory_intent_is_distinct_from_content_question(self):
         self.assertTrue(is_document_catalog_question("Какие регламенты у нас есть?"))
         self.assertTrue(is_document_catalog_question("С чем мы сейчас работаем и когда это загружено?"))

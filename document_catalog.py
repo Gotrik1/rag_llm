@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 
 _SEMVER_RE = re.compile(
@@ -186,6 +187,19 @@ def _markdown_label(value: str) -> str:
     return value.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
 
+def _json_safe(value: Any) -> Any:
+    """Normalize registry values before they cross HTTP, SSE, or queue boundaries."""
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def build_document_catalog_answer(project_name: str, documents: list[dict[str, Any]]) -> dict[str, Any]:
     annotated = annotate_document_versions(documents)
     scope_name = project_name.strip() or "свободный чат"
@@ -216,4 +230,4 @@ def build_document_catalog_answer(project_name: str, documents: list[dict[str, A
         "Дата загрузки не является датой редакции документа. Сравнение актуальности выполнено только между "
         "явно обозначенными версиями, уже загруженными в эту рабочую область; внешний реестр или СЭД не проверялись."
     )
-    return {"answer": "\n".join(lines), "sources": sources, "documents": annotated}
+    return {"answer": "\n".join(lines), "sources": sources, "documents": _json_safe(annotated)}

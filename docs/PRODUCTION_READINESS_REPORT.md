@@ -1,105 +1,93 @@
 # Production readiness report
 
-Date: 2026-09-09. Branch: `dev`. Application release `528c7dd1e` is deployed on
-VM `iprg001` and is available at `https://5.35.120.112:8443/`. The external TLS
-gateway requires Basic Auth; anonymous and invalid credentials are rejected.
-O2 Cloud Edge Firewall permits public ingress only to TCP/8443 for this service;
-the existing DNAT forwards that port to `192.168.30.2`. The endpoint therefore
-does not require a corporate VPN, while the application remains protected by
-the gateway credentials.
-Corporate OIDC remains the required next step for named users, per-user RBAC and
-audit attribution.
+Date: 2026-09-09. Branch: `dev`. Production release: `4f12ea1cc`.
 
-## Implemented in this hardening pass
+The application is publicly available without VPN at
+`https://5.35.120.112:8443/`. The TLS gateway requires Basic Auth once per
+browser session. Anonymous access is rejected. The gateway consumes the Basic
+credentials and removes both authentication headers before forwarding requests
+to the application, so navigation and API calls do not cause recurring browser
+login dialogs.
 
-| Area | Result | Verification |
+## Delivered capabilities
+
+| Area | Production behavior | Evidence |
 | --- | --- | --- |
-| Refresh/restart-safe generation | generation is an ARQ job with PostgreSQL state; a dedicated worker survives browser loss and API replacement; restored UI polls `running` records and restores sources/formulas | queue/worker contracts + ASGI/SSE + UI state tests |
-| Concurrent chats | request captures original `chat_id`; UI running state is per chat; global model settings remain locked during any generation | TypeScript build and review of state transitions |
-| PostgreSQL concurrency | removed process-global psycopg connection; connections are isolated per worker thread and closed after each request | clean PostgreSQL 18 integration suite with `ResourceWarning` promoted to error |
-| Separate queues | bounded upload uses a single-writer ingestion worker; answers use a dedicated concurrent generation worker | job routing, worker terminal-state and Compose tests |
-| BM25 publication | worker uses atomic snapshot replacement; API workers hot-reload changed snapshot | two docstore refresh tests |
-| Document registry | project/chat listing, status, progress, chunks and source download links exposed in UI/API | ASGI registry tests + UI build |
-| Workspace/version awareness | inventory questions are answered deterministically from the scoped PostgreSQL registry without retrieval or LLM tokens; the answer includes document link, upload time, processing state, explicit version and a newer-loaded-version warning | intent/version/serialization tests + live durable-queue acceptance |
-| Project isolation | documents attached to other project/chats are filtered before reranking; exclusion set is part of cache key | scope unit tests |
-| Cache | exact Redis namespace/TTL retained; corpus and flow changes invalidate; scope affects key | response-cache and flow tests |
-| Grounding | prompt remains bounded to selected chunks; generalized beyond regulatory documents; textual source policy added | PRISM/prompt-injection contracts |
-| Formulas | KaTeX rendering, short Markdown/LaTeX equality extraction, and same-document formula sibling retrieval | formula/PRISM tests + real production browser |
-| User-facing sources | citations are the original document plus a human locator and stable content link; UUID filename prefixes, chunk previews and retrieval scores are removed; only actually cited linked locators are returned | 6 source-contract tests + live VM fact/formula acceptance |
-| Live API contract | `/api/openapi.json` now serves `app.openapi()` rather than the stale compatibility file | route contract/import test |
-| Deployment | local Compose contract is `rag-assistant`; the existing VM project remains `rag-platform` to preserve named volumes; worker single-writer default and secret templates corrected | rendered Compose validation and live VM services |
-| Documentation | root README, current architecture/runbook, deploy inventory, detailed Russian user guide | link/path review |
+| Durable sessions | chats and messages are stored in PostgreSQL; an in-progress answer survives refresh, tab closure and API replacement | restart/restore contracts and live VM acceptance |
+| Concurrent chats | generation is bound to its original `chat_id`; switching chats does not move or overwrite the result | two simultaneous live production questions plus UI state tests |
+| Queues | uploads use a single-writer ingestion queue; answers use a separate concurrent generation queue | ARQ routing/worker tests; all three production queues drained to zero |
+| Cache | Redis keys include project/chat scope, corpus revision and flow; corpus or flow changes invalidate stale results | cache and invalidation contracts |
+| Bounded RAG context | the system prompt does not contain the whole document; retrieval, reranking and neighbor expansion select a bounded evidence set | PRISM and prompt-injection tests; live token telemetry |
+| Project isolation | retrieval excludes documents outside the active project/chat scope | cross-project integration contracts |
+| Document memory | UI/API show file name, upload time, status, chunk count, detected version and freshness status | live inventory query and UI/API tests |
+| Version awareness | versions are compared only when metadata is supported; upload time is never presented as document edition; unknown freshness is stated explicitly | inventory/version tests and live production answer |
+| Sources | answers cite the original document with a clickable download link and a human locator such as section, paragraph or page; chunk UUIDs, scores and previews are hidden | source-contract tests and live answers |
+| Formulas | Markdown/KaTeX renders validated LaTeX formulas; formula payload contains equations rather than prose | formula contracts and live `ИВ0` answer |
+| Grounded answers | deterministic inventory and evidence-based extractive paths reduce unnecessary LLM use; out-of-scope questions are refused | live acceptance on `r5.docx`, `r7.docx`, `r12.docx` and refusal case |
+| Prompt-injection resistance | document text is treated as evidence, not as executable user/system instructions | policy and injection contracts |
+| UX | compact chat list, visible project document registry, restored running states, stable sources/formulas after refresh | 15 UI tests, production build and browser acceptance |
 
-## Test evidence
+## Automated verification
 
-Latest completed release-gate runs:
+- Backend: `112 passed`, `7 skipped`, one upstream Starlette/httpx deprecation
+  warning; duration 7.56 s.
+- Branch-aware Python coverage: `49.2%` overall across 4,166 statements and
+  1,460 branches. High-risk focused modules include persistence `84.6%`,
+  generation worker `80.3%`, document ingestion `77.9%`, response cache `69.5%`,
+  ASGI routes `63.8%`, deterministic DOCX parser `62.2%`, and core RAG agent
+  `42.8%`. Coverage is reported honestly; live acceptance and integration tests
+  do not replace missing unit branches.
+- UI Vitest: `15 passed` (`7` API and `8` application tests).
+- UI production build: successful, `2522` modules.
+- Focused source/formula/PRISM regression: `28 passed`.
+- PostgreSQL 18 integration gate from the hardening pass: `86 passed`,
+  `2 skipped`, with connection warnings promoted to errors.
 
-- TLS gateway hotfix: `2 passed` in the production application image; the
-  regression contract requires the edge to consume Basic Auth and strip both
-  `Authorization` and `Proxy-Authorization` before proxying to the application.
-- Final application image: `109` Python unit/contract tests executed, `102` passed and `7` environment-dependent tests skipped; `pip check` reports no broken requirements.
-- Earlier clean PostgreSQL 18 integration run: `86 passed, 2 skipped`; both skips are opt-in live model tests.
-- Python branch coverage: `52.2%` overall with a CI regression floor of 50%; document ingestion is `77.9%`, deterministic DOCX parsing `62.2%`, durable generation worker `79.7%`, persistence `83.8%`, the legacy adapter `87.1%`, and ASGI routes `63.7%`. CI publishes `coverage.xml`.
-- UI Vitest: `14 passed`.
-- UI production build: success, 2522 modules; application code is split from the assistant and Markdown/KaTeX dependency chunks.
-- Rust: `cargo test` succeeds; the crate currently contains zero Rust unit tests.
-- Compose static validation: succeeds for `compose.yaml`.
+The seven skipped backend tests require optional live infrastructure or a live
+model and are covered separately by production acceptance. Docker Desktop on
+the workstation was unavailable, so the final runtime gate was performed on the
+target VM rather than claimed from a local Compose launch.
 
-The PostgreSQL integration suite was verified without Docker by initializing a
-clean temporary PostgreSQL 18 cluster, applying `alembic upgrade head` followed
-by the workspace SQL migrations, and running the complete test suite with
-`ResourceWarning` treated as an error. This exposed and fixed request-thread
-connection cleanup. Docker
-Desktop 4.71 still crashes in its optional Model Runner before the Engine starts,
-so the full Compose runtime remains a required VM acceptance gate.
+## Live production acceptance
 
-## VM deployment evidence
+| Check | Result |
+| --- | --- |
+| Release | `/opt/rag_llm/current` resolves to `/opt/rag_llm/releases/4f12ea1cc`; rollback is `/opt/rag_llm/releases/355b6338d` |
+| Artifact | 29,034,120 bytes; SHA-256 `E164D939E7789B7AB9D68E5F24048E08D427F43568F9F5BAAE694E3DABC0B01C` |
+| Runtime | 19 services running; application, proxy, LLM bridge, Qdrant, Redis, PostgreSQL and TLS proxy healthy |
+| Health | internal `/healthz` returns `{"status":"ok"}` and readiness returns `{"status":"ready"}` |
+| Public access | authenticated external workspace request returns `200`; anonymous request returns `401`; no VPN is required |
+| Repeated authentication | five sequential authenticated UI/API requests, including repeated `/api/me`, returned `200`; no downstream Basic challenge was emitted |
+| Queue drain | default, ingestion and generation queues are `0 / 0 / 0` after acceptance |
+| Document registry | four ready documents are visible: `r5.docx` (196 chunks), `r7.docx` (466), `r12.docx` (1,242), `production_acceptance.md` (4) |
+| Inventory answer | returns all four documents, clickable links, timestamps, processing status and explicit `version unknown / freshness not confirmed`; uses no retrieval or LLM tokens |
+| Procedural answer | `r7.docx` question returned the required sections, event scope and calculation algorithm with one clean human-readable source locator |
+| Definition/formula | `r12.docx` question returned a concise definition of `ИВ0`, one valid displayed equation, variable definitions and the locator `Виды инициатив отклонений > Внешняя инициатива ИВ0-1` |
+| Context budget | live `ИВ0` answer used about 2,895 context tokens and about 3,118 total tokens, rather than injecting the complete document |
+| Parallelism | simultaneous `ИВ0` and `r7` requests completed in their original chats without cross-chat result leakage |
+| Source contract | returned sources are original documents with stable content URLs and useful locators; storage UUIDs and internal chunk labels are absent |
 
-| Check | Result | Evidence |
-| --- | --- | --- |
-| Target/release | passed | `iprg001`; `/opt/rag_llm/current` resolves to `/opt/rag_llm/releases/528c7dd1e`; archive SHA-256 `a8237357aa78948c55d7e34e7bf30d2f411abd8a5be8afed452a76b6111b45e5` is recorded in root-only `/opt/rag_llm/shared/deployed-release.txt` |
-| Release artifact | passed | archive was built from tracked files only; runtime data, generated artifacts and secrets were not included; SHA-256 was verified before extraction |
-| Backup/rollback | passed | latest backup `/opt/rag_llm/shared/backups/pre-3c9e780e6-20260909T092335Z`; PostgreSQL dump, Qdrant snapshot, app-data archive and `SHA256SUMS`; a failing release test stopped candidate `d870003fa` before activation, proving the test gate and rollback path |
-| Migrations/services | passed | migration container exited successfully; app/proxy/LLM bridge healthy; PostgreSQL, Redis, Qdrant, ingestion worker, generation worker, vLLM and telemetry containers running |
-| Health | passed | internal HTTP and external TLS `/healthz` both return `{"status":"ok"}` |
-| Dependencies/tests | passed | final image `pip check`: no broken requirements; `109` tests executed, `102` passed and `7` environment-dependent integration/live-model tests skipped; UI has `14` passing tests and a successful 2522-module production build |
-| Durable generation | passed | a queued answer survived browser refresh and an API/worker replacement, then completed in its original chat |
-| Concurrent chats | passed with automated contract evidence | server-owned two-chat test passes; UI keeps independent chat state and lists several project chats concurrently |
-| Upload/registry/source | passed | Markdown acceptance file is `ready` with 4 indexed chunks; UI shows it under “Документы в памяти”; the original is available through its document-content link |
-| Workspace inventory/version query | passed | production chat `6c99742f-fa79-404a-b472-7d7ea7b4daf2` answered “Какие регламенты у нас есть, когда они загружены и есть ли более актуальные версии?” from the PostgreSQL registry (`flow_mode=workspace`), returned the original document URL and upload time, used zero retrieval chunks, and explicitly did not confuse upload time with document edition or claim an external actuality check |
-| Retrieval/formulas | passed | production chat `0ad3e456-1a67-4f25-89d2-58b5139ae110` returned `NEBULA-742`, `I = U/R`, and `I = 3 A`; the fact links to `production_acceptance.md — раздел «Unique fact»`, the formula links to `production_acceptance.md — раздел «Formula»`; the API returns exactly these cited document locators without score, preview or storage filename |
-| Queues | passed | default, ingestion and generation ARQ queue lengths are all zero after acceptance; ingestion and generation use distinct queue names |
-| Cache | passed at contract level | namespace/TTL, scope key, flow invalidation and corpus invalidation tests pass; a separate live repeat/mutation benchmark was not run because chat history intentionally changes the grounded cache key |
-| Project isolation | passed at integration-contract level | cross-project exclusion test passes; a destructive live two-project corpus mutation was not performed on the retained VM data |
-| Observability | partially verified | Prometheus, Grafana, Loki, Tempo, Alloy and OpenTelemetry containers are running; dashboard contents and alert delivery were not manually certified in this pass |
-| External authentication | passed for restricted single-admin operation | `/nginx-health` returns `200`; anonymous UI access and an invalid password return `401`; valid gateway credentials return `200`; five consecutive authenticated UI/API requests returned `200`, including repeated `/api/me`; the gateway consumes Basic Auth and removes it before the application identity provider, preventing repeated browser challenges; plaintext recovery credentials are mode `0600`, the salted htpasswd hash is `0644` inside a root-only directory |
-| Public internet ingress | passed | O2 Cloud Edge rule `RAG_8443_public` allows source `ANY` only through application profile `RAG_HTTPS_8443` (`TCP/8443`) to `192.168.30.2`; independent TCP probes succeeded from five internet nodes (Hungary, Indonesia, Netherlands, Russia and Turkey); an external anonymous HTTPS request returned `401`, an authenticated request returned `200 text/html`, and the VM DNAT counter recorded 8 packets on port 8443 |
-| Per-user authentication | remaining enterprise hardening | application auth remains `development` behind the mandatory gateway. Corporate OIDC is still required before issuing individual accounts or claiming per-user RBAC/audit attribution |
-| Final runtime audit | passed | `19` services running, internal health `{"status":"ok"}`, default/ingestion/generation queue lengths `0,0,0`; PostgreSQL contains 1 project, 13 acceptance chats, 49 messages and 1 registered document |
+The representative production acceptance cases score at least 9/10 under the
+project rubric. This is not a universal guarantee for every future document:
+quality depends on parsing, corpus completeness and model behavior. A
+version-controlled corpus-specific evaluation set remains the release gate for
+new document classes and model/retrieval changes.
 
-The technical rollout is complete and rollback-ready for restricted use through
-the mandatory TLS Basic Auth gateway. Before multi-user rollout, the operator
-must supply the corporate OIDC issuer, audience, JWKS URL and bootstrap subject,
-switch `RAG_AUTH_MODE=oidc`, and verify RBAC with both an allowed and a denied
-user. The gateway password was generated independently; no credential from the
-VM access document was reused.
+## Deployment and rollback
 
-## Residual risks and scaling triggers
+Deployment was atomic and retained existing PostgreSQL, Redis, Qdrant and vLLM
+data. The tracked release archive was verified before extraction. Runtime data,
+generated artifacts and secrets were excluded. A failed candidate is stopped
+before the `current` symlink is switched; the previous release remains directly
+available for rollback. Final operational documentation is stored separately
+under `/opt/rag_llm/shared/docs` so it survives release rotation.
 
-1. In-flight generation survives browser and API-process replacement through
-   Redis/ARQ plus PostgreSQL state. A simultaneous loss of Redis AOF and
-   PostgreSQL still requires infrastructure restore from a consistent backup.
-2. BM25 is one shared immutable snapshot with a single writer. Shard or move to
-   a service before increasing ingestion workers or deploying writers on
-   multiple hosts.
-3. The frontend bundle should be code-split when cold-load measurements exceed
-   the product target; current gzip size is about 318 KB.
-4. Answer quality is corpus- and model-dependent. `quality_eval.py` now enforces
-   a per-question 9/10 threshold for facts, citations, formulas, refusal, and
-   latency. A representative production JSONL set and VM run are still required
-   before claiming the score for the real corpus.
-5. Rust currently has compilation coverage but no unit tests; production should
-   add retrieval/cache protocol tests before making Rust the default flow.
-6. The Qdrant Python client is `1.19.0` while the server is `1.17.1`; the client
-   warns that the minor-version gap exceeds its compatibility policy. Pin or
-   upgrade the pair together in the next maintenance release.
+## Remaining enterprise hardening
+
+The current Basic gateway is appropriate for restricted single-account use.
+Corporate OIDC is still required for named users, individual RBAC and
+user-attributed audit logs. Configure issuer, audience, JWKS URL and bootstrap
+subject before claiming enterprise multi-user identity. Also keep the Qdrant
+client/server minor versions aligned at the next maintenance window and expand
+branch coverage in `rag_agent.py`, `web_ui.py`, `db_store.py` and provider error
+paths.

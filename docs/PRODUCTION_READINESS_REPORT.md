@@ -1,6 +1,6 @@
 # Production readiness report
 
-Date: 2026-09-09. Branch: `dev`. Production release: `456dc3194`.
+Date: 2026-09-09. Branch: `dev`. Production release: `b1049e1dd`.
 
 The application is publicly available without VPN at
 `https://5.35.120.112:8443/`. The TLS gateway requires Basic Auth once per
@@ -25,7 +25,7 @@ login dialogs.
 | Formulas | Markdown/KaTeX renders validated LaTeX formulas; formula payload contains equations rather than prose | formula contracts and live `ИВ0` answer |
 | Grounded answers | deterministic inventory and evidence-based extractive paths reduce unnecessary LLM use; out-of-scope questions are refused | live acceptance on `r5.docx`, `r7.docx`, `r12.docx` and refusal case |
 | Prompt-injection resistance | document text is treated as evidence, not as executable user/system instructions | policy and injection contracts |
-| UX | compact chat list, visible project document registry, restored running states, and a technical panel that restores the matching Evidence, Sources and Debug question after refresh/chat switching | 17 UI tests, production build and live persisted-metadata acceptance |
+| UX | compact chat list, visible project document registry, upload progress synchronized with the authoritative document status, restored running states, and a technical panel that restores the matching Evidence, Sources and Debug question after refresh/chat switching | 19 UI tests, production build and live persisted-metadata acceptance |
 
 ## Automated verification
 
@@ -37,7 +37,7 @@ login dialogs.
   ASGI routes `63.8%`, deterministic DOCX parser `62.2%`, and core RAG agent
   `42.8%`. Coverage is reported honestly; live acceptance and integration tests
   do not replace missing unit branches.
-- UI Vitest: `17 passed` (`7` API and `10` application tests).
+- UI Vitest: `19 passed` (`7` API and `12` application tests).
 - UI production build: successful, `2522` modules.
 - Focused source/formula/PRISM regression: `28 passed`.
 - PostgreSQL 18 integration gate from the hardening pass: `86 passed`,
@@ -52,8 +52,8 @@ target VM rather than claimed from a local Compose launch.
 
 | Check | Result |
 | --- | --- |
-| Release | `/opt/rag_llm/current` resolves to `/opt/rag_llm/releases/456dc3194`; rollback is `/opt/rag_llm/releases/4f12ea1cc` |
-| Artifact | 29,083,496 bytes; SHA-256 `3111D22A4633CEF949D22FFC07C5F3AE73733966E9ED205F382CDF2238283638` |
+| Release | `/opt/rag_llm/current` resolves to `/opt/rag_llm/releases/b1049e1dd`; rollback is `/opt/rag_llm/releases/456dc3194` |
+| Artifact | 29,084,618 bytes; SHA-256 `B6F78EE2472104FFBFAD600CCC1A9369E4C1F802CA7E24FF7D2700A8BE2CF674` |
 | Runtime | 19 services running; application, proxy, LLM bridge, Qdrant, Redis, PostgreSQL and TLS proxy healthy |
 | Health | internal `/healthz` returns `{"status":"ok"}` and readiness returns `{"status":"ready"}` |
 | Public access | authenticated external workspace request returns `200`; anonymous request returns `401`; no VPN is required |
@@ -66,7 +66,8 @@ target VM rather than claimed from a local Compose launch.
 | Context budget | live `ИВ0` answer used about 2,895 context tokens and about 3,118 total tokens, rather than injecting the complete document |
 | Parallelism | simultaneous `ИВ0` and `r7` requests completed in their original chats without cross-chat result leakage |
 | Source contract | returned sources are original documents with stable content URLs and useful locators; storage UUIDs and internal chunk labels are absent |
-| Technical panel restore | active production chat exposes one persisted source, one formula, usage and LLM metadata; deployed asset `assets/index-D1iHS_rE.js` restores those values and the matching question after page refresh |
+| Upload status consistency | the right-side upload notice derives from the current document registry instead of retaining the initial queue response; pending, mixed, ready and failed states are distinguished |
+| Technical panel restore | active production chat exposes one persisted source, one formula, usage and LLM metadata; deployed asset `assets/index-DzH4VeGm.js` restores those values and the matching question after page refresh |
 
 The representative production acceptance cases score at least 9/10 under the
 project rubric. This is not a universal guarantee for every future document:

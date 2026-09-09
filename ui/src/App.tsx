@@ -341,6 +341,51 @@ export function generationResponseIsTerminal(status?: AskResponse["status"]): bo
   return status !== "running";
 }
 
+function fileCountLabel(count: number): string {
+  const mod100 = count % 100;
+  const mod10 = count % 10;
+  const noun = mod100 >= 11 && mod100 <= 14
+    ? "файлов"
+    : mod10 === 1
+      ? "файл"
+      : mod10 >= 2 && mod10 <= 4
+        ? "файла"
+        : "файлов";
+  return `${count} ${noun}`;
+}
+
+export function uploadFeedback(
+  result: UploadResponse | null,
+  documents: DocumentRecord[]
+): { state: "pending" | "success" | "error"; message: string } | null {
+  if (!result?.files.length) return null;
+  const documentsById = new Map(documents.map((document) => [document.id, document]));
+  const statuses = result.files.map((file) => documentsById.get(file.id)?.status ?? file.status);
+  const ready = statuses.filter((status) => status === "ready").length;
+  const failed = statuses.filter((status) => status === "failed" || status === "cancelled").length;
+  const total = statuses.length;
+
+  if (failed) {
+    const completed = ready ? ` Готово: ${ready}.` : "";
+    return {
+      state: "error",
+      message: `Не обработано: ${failed} из ${total}.${completed} Проверьте статус документа слева.`
+    };
+  }
+  if (ready === total) {
+    return {
+      state: "success",
+      message: `${fileCountLabel(total)} ${total === 1 ? "готов и добавлен" : "готовы и добавлены"} в базу знаний`
+    };
+  }
+  return {
+    state: "pending",
+    message: ready
+      ? `Готово ${ready} из ${total} · остальные обрабатываются`
+      : `${fileCountLabel(total)} ${total === 1 ? "обрабатывается" : "обрабатываются"}…`
+  };
+}
+
 function readStored<T>(key: string, fallback: T): T {
   try {
     const value = window.localStorage.getItem(key);
@@ -583,6 +628,11 @@ export function App() {
   useEffect(() => {
     void loadDocuments(activeProjectId, activeChatId);
   }, [activeChatId, activeProjectId, loadDocuments]);
+
+  useEffect(() => {
+    setUploadResult(null);
+    setUploadError("");
+  }, [activeChatId, activeProjectId]);
 
   useEffect(() => {
     if (!activeChatId || !activeChatHasRunningMessage) return;
@@ -1645,6 +1695,7 @@ function KnowledgeLoader({
   onUpload: () => void;
 }) {
   const inputId = "knowledge-file-input";
+  const feedback = uploadFeedback(result, documents);
 
   return (
     <section className="knowledge-loader" aria-label="Загрузка в базу знаний">
@@ -1687,10 +1738,16 @@ function KnowledgeLoader({
         {isUploading ? "Загрузка..." : "Загрузить"}
       </button>
 
-      {result ? (
-        <div className="upload-status success">
-          <CheckCircle2 size={14} />
-          <span>{result.files.length} файл(ов) поставлено в очередь</span>
+      {feedback ? (
+        <div className={`upload-status ${feedback.state}`} aria-live="polite">
+          {feedback.state === "error" ? (
+            <AlertTriangle size={14} />
+          ) : feedback.state === "pending" ? (
+            <RefreshCw className="spin" size={14} />
+          ) : (
+            <CheckCircle2 size={14} />
+          )}
+          <span>{feedback.message}</span>
         </div>
       ) : null}
       {error ? (

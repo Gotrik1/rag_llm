@@ -812,6 +812,12 @@ textarea {
   color: #9ee0d0;
 }
 
+.upload-status.pending {
+  border-color: #375a7c;
+  background: #142638;
+  color: #b9dcff;
+}
+
 .upload-status.error {
   border-color: #7c3d1a;
   background: #2b1b12;

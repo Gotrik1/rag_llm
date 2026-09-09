@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { documentUploadedLabel, documentVersionLabel, generationResponseIsTerminal, hasRunningAssistantMessage, normalizeSourceCitations, panelStateFromMessageRecords, resultFromMessageRecord, sourceLocatorLabel, visibleNavigationChats } from "./App";
+import { documentUploadedLabel, documentVersionLabel, generationResponseIsTerminal, hasRunningAssistantMessage, normalizeSourceCitations, panelStateFromMessageRecords, resultFromMessageRecord, sourceLocatorLabel, uploadFeedback, visibleNavigationChats } from "./App";
 
 
 describe("persisted generation state", () => {
@@ -114,5 +114,53 @@ describe("persisted generation state", () => {
 
     expect(restored.question).toBe("Второй вопрос");
     expect(restored.result?.answer).toBe("Второй ответ");
+  });
+
+  it("replaces the queued upload notice with the authoritative ready state", () => {
+    const result = {
+      chunks: 0,
+      queued: true,
+      files: [{
+        id: "document-1",
+        file: "manual.docx",
+        job_id: "job-1",
+        status: "queued",
+        url: "/api/documents/document-1/content",
+        size_bytes: 1200
+      }]
+    };
+
+    expect(uploadFeedback(result, [{
+      id: "document-1",
+      file_name: "manual.docx",
+      status: "ready"
+    }])).toEqual({
+      state: "success",
+      message: "1 файл готов и добавлен в базу знаний"
+    });
+  });
+
+  it("shows truthful progress and terminal upload failures", () => {
+    const result = {
+      chunks: 0,
+      queued: true,
+      files: [
+        { id: "document-1", file: "one.docx", job_id: "job-1", status: "queued", url: "/one", size_bytes: 1 },
+        { id: "document-2", file: "two.docx", job_id: "job-2", status: "queued", url: "/two", size_bytes: 1 }
+      ]
+    };
+
+    expect(uploadFeedback(result, [
+      { id: "document-1", file_name: "one.docx", status: "ready" },
+      { id: "document-2", file_name: "two.docx", status: "processing" }
+    ])).toEqual({ state: "pending", message: "Готово 1 из 2 · остальные обрабатываются" });
+
+    expect(uploadFeedback(result, [
+      { id: "document-1", file_name: "one.docx", status: "ready" },
+      { id: "document-2", file_name: "two.docx", status: "failed" }
+    ])).toEqual({
+      state: "error",
+      message: "Не обработано: 1 из 2. Готово: 1. Проверьте статус документа слева."
+    });
   });
 });

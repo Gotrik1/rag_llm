@@ -22,13 +22,10 @@ For complete configuration, backup, acceptance, and rollback steps, read
 [`../DEPLOYMENT.md`](../DEPLOYMENT.md). Never commit generated secret files,
 private keys, certificates, uploaded documents, or runtime volumes.
 
-The Internet-facing TLS proxy requires `gateway_htpasswd`. Generate a strong,
-unique password independently from SSH/sudo credentials and store only its
-Apache-compatible hash in that Docker secret. Keep the plaintext recovery copy,
-if one is operationally required, in a root-only host file outside the release.
-For Compose file-backed secrets, keep the host secret directory mode `0700`,
-the plaintext recovery file `0600`, and the salted htpasswd hash `0644` so the
-unprivileged nginx worker can read its direct bind mount.
-The public `/nginx-health` probe is intentionally exempt; every UI and API path
-is protected. Corporate OIDC should replace this single shared gateway identity
-when per-user RBAC and audit attribution are required.
+The Internet-facing TLS proxy does not use HTTP Basic Auth and therefore must
+not mount a shared gateway password. The application owns registration, login,
+logout, lockout, CSRF protection and opaque server-side sessions. Keep
+`RAG_AUTH_MODE=local` and `RAG_SESSION_COOKIE_SECURE=true` on HTTPS production.
+The public `/nginx-health` probe remains unauthenticated; application API routes
+enforce the current user and document ownership. Corporate OIDC can later
+replace local accounts without reintroducing a shared browser credential.

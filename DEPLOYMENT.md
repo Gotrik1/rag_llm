@@ -11,8 +11,9 @@ command from the canonical checkout on branch `dev`. Do not use the legacy
 - Persistent filesystem with separate monitored capacity for PostgreSQL,
   Qdrant, uploaded documents/BM25, model cache, Prometheus, Loki, and Tempo.
 - DNS/TLS certificate for `RAG_SERVER_NAME`.
-- Reachable OIDC issuer/JWKS and correct audience/claims for multi-user use; a
-  TLS-gateway password is the minimum temporary control for single-admin use.
+- A strong application secret for opaque server-side sessions and CSRF tokens.
+- Optional reachable OIDC issuer/JWKS and correct audience/claims if corporate
+  SSO replaces the built-in local accounts later.
 - Outbound registry/Hugging Face access for the first image/model pull, or an
   approved offline image/model transfer.
 
@@ -28,7 +29,6 @@ cp deploy/secrets/redis_password.example deploy/secrets/redis_password
 cp deploy/secrets/redis_exporter_passwords.json.example deploy/secrets/redis_exporter_passwords.json
 cp deploy/secrets/grafana_admin_password.example deploy/secrets/grafana_admin_password
 cp deploy/secrets/app_secret_key.example deploy/secrets/app_secret_key
-cp deploy/secrets/gateway_htpasswd.example deploy/secrets/gateway_htpasswd
 ```
 
 Replace every placeholder. `redis_exporter_passwords.json` must contain the
@@ -36,12 +36,13 @@ same Redis password as `redis_password`, mapped to `redis://redis:6379`.
 Prefer a platform secret manager. If files are used, grant read permission only
 to the deployment account. Never paste their contents into logs or reports.
 
-Generate `gateway_htpasswd` with a strong password and an Apache-compatible
-`apr1` hash. Never reuse SSH/sudo credentials. Set real OIDC
-issuer/audience/JWKS values for multi-user production, plus one exact trusted
-CORS origin, server name, TLS paths, data root, and GPU limits. Development
-authentication may be used only while every public UI/API route is protected by
-the TLS gateway; it does not provide per-user RBAC or attribution.
+Set `RAG_AUTH_MODE=local`, `RAG_SESSION_COOKIE_SECURE=true`, one exact trusted
+CORS origin, server name, TLS paths, data root and GPU limits. The TLS gateway
+must not enable HTTP Basic Auth: registration, login, logout, lockout, CSRF and
+session restoration belong to the application. Configure
+`RAG_LOCAL_ADMIN_EMAILS` only when an explicitly approved account must receive
+administrator rights at registration. OIDC issuer/audience/JWKS values are
+optional until corporate SSO is enabled.
 
 ## 3. Preflight and backup
 
@@ -86,24 +87,28 @@ curl --fail http://127.0.0.1:8080/nginx-health
 curl --fail http://127.0.0.1:8080/healthz
 curl --fail http://127.0.0.1:8080/readyz
 curl --fail --cacert /path/to/ca.pem https://RAG_SERVER_NAME:8443/nginx-health
-curl --fail --user USER:PASSWORD --cacert /path/to/ca.pem https://RAG_SERVER_NAME:8443/healthz
+curl --fail --cacert /path/to/ca.pem https://RAG_SERVER_NAME:8443/nginx-health
 ```
 
-Then verify through the real browser/OIDC path:
+Then verify through the real application-auth path:
 
-1. Create a project and two chats.
-2. Upload one small document; observe queued → processing → ready and a nonzero chunk count.
-3. Ask a question whose answer is present and verify that the citation names the
+1. Register two temporary users, refresh each browser session and verify that
+   no HTTP Basic dialog appears and each session remains authenticated.
+2. Create a project and two chats for each user; confirm that projects, chats,
+   messages and private documents do not cross users.
+3. Verify that existing shared documents are visible to both users. Switch one
+   project between `project_only` and `project_and_global` and verify retrieval scope.
+4. Upload one small private document; observe queued → processing → ready and a nonzero chunk count.
+5. Ask a question whose answer is present and verify that the citation names the
    document and a human locator, contains no UUID/chunk/score, and opens the
    source document.
-4. Ask a formula question and verify inline/display rendering.
-5. Start a slow answer, refresh the page, then restart only `app`; verify the
+6. Ask a formula question and verify inline/display rendering.
+7. Start a slow answer, refresh the page, then restart only `app`; verify the
    generation worker finishes it and the answer, sources, and formulas appear.
-6. Start answers in two chats and switch between them; verify no cross-chat message placement.
-7. Upload different documents to two projects and verify facts/sources do not cross project boundaries.
-8. Repeat an identical question and verify `from_cache=true`; change project memory/document corpus and verify no stale hit.
-9. Inspect Grafana `RAG Production Overview`, Prometheus targets, Loki logs, and Tempo traces.
-10. Run the versioned corpus gate from `docs/QUALITY_EVALUATION.md`; every case
+8. Start answers in two chats and switch between them; verify no cross-chat message placement.
+9. Repeat an identical question and verify `from_cache=true`; change project memory/document corpus and verify no stale hit.
+10. Inspect Grafana `RAG Production Overview`, Prometheus targets, Loki logs, and Tempo traces.
+11. Run the versioned corpus gate from `docs/QUALITY_EVALUATION.md`; every case
     must score at least 9/10.
 
 Record response status, latency, source file/section, and the deployed Git SHA.

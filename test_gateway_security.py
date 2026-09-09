@@ -8,26 +8,25 @@ ROOT = Path(__file__).resolve().parent
 
 
 class GatewaySecurityTests(unittest.TestCase):
-    def test_tls_gateway_requires_basic_auth_but_health_stays_probeable(self):
+    def test_tls_gateway_uses_application_auth_without_basic_challenge(self):
         config = (ROOT / "deploy/nginx/tls.conf.template").read_text(encoding="utf-8")
 
         health = config.split("location = /nginx-health", 1)[1].split("location /", 1)[0]
         protected = config.split("location /", 1)[1]
         self.assertNotIn("auth_basic", health)
-        self.assertIn('auth_basic "RAG Assistant";', protected)
-        self.assertIn("auth_basic_user_file /run/secrets/gateway_htpasswd;", protected)
+        self.assertNotIn("auth_basic", protected)
+        self.assertIn("location ~ ^/api/auth/(login|register)$", config)
+        self.assertIn("limit_req zone=rag_auth", config)
         self.assertIn('proxy_set_header Authorization "";', protected)
         self.assertIn('proxy_set_header Proxy-Authorization "";', protected)
 
-    def test_compose_mounts_gateway_password_as_a_secret(self):
+    def test_compose_does_not_mount_a_shared_gateway_password(self):
         compose = yaml.safe_load((ROOT / "compose.yaml").read_text(encoding="utf-8"))
 
-        mounted_secret = compose["services"]["tls-proxy"]["secrets"][0]
-        self.assertEqual(mounted_secret["source"], "gateway_htpasswd")
-        self.assertEqual(mounted_secret["target"], "gateway_htpasswd")
-        self.assertEqual(mounted_secret["mode"], 0o444)
-        secret_file = compose["secrets"]["gateway_htpasswd"]["file"]
-        self.assertIn("RAG_GATEWAY_HTPASSWD_FILE", secret_file)
+        self.assertNotIn("secrets", compose["services"]["tls-proxy"])
+        self.assertNotIn("gateway_htpasswd", compose["secrets"])
+        self.assertEqual(compose["x-app-environment"]["RAG_AUTH_MODE"], "${RAG_AUTH_MODE:-local}")
+        self.assertEqual(compose["x-app-environment"]["RAG_SESSION_COOKIE_SECURE"], "${RAG_SESSION_COOKIE_SECURE:-true}")
 
 
 if __name__ == "__main__":

@@ -910,8 +910,12 @@ export function App() {
             <span>Новый диалог</span>
           </button>
           <NavigationSidebar
+            activeChatId={activeChatId}
             activeProjectId={activeProjectId}
             chats={chats}
+            documents={documents}
+            documentsError={documentsError}
+            isLoadingDocuments={isLoadingDocuments}
             pinnedChatIds={pinnedChatIds}
             pinnedProjectIds={pinnedProjectIds}
             projects={projects}
@@ -973,8 +977,12 @@ export function App() {
 }
 
 function NavigationSidebar({
+  activeChatId,
   activeProjectId,
   chats,
+  documents,
+  documentsError,
+  isLoadingDocuments,
   pinnedChatIds,
   pinnedProjectIds,
   projects,
@@ -990,8 +998,12 @@ function NavigationSidebar({
   onProjectPin,
   onProjectRename
 }: {
+  activeChatId: string;
   activeProjectId: string;
   chats: ChatSummary[];
+  documents: DocumentRecord[];
+  documentsError: string;
+  isLoadingDocuments: boolean;
   pinnedChatIds: string[];
   pinnedProjectIds: string[];
   projects: Project[];
@@ -1008,7 +1020,8 @@ function NavigationSidebar({
   onProjectRename: (projectId: string, name: string) => void;
 }) {
   const [showAllProjects, setShowAllProjects] = useState(false);
-  const [collapsedProjectIds, setCollapsedProjectIds] = useState<string[]>([]);
+  const [expandedProjectIds, setExpandedProjectIds] = useState<string[]>([]);
+  const [expandedChatScopes, setExpandedChatScopes] = useState<string[]>([]);
   const [movingChatId, setMovingChatId] = useState<string | null>(null);
   const [editing, setEditing] = useState<{ kind: "project" | "chat"; id: string; value: string } | null>(null);
   const visibleProjects = showAllProjects ? projects : projects.slice(0, 5);
@@ -1016,6 +1029,10 @@ function NavigationSidebar({
   const pinnedChats = chats.filter((chat) => pinnedChatIds.includes(chat.id));
   const freeChats = chats.filter((chat) => chat.projectId === null);
   const projectNames = new Map(projects.map((project) => [project.id, project.name]));
+
+  useEffect(() => {
+    if (activeProjectId) setExpandedProjectIds([activeProjectId]);
+  }, [activeProjectId]);
 
   const saveEdit = () => {
     if (!editing) return;
@@ -1038,6 +1055,7 @@ function NavigationSidebar({
   const renderChat = (chat: ChatSummary, nested = false) => (
     <div className={`nav-chat-group ${nested ? "project-chat" : ""}`} key={chat.id}>
       <NavigationItem
+        active={chat.id === activeChatId}
         chat
         label={chat.title}
         onDelete={() => onChatDelete(chat.id)}
@@ -1069,11 +1087,34 @@ function NavigationSidebar({
     </div>
   );
 
+  const renderChatList = (items: ChatSummary[], scope: string, nested = false) => {
+    const expanded = expandedChatScopes.includes(scope);
+    const activeIndex = items.findIndex((chat) => chat.id === activeChatId);
+    const visible = visibleNavigationChats(items, expanded, 4, activeIndex);
+    return (
+      <>
+        {visible.map((chat) => renderChat(chat, nested))}
+        {items.length > 4 ? (
+          <button
+            className="nav-list-toggle"
+            onClick={() => setExpandedChatScopes((current) => current.includes(scope)
+              ? current.filter((item) => item !== scope)
+              : [...current, scope])}
+            type="button"
+          >
+            {expanded ? "Свернуть" : `Ещё ${items.length - 4}`}
+          </button>
+        ) : null}
+      </>
+    );
+  };
+
   return (
     <nav className="navigation-sidebar" aria-label="Проекты и чаты">
-      <section className="nav-section">
-        <div className="nav-section-title">Закреплённые</div>
-        <div className="project-list pinned-list">
+      {pinnedProjects.length || pinnedChats.length ? (
+        <section className="nav-section">
+          <div className="nav-section-title">Закреплённые</div>
+          <div className="project-list pinned-list">
           {pinnedProjects.map((project) => (
             <NavigationItem
               active={project.id === activeProjectId}
@@ -1104,6 +1145,7 @@ function NavigationSidebar({
           ))}
         </div>
       </section>
+      ) : null}
 
       <section className="nav-section">
         <div className="nav-section-header">
@@ -1112,26 +1154,27 @@ function NavigationSidebar({
         </div>
         <div className="project-list">
           {visibleProjects.map((project) => (
-            <div className={`project-tree ${collapsedProjectIds.includes(project.id) ? "is-collapsed" : ""}`} key={project.id}>
+            <div className={`project-tree ${expandedProjectIds.includes(project.id) ? "" : "is-collapsed"}`} key={project.id}>
               <NavigationItem
                 active={project.id === activeProjectId}
+                detail={`${chats.filter((chat) => chat.projectId === project.id).length} чатов`}
                 icon={<Folder size={17} />}
                 label={project.name}
                 onCreateChat={() => onProjectChatCreate(project.id)}
                 onDelete={() => onProjectDelete(project.id)}
                 onOpen={() => {
-                  setCollapsedProjectIds((current) => current.includes(project.id)
+                  setExpandedProjectIds((current) => current.includes(project.id)
                     ? current.filter((id) => id !== project.id)
-                    : [...current, project.id]);
+                    : [project.id]);
                   onProjectChange(project.id);
                 }}
                 onPin={() => onProjectPin(project.id)}
                 pinned={pinnedProjectIds.includes(project.id)}
                 {...editProps("project", project.id, project.name)}
               />
-              {!collapsedProjectIds.includes(project.id) ? (
+              {expandedProjectIds.includes(project.id) ? (
                 <div className="project-chat-list">
-                  {chats.filter((chat) => chat.projectId === project.id).map((chat) => renderChat(chat, true))}
+                  {renderChatList(chats.filter((chat) => chat.projectId === project.id), `project:${project.id}`, true)}
                 </div>
               ) : null}
             </div>
@@ -1144,12 +1187,51 @@ function NavigationSidebar({
         ) : null}
       </section>
 
-      <section className="nav-section chats-section">
-        <div className="nav-section-title">Чаты</div>
-        <div className="sidebar-chat-list">
-          {freeChats.length ? freeChats.map((chat) => renderChat(chat)) : <div className="sidebar-empty">Свободных чатов пока нет.</div>}
+      <section className="nav-section documents-section" aria-label={activeProjectId ? "Документы проекта" : "Документы чата"}>
+        <div className="nav-section-header">
+          <div className="nav-section-title">{activeProjectId ? "Документы проекта" : "Документы чата"}</div>
+          <span className="nav-count" title="Количество загруженных документов">{documents.length}</span>
+        </div>
+        <div className="nav-document-list" aria-live="polite">
+          {isLoadingDocuments ? <div className="sidebar-empty">Обновляем список…</div> : null}
+          {documentsError ? <div className="sidebar-empty error-copy">{documentsError}</div> : null}
+          {!isLoadingDocuments && !documentsError && !documents.length ? (
+            <div className="sidebar-empty">Документов пока нет. Загрузить их можно в панели справа.</div>
+          ) : null}
+          {documents.map((document) => (
+            <a
+              className="nav-document"
+              href={`/api/documents/${document.id}/content`}
+              key={document.id}
+              rel="noreferrer"
+              target="_blank"
+              title={`${document.file_name}. ${documentUploadedLabel(document.created_at)}. ${documentVersionLabel(document)}`}
+            >
+              <FileText size={15} />
+              <span className="nav-document-copy">
+                <span className="nav-document-name">{document.file_name}</span>
+                <span className="nav-document-meta">
+                  {documentUploadedLabel(document.created_at)} · {documentVersionLabel(document)}
+                </span>
+              </span>
+              <span className={`nav-document-status ${document.status}`}>
+                {document.status === "ready"
+                  ? "Готов"
+                  : document.status === "processing"
+                    ? `${document.processing_state?.progress ?? 0}%`
+                    : document.status}
+              </span>
+            </a>
+          ))}
         </div>
       </section>
+
+      {freeChats.length ? (
+        <section className="nav-section chats-section">
+          <div className="nav-section-title">Свободные чаты</div>
+          <div className="sidebar-chat-list">{renderChatList(freeChats, "free")}</div>
+        </section>
+      ) : null}
     </nav>
   );
 }
@@ -1594,44 +1676,17 @@ function KnowledgeLoader({
           <span>{error}</span>
         </div>
       ) : null}
-      <div className="memory-documents" aria-live="polite">
-        <div className="memory-documents-heading">
-          <span>Документы в памяти</span>
-          <span>{documents.length}</span>
-        </div>
-        {isLoadingDocuments ? <div className="loader-muted">Обновляем список…</div> : null}
-        {documentsError ? (
-          <div className="upload-status error"><AlertTriangle size={14} /><span>{documentsError}</span></div>
-        ) : null}
-        {!isLoadingDocuments && !documentsError && !documents.length ? (
-          <div className="loader-muted">В этом проекте пока нет документов.</div>
-        ) : null}
-        {documents.map((document) => (
-          <a
-            className="memory-document"
-            href={`/api/documents/${document.id}/content`}
-            key={document.id}
-            rel="noreferrer"
-            target="_blank"
-            title={`${document.file_name}. ${documentUploadedLabel(document.created_at)}. ${documentVersionLabel(document)}`}
-          >
-            <FileText size={13} />
-            <span className="memory-document-copy">
-              <span className="memory-document-name">{document.file_name}</span>
-              <span className="memory-document-meta">
-                {documentUploadedLabel(document.created_at)} · {documentVersionLabel(document)}
-              </span>
-            </span>
-            <span className={`memory-document-status ${document.status}`}>
-              {document.status === "ready"
-                ? "Готов"
-                : document.status === "processing"
-                  ? `${document.processing_state?.progress ?? 0}%`
-                  : document.status}
-            </span>
-          </a>
-        ))}
+      <div className="knowledge-summary" aria-live="polite">
+        <Files size={14} />
+        <span>
+          {isLoadingDocuments
+            ? "Обновляем список документов…"
+            : `${documents.length} документ(ов) · перечень показан слева`}
+        </span>
       </div>
+      {documentsError ? (
+        <div className="upload-status error"><AlertTriangle size={14} /><span>{documentsError}</span></div>
+      ) : null}
     </section>
   );
 }
@@ -2151,6 +2206,12 @@ export function documentUploadedLabel(createdAt?: string): string {
     dateStyle: "medium",
     timeStyle: "short"
   }).format(date)}`;
+}
+
+export function visibleNavigationChats<T>(items: T[], expanded: boolean, limit = 4, activeIndex = -1): T[] {
+  if (expanded || items.length <= limit) return items;
+  if (activeIndex < limit || activeIndex >= items.length) return items.slice(0, limit);
+  return [...items.slice(0, Math.max(limit - 1, 0)), items[activeIndex]];
 }
 
 export function documentVersionLabel(

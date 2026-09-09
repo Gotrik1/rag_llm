@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { documentUploadedLabel, documentVersionLabel, generationResponseIsTerminal, hasRunningAssistantMessage, normalizeSourceCitations, resultFromMessageRecord, sourceLocatorLabel } from "./App";
+import { documentUploadedLabel, documentVersionLabel, generationResponseIsTerminal, hasRunningAssistantMessage, normalizeSourceCitations, resultFromMessageRecord, sourceLocatorLabel, visibleNavigationChats } from "./App";
 
 
 describe("persisted generation state", () => {
@@ -12,6 +12,13 @@ describe("persisted generation state", () => {
       version_status: "superseded",
       newer_file_name: "Регламент v1.5.docx"
     })).toBe("Есть новее: Регламент v1.5.docx");
+  });
+
+  it("keeps long chat histories compact until the user expands them", () => {
+    const chats = ["one", "two", "three", "four", "five", "six"];
+    expect(visibleNavigationChats(chats, false)).toEqual(["one", "two", "three", "four"]);
+    expect(visibleNavigationChats(chats, false, 4, 5)).toEqual(["one", "two", "three", "six"]);
+    expect(visibleNavigationChats(chats, true)).toEqual(chats);
   });
 
   it("shows a human document locator instead of retrieval metadata", () => {

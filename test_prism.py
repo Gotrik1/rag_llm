@@ -242,6 +242,8 @@ class PrismQueryTests(unittest.TestCase):
         self.assertIn(r"$$\mathrm{ИВ0} = V_{\mathrm{УДГ}} - V_{\mathrm{план.\,ДГ}}$$", answer)
         self.assertIn(r"V_{\mathrm{УДГ}}", answer)
         self.assertIn(r"V_{\mathrm{план.\,ДГ}}", answer)
+        self.assertIn("величина внешней инициативы для соответствующей ГТП и часа", answer)
+        self.assertNotIn(":;", answer)
         self.assertIn("[Источник: abc123_r12.docx —", answer)
         self.assertNotIn("[Источник: r12_rag.md —", answer)
 

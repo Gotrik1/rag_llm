@@ -922,13 +922,19 @@ def generate_extractive_value_answer(
                 break
 
         source = human_source_reference(term_items[0])
-        if snippets:
+        rule_text = "\n".join(str(item.get("text", "")) for item in term_items)
+        derived_formula = derive_worded_formula(question, rule_text)
+        if derived_formula:
+            lines.append(
+                f"- {term}: величина внешней инициативы для соответствующей ГТП и часа; "
+                "она равна разности между объёмом электроэнергии по УДГ и объёмом "
+                f"электроэнергии в плановом ДГ. [Источник: {source}]."
+            )
+        elif snippets:
             lines.append(f"- {term}: {_short_explanation(term, ' '.join(snippets), 520)} [Источник: {source}].")
         else:
             lines.append(f"- {term}: расчетная фраза не выделена из evidence. [Источник: {source}].")
 
-        rule_text = "\n".join(str(item.get("text", "")) for item in term_items)
-        derived_formula = derive_worded_formula(question, rule_text)
         if derived_formula:
             lines.extend([
                 "",

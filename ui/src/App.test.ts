@@ -1,9 +1,19 @@
 import { describe, expect, it } from "vitest";
 
-import { generationResponseIsTerminal, hasRunningAssistantMessage, normalizeSourceCitations, resultFromMessageRecord, sourceLocatorLabel } from "./App";
+import { documentUploadedLabel, documentVersionLabel, generationResponseIsTerminal, hasRunningAssistantMessage, normalizeSourceCitations, resultFromMessageRecord, sourceLocatorLabel } from "./App";
 
 
 describe("persisted generation state", () => {
+  it("shows upload time and conservative version status", () => {
+    expect(documentUploadedLabel()).toBe("Время загрузки неизвестно");
+    expect(documentVersionLabel({ version_label: null, version_status: "unknown" })).toBe("Версия не указана");
+    expect(documentVersionLabel({
+      version_label: "1.4",
+      version_status: "superseded",
+      newer_file_name: "Регламент v1.5.docx"
+    })).toBe("Есть новее: Регламент v1.5.docx");
+  });
+
   it("shows a human document locator instead of retrieval metadata", () => {
     expect(sourceLocatorLabel({ locator: "стр. 17, раздел «Расчёт»" })).toBe("стр. 17, раздел «Расчёт»");
     expect(sourceLocatorLabel({ section: "Запуск" })).toBe("Раздел «Запуск»");

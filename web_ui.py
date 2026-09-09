@@ -45,6 +45,7 @@ from db_store import (
     update_project,
     update_workspace,
 )
+from document_catalog import build_document_catalog_answer, is_document_catalog_question
 from llm_providers import DEFAULTS, ProviderLLM
 from rag_agent import CACHE_VERSION, DATA_DIR, GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, format_formula_for_display, refine_prism_query, source_locator, user_facing_source_name, validate_retrieval
 from runtime_paths import MATHML_CACHE_DIR, STATE_DIR, UPLOAD_DIR
@@ -1217,6 +1218,34 @@ class Handler(BaseHTTPRequestHandler):
         scope = get_project_conversation(chat_id)
         if scope is None:
             self.send_json({"error": "chat not found"}, 404)
+            return
+        if is_document_catalog_question(question):
+            started = time.time()
+            project_id = str(scope.get("project_id") or "").strip()
+            documents = list_documents(project_id or None, None if project_id else chat_id)
+            catalog = build_document_catalog_answer(
+                str(scope.get("project_name") or "Свободный чат"),
+                documents,
+            )
+            answer = str(catalog["answer"])
+            self.send_json({
+                "answer": answer,
+                "html_answer": render_text(answer),
+                "formulas": [],
+                "warnings": [],
+                "sources": catalog["sources"],
+                "documents": catalog["documents"],
+                "context": [],
+                "from_cache": False,
+                "llm": {
+                    "provider": "workspace",
+                    "model": "postgresql-registry",
+                    "label": "Реестр документов · PostgreSQL",
+                },
+                "flow_mode": "workspace",
+                "elapsed_s": time.time() - started,
+                "usage": usage_stats(answer, []),
+            })
             return
         excluded_sources = excluded_document_sources(scope, chat_id)
 

@@ -243,7 +243,10 @@ class AsgiFoundationTests(unittest.TestCase):
         with patch("asgi_app.list_documents", return_value=items) as list_documents:
             response = self.client.get("/api/projects/project-1/documents")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["items"], items)
+        document = response.json()["items"][0]
+        self.assertEqual(document["file_name"], "manual.pdf")
+        self.assertEqual(document["version_status"], "unknown")
+        self.assertIsNone(document["version_label"])
         list_documents.assert_called_once_with("project-1", None)
 
 

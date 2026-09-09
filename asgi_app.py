@@ -20,6 +20,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from audit import record as audit_record
 from db_store import create_document, create_message, get_document, list_documents, update_document, update_message
+from document_catalog import annotate_document_versions
 from jobs import JobQueue
 from legacy_adapter import invoke_legacy
 from persistence import get_store
@@ -482,12 +483,14 @@ async def upload_documents(
 
 @app.get("/api/projects/{project_id}/documents")
 async def project_documents(project_id: str, _: Principal = Depends(current_principal)):
-    return {"items": await asyncio.to_thread(list_documents, project_id, None)}
+    items = await asyncio.to_thread(list_documents, project_id, None)
+    return {"items": annotate_document_versions(items)}
 
 
 @app.get("/api/documents")
 async def documents(project_id: str = "", chat_id: str = "", _: Principal = Depends(current_principal)):
-    return {"items": await asyncio.to_thread(list_documents, project_id.strip() or None, chat_id.strip() or None)}
+    items = await asyncio.to_thread(list_documents, project_id.strip() or None, chat_id.strip() or None)
+    return {"items": annotate_document_versions(items)}
 
 
 @app.get("/api/documents/{document_id}/content")

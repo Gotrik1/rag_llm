@@ -74,6 +74,32 @@ class FlowModeTests(unittest.TestCase):
         self.assertEqual(result["payload"]["answer"], "python answer")
         self.assertIn(("ask", "Что сказано?"), agent.calls)
 
+    def test_document_inventory_question_uses_registry_without_retrieval(self):
+        handler = object.__new__(web_ui.Handler)
+        captured = {}
+        handler.send_json = lambda payload, status=200: captured.update(payload=payload, status=status)
+        documents = [{
+            "id": "doc-1",
+            "file_name": "Регламент v2.0.docx",
+            "status": "ready",
+            "created_at": "2026-09-09T08:15:00Z",
+        }]
+        with patch.object(
+            web_ui,
+            "get_project_conversation",
+            return_value={"project_id": "project-1", "project_name": "ТЭС", "memory": {}, "messages": []},
+        ), patch.object(web_ui, "list_documents", return_value=documents) as list_documents, patch.object(
+            web_ui, "get_agent"
+        ) as get_agent:
+            handler.handle_ask({"question": "Какие регламенты у нас есть?", "chat_id": "chat-1"})
+
+        self.assertEqual(captured["status"], 200)
+        self.assertIn("Регламент v2.0.docx", captured["payload"]["answer"])
+        self.assertIn("09.09.2026 08:15 UTC", captured["payload"]["answer"])
+        self.assertEqual(captured["payload"]["flow_mode"], "workspace")
+        list_documents.assert_called_once_with("project-1", None)
+        get_agent.assert_not_called()
+
     def test_rust_mode_uses_rust_answer(self):
         result, agent = self.invoke("rust")
         self.assertEqual(result["payload"]["answer"], "rust answer")

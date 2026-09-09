@@ -857,10 +857,24 @@ textarea {
 }
 
 .memory-document-name {
+  display: block;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.memory-document-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.memory-document-meta {
+  color: #7f8b99;
+  font-size: 10px;
+  line-height: 1.35;
+  white-space: normal;
 }
 
 .memory-document-status {

@@ -135,6 +135,12 @@ type DocumentRecord = {
   processing_state?: { job_id?: string; progress?: number; error?: string };
   metadata?: { chunks?: number; size_bytes?: number };
   created_at?: string;
+  document_family?: string;
+  version_label?: string | null;
+  version_source?: "metadata" | "file_name" | null;
+  version_status?: "latest" | "superseded" | "unknown";
+  newer_document_id?: string | null;
+  newer_file_name?: string | null;
 };
 
 type ModelsResponse = {
@@ -1607,13 +1613,18 @@ function KnowledgeLoader({
             key={document.id}
             rel="noreferrer"
             target="_blank"
-            title={document.file_name}
+            title={`${document.file_name}. ${documentUploadedLabel(document.created_at)}. ${documentVersionLabel(document)}`}
           >
             <FileText size={13} />
-            <span className="memory-document-name">{document.file_name}</span>
+            <span className="memory-document-copy">
+              <span className="memory-document-name">{document.file_name}</span>
+              <span className="memory-document-meta">
+                {documentUploadedLabel(document.created_at)} · {documentVersionLabel(document)}
+              </span>
+            </span>
             <span className={`memory-document-status ${document.status}`}>
               {document.status === "ready"
-                ? `${document.metadata?.chunks ?? 0} чанков`
+                ? "Готов"
                 : document.status === "processing"
                   ? `${document.processing_state?.progress ?? 0}%`
                   : document.status}
@@ -2130,6 +2141,26 @@ export function normalizeSourceCitations(markdown: string, sources: ApiSource[] 
 
 export function sourceLocatorLabel(source: Pick<ApiSource, "locator" | "section">): string {
   return source.locator || (source.section ? `Раздел «${source.section}»` : "Документ целиком");
+}
+
+export function documentUploadedLabel(createdAt?: string): string {
+  if (!createdAt) return "Время загрузки неизвестно";
+  const date = new Date(createdAt);
+  if (Number.isNaN(date.getTime())) return "Время загрузки неизвестно";
+  return `Загружен ${new Intl.DateTimeFormat("ru-RU", {
+    dateStyle: "medium",
+    timeStyle: "short"
+  }).format(date)}`;
+}
+
+export function documentVersionLabel(
+  document: Pick<DocumentRecord, "version_label" | "version_status" | "newer_file_name">
+): string {
+  if (!document.version_label) return "Версия не указана";
+  if (document.version_status === "superseded") {
+    return `Есть новее: ${document.newer_file_name || "другая загруженная версия"}`;
+  }
+  return `Версия ${document.version_label} · последняя из загруженных`;
 }
 
 function DebugPanel({

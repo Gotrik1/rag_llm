@@ -16,8 +16,7 @@ describe("persisted generation state", () => {
       file: "manual.pdf",
       section: "Запуск",
       locator: "раздел «Запуск»",
-      url: "/api/documents/doc-1/content",
-      score: 0.9
+      url: "/api/documents/doc-1/content"
     }])).toBe("Факт. [Источник: manual.pdf — раздел «Запуск»](/api/documents/doc-1/content)");
   });
 

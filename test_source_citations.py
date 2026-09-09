@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from rag_agent import human_source_reference, source_locator, user_facing_source_name
-from web_ui import enrich_answer_source_citations, enrich_source_links
+from web_ui import enrich_answer_source_citations, enrich_source_links, select_user_facing_sources
 
 
 class SourceCitationTests(unittest.TestCase):
@@ -31,7 +31,7 @@ class SourceCitationTests(unittest.TestCase):
         self.assertEqual(sources[0]["file"], "Руководство оператора.docx")
         self.assertEqual(sources[0]["locator"], "раздел «Запуск»")
         self.assertEqual(sources[0]["url"], "/api/documents/doc-1/content")
-        self.assertEqual(sources[0]["score"], 0.9)
+        self.assertEqual(set(sources[0]), {"file", "section", "locator", "url"})
 
     def test_answer_citation_becomes_clickable_document_and_locator(self):
         answer = "Кнопка запускает расчёт. [Источник: Руководство оператора.docx — Запуск]"
@@ -48,6 +48,31 @@ class SourceCitationTests(unittest.TestCase):
             enriched,
         )
         self.assertNotIn("score=", enriched)
+
+    def test_formula_paragraph_uses_formula_locator_even_if_model_repeats_fact_locator(self):
+        answer = (
+            "Код NEBULA-742. [Источник: manual.pdf — Unique fact]\n\n"
+            "Формула: $$I = \\frac{U}{R}$$. [Источник: manual.pdf — Unique fact]"
+        )
+        sources = [
+            {"file": "manual.pdf", "section": "Unique fact", "locator": "раздел «Unique fact»", "url": "/api/documents/doc-1/content"},
+            {"file": "manual.pdf", "section": "Formula", "locator": "раздел «Formula»", "url": "/api/documents/doc-1/content"},
+        ]
+
+        enriched = enrich_answer_source_citations(answer, sources)
+
+        self.assertIn("Источник: manual.pdf — раздел «Unique fact»", enriched)
+        self.assertIn("Источник: manual.pdf — раздел «Formula»", enriched)
+
+    def test_user_sources_include_only_cited_linked_document_locators(self):
+        sources = [
+            {"file": "manual.pdf", "section": "Запуск", "locator": "раздел «Запуск»", "url": "/api/documents/doc-1/content"},
+            {"file": "manual.pdf", "section": "Удаление", "locator": "раздел «Удаление»", "url": "/api/documents/doc-1/content"},
+            {"file": "legacy.pdf", "section": "Шум", "locator": "раздел «Шум»"},
+        ]
+        answer = "Факт. [Источник: manual.pdf — раздел «Запуск»](/api/documents/doc-1/content)"
+
+        self.assertEqual(select_user_facing_sources(answer, sources), [sources[0]])
 
 
 if __name__ == "__main__":

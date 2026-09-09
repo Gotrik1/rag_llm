@@ -265,21 +265,26 @@ def enrich_source_links(sources: list[dict]) -> list[dict]:
         # Retrieval remains available during a temporary PostgreSQL incident.
         records = {}
     enriched_by_locator: dict[tuple[str, str], dict] = {}
+    best_scores: dict[tuple[str, str], float] = {}
     for source in sources:
-        item = dict(source)
         raw_file = str(source.get("file", ""))
         record = records.get(raw_file)
+        display_file = user_facing_source_name(raw_file)
+        item = {
+            "file": display_file,
+            "section": str(source.get("section") or ""),
+            "locator": source_locator(source.get("section", ""), source.get("page_number")),
+        }
         if record:
-            item["file"] = str(record.get("file_name") or user_facing_source_name(raw_file))
-            item["document_id"] = str(record["id"])
+            item["file"] = str(record.get("file_name") or display_file)
             item["url"] = f"/api/documents/{record['id']}/content"
-        else:
-            item["file"] = user_facing_source_name(raw_file)
-        item["locator"] = source_locator(item.get("section", ""), item.get("page_number"))
+        if source.get("page_number") is not None:
+            item["page_number"] = source["page_number"]
         key = (item["file"].casefold(), item["locator"].casefold())
-        previous = enriched_by_locator.get(key)
-        if previous is None or float(item.get("score", 0)) > float(previous.get("score", 0)):
+        score = float(source.get("score", 0))
+        if key not in enriched_by_locator or score > best_scores[key]:
             enriched_by_locator[key] = item
+            best_scores[key] = score
     return list(enriched_by_locator.values())
 
 
@@ -299,6 +304,16 @@ def enrich_answer_source_citations(answer: str, sources: list[dict]) -> str:
             (item for item in candidates if requested_section and requested_section.casefold() in str(item.get("section", "")).casefold()),
             candidates[0] if candidates else None,
         )
+        preceding_text = answer[max(0, match.start() - 800):match.start()]
+        if re.search(r"\\frac|\\cdot|\bформул|\bрасч[её]т", preceding_text, re.IGNORECASE):
+            formula_source = next(
+                (
+                    item for item in candidates
+                    if re.search(r"формул|formula|расч[её]т", str(item.get("section", "")), re.IGNORECASE)
+                ),
+                None,
+            )
+            source = formula_source or source
         if source is None:
             locator = source_locator(requested_section)
             return f"[Источник: {name} — {locator}]"
@@ -307,6 +322,18 @@ def enrich_answer_source_citations(answer: str, sources: list[dict]) -> str:
         return f"[{label}]({url})" if url else f"[{label}]"
 
     return pattern.sub(replace, answer)
+
+
+def select_user_facing_sources(answer: str, sources: list[dict]) -> list[dict]:
+    """Expose cited document locators, never raw retrieval candidates."""
+    linked = [source for source in sources if str(source.get("url") or "").strip()]
+    cited = [
+        source
+        for source in linked
+        if f"]({source['url']})" in answer
+        and str(source.get("locator") or "") in answer
+    ]
+    return cited or linked
 
 
 def excluded_document_sources(scope: dict, chat_id: str) -> set[str]:
@@ -1239,6 +1266,7 @@ class Handler(BaseHTTPRequestHandler):
             sources = [{"file": item["file"], "section": item.get("section_path", ""), "score": item["score"], "text_preview": item["text"][:120]} for item in context]
         sources = enrich_source_links(sources)
         answer = enrich_answer_source_citations(answer, sources)
+        sources = select_user_facing_sources(answer, sources)
         formulas = extract_formula_lines(context, question)
         warnings = validate_retrieval(question, context, answer)
         self.send_json({
@@ -1246,10 +1274,7 @@ class Handler(BaseHTTPRequestHandler):
             "html_answer": render_text(answer),
             "formulas": [{"text": f, "html": render_text(format_formula_for_display(f))} for f in formulas],
             "warnings": warnings,
-            "sources": [
-                {**s, "html_preview": render_text(str(s.get("text_preview", "")))}
-                for s in sources
-            ],
+            "sources": sources,
             "context": [
                 {**c, "html_text": render_text(c["text"])}
                 for c in context

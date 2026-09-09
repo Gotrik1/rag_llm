@@ -68,9 +68,7 @@ type ApiSource = {
   url?: string;
   section?: string;
   locator?: string;
-  score: number;
-  text_preview?: string;
-  html_preview?: string;
+  page_number?: number;
 };
 
 type ApiFormula = {

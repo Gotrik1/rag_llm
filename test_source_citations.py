@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from rag_agent import human_source_reference, source_locator, user_facing_source_name
-from web_ui import enrich_answer_source_citations, enrich_source_links, select_user_facing_sources
+from web_ui import enrich_answer_source_citations, enrich_source_links, requested_response_formulas, select_user_facing_sources
 
 
 class SourceCitationTests(unittest.TestCase):
@@ -63,6 +63,30 @@ class SourceCitationTests(unittest.TestCase):
 
         self.assertIn("Источник: manual.pdf — раздел «Unique fact»", enriched)
         self.assertIn("Источник: manual.pdf — раздел «Formula»", enriched)
+
+    def test_repeated_identical_source_lines_are_collapsed(self):
+        answer = (
+            "Факт.\n"
+            "[Источник: manual.pdf — Запуск]\n"
+            "[Источник: manual.pdf — Запуск]"
+        )
+        source = {
+            "file": "manual.pdf", "section": "Запуск", "locator": "раздел «Запуск»",
+            "url": "/api/documents/doc-1/content",
+        }
+
+        enriched = enrich_answer_source_citations(answer, [source])
+
+        self.assertEqual(enriched.count("Источник: manual.pdf"), 1)
+
+    def test_non_formula_question_has_no_formula_payload(self):
+        chunks = [{"text": "Константы используются в формулах через функцию Const."}]
+
+        self.assertEqual(requested_response_formulas(chunks, "Какие регламенты применяются?"), [])
+        self.assertEqual(
+            requested_response_formulas([{"text": "$$I = U / R$$"}], "Покажи формулу тока"),
+            ["I = U / R"],
+        )
 
     def test_user_sources_include_only_cited_linked_document_locators(self):
         sources = [

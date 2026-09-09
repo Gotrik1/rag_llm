@@ -2,6 +2,7 @@ import unittest
 from pathlib import Path
 
 from rag_agent import (
+    RAGAgent,
     build_section_documents,
     extract_formula_lines_from_texts,
     formula_sibling_results,
@@ -17,6 +18,30 @@ from rag_agent import (
 
 
 class PrismQueryTests(unittest.TestCase):
+    def test_lexical_section_seed_finds_long_normative_heading(self):
+        class Node:
+            def __init__(self, text, metadata):
+                self.text = text
+                self.metadata = metadata
+
+        agent = object.__new__(RAGAgent)
+        target = "Порядок признания Коммерческим оператором процедуры конкурентного отбора несостоявшейся и порядок определения планового почасового производства и потребления в этом случае"
+        agent._all_nodes = [
+            Node("Сведения общего характера.", {"file_name": "noise.docx", "section_path": "Общие положения"}),
+            Node(
+                "При наступлении событий из п. 3.2 КО объявляет процедуру несостоявшейся.",
+                {"file_name": "r7.docx", "section_path": target, "section_title": target},
+            ),
+        ]
+
+        seeds = agent._lexical_section_seed_results(
+            "В каких случаях процедура конкурентного отбора признаётся несостоявшейся и как определяется плановое почасовое производство и потребление?"
+        )
+
+        self.assertTrue(seeds)
+        self.assertEqual(seeds[0]["file"], "r7.docx")
+        self.assertIn("section-lexical", seeds[0]["matched_queries"][0])
+
     def test_formula_heading_is_linked_to_the_governing_clause(self):
         markdown = """#### 4.4.2.6. Ставка по собственной инициативе в сторону увеличения определяется как минимальная величина:\n\n#### = MIN(Ц_i,q^-, Т_i,q).\n"""
 

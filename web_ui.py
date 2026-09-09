@@ -47,7 +47,7 @@ from db_store import (
 )
 from document_catalog import build_document_catalog_answer, is_document_catalog_question
 from llm_providers import DEFAULTS, ProviderLLM
-from rag_agent import CACHE_VERSION, DATA_DIR, GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, format_formula_for_display, refine_prism_query, source_locator, user_facing_source_name, validate_retrieval
+from rag_agent import CACHE_VERSION, DATA_DIR, GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, format_formula_for_display, is_formula_question, refine_prism_query, source_locator, user_facing_source_name, validate_retrieval
 from runtime_paths import MATHML_CACHE_DIR, STATE_DIR, UPLOAD_DIR
 from system_prompts import get_profile, profiles
 from opentelemetry.trace import Status, StatusCode
@@ -322,7 +322,17 @@ def enrich_answer_source_citations(answer: str, sources: list[dict]) -> str:
         url = str(source.get("url") or "").strip()
         return f"[{label}]({url})" if url else f"[{label}]"
 
-    return pattern.sub(replace, answer)
+    enriched = pattern.sub(replace, answer)
+    seen_citations: set[str] = set()
+    deduplicated_lines: list[str] = []
+    for line in enriched.splitlines():
+        normalized = line.strip()
+        if normalized.startswith("[Источник:") and normalized in seen_citations:
+            continue
+        if normalized.startswith("[Источник:"):
+            seen_citations.add(normalized)
+        deduplicated_lines.append(line)
+    return "\n".join(deduplicated_lines)
 
 
 def select_user_facing_sources(answer: str, sources: list[dict]) -> list[dict]:
@@ -662,6 +672,11 @@ def cleanup_llm_markup(value: str) -> str:
 
 def extract_formula_lines(chunks: list[dict], question: str = "") -> list[str]:
     return extract_formula_lines_from_texts([chunk.get("text", "") for chunk in chunks], question)
+
+
+def requested_response_formulas(chunks: list[dict], question: str) -> list[str]:
+    """Keep the formulas payload empty unless the user actually requested a calculation."""
+    return extract_formula_lines(chunks, question) if is_formula_question(question) else []
 
 
 def estimate_tokens(value: str) -> int:
@@ -1296,7 +1311,7 @@ class Handler(BaseHTTPRequestHandler):
         sources = enrich_source_links(sources)
         answer = enrich_answer_source_citations(answer, sources)
         sources = select_user_facing_sources(answer, sources)
-        formulas = extract_formula_lines(context, question)
+        formulas = requested_response_formulas(context, question)
         warnings = validate_retrieval(question, context, answer)
         self.send_json({
             "answer": answer,
@@ -1325,7 +1340,7 @@ class Handler(BaseHTTPRequestHandler):
             python_items = get_agent().retrieve_context(question, TOP_K)
             rust_items = filter_rust_context(question, rust_context(question)) if mode != "python" else []
             context = python_items if mode == "python" else fuse_contexts(python_items, rust_items, TOP_K)
-        formulas = extract_formula_lines(context, question)
+        formulas = requested_response_formulas(context, question)
         warnings = validate_retrieval(question, context)
         self.send_json({
             "formulas": [{"text": f, "html": render_text(format_formula_for_display(f))} for f in formulas],

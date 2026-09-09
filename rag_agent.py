@@ -430,6 +430,26 @@ def section_query_terms(question: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(terms))
 
 
+def lexical_term_keys(value: str) -> tuple[str, ...]:
+    """Normalize inflected Russian/English words for conservative heading matching."""
+    words = re.findall(r"[а-яёa-z0-9-]{4,}", value.lower().replace("ё", "е"))
+    return tuple(word if len(word) <= 4 else word[:4] for word in words)
+
+
+def longest_common_token_run(left: tuple[str, ...], right: tuple[str, ...]) -> int:
+    """Return the longest contiguous token-key run shared by two sequences."""
+    previous = [0] * (len(right) + 1)
+    best = 0
+    for left_token in left:
+        current = [0] * (len(right) + 1)
+        for index, right_token in enumerate(right, start=1):
+            if left_token == right_token:
+                current[index] = previous[index - 1] + 1
+                best = max(best, current[index])
+        previous = current
+    return best
+
+
 def build_targeted_queries(question: str) -> list[str]:
     """Build deterministic retrieval probes for each requested abbreviation."""
     intent = detect_query_intent(question)
@@ -1826,6 +1846,7 @@ class RAGAgent:
         prompt = f"""{system_prompt or GROUNDED_SYSTEM_PROMPT}
 
 Ниже приведены данные для ответа. Используй их как единственный фактический контекст: не выдумывай сведения, которых в нём нет. Всегда отвечай на русском языке.
+После каждого самостоятельного факта или группы пунктов ставь ровно одну цитату из соответствующего блока контекста в формате [Источник: имя файла — точный раздел или пункт]. Не заменяй точный раздел названием документа и не повторяй одну и ту же цитату подряд.
 
 КОНТЕКСТ:
 {context_text}
@@ -1866,6 +1887,57 @@ class RAGAgent:
             preview = item["text"][:700].replace("\n", " ")
             print(f"\n{i}. {item['file']}  score={item['score']:.4f}")
             print(f"   {preview}")
+
+    def _lexical_section_seed_results(self, question: str, limit: int = 12) -> list[dict]:
+        """Seed headings whose wording overlaps the question before vector ranking."""
+        query_terms = section_query_terms(question)
+        query_keys = lexical_term_keys(" ".join(query_terms))
+        if len(query_keys) < 3:
+            return []
+
+        query_key_set = set(query_keys)
+        ranked: list[tuple[float, dict]] = []
+        for node in self._all_nodes:
+            meta = node.metadata or {}
+            text = node.text or ""
+            section_path = str(meta.get("section_path", ""))
+            section_title = str(meta.get("section_title", ""))
+            section_text = f"{section_path} {section_title}".strip()
+            if not section_text:
+                continue
+
+            section_keys = lexical_term_keys(section_text)
+            section_key_set = set(section_keys)
+            matched = query_key_set & section_key_set
+            common_run = longest_common_token_run(query_keys, section_keys)
+            minimum_matches = max(3, min(6, round(len(query_key_set) * 0.35)))
+            if common_run < 3 and len(matched) < minimum_matches:
+                continue
+
+            coverage = len(matched) / len(query_key_set)
+            density = len(matched) / max(1, len(section_key_set))
+            body_matches = query_key_set & set(lexical_term_keys(text[:2200]))
+            body_coverage = len(body_matches) / len(query_key_set)
+            score = 2.0 + common_run * 0.4 + coverage * 3.0 + density + body_coverage * 2.0
+            if len(section_text) > 900:
+                score -= 1.5
+            chunk_meta = {
+                **extract_chunk_metadata(text),
+                **{key: value for key, value in meta.items() if key in {
+                    "section_path", "section_title", "parent_section", "status", "chunk_type",
+                } and value},
+            }
+            if chunk_meta.get("status") == "deleted":
+                continue
+            ranked.append((score, {
+                "file": meta.get("file_name", meta.get("file_path", "?")),
+                "score": round(score, 4),
+                "text": text,
+                "matched_queries": [f"section-lexical:{common_run}"],
+                **chunk_meta,
+            }))
+
+        return [item for _, item in sorted(ranked, key=lambda pair: pair[0], reverse=True)[:limit]]
 
     def _procedural_seed_results(self, question: str) -> list[dict]:
         """Seed the exact workflow sections for short parameter-creation queries."""
@@ -2195,6 +2267,9 @@ class RAGAgent:
             key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
             merged[key] = item
         for item in self._exact_section_seed_results(question):
+            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
+            merged[key] = item
+        for item in self._lexical_section_seed_results(question):
             key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
             merged[key] = item
         for item in self._section_seed_results(question):

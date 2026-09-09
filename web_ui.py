@@ -46,7 +46,7 @@ from db_store import (
     update_workspace,
 )
 from llm_providers import DEFAULTS, ProviderLLM
-from rag_agent import CACHE_VERSION, DATA_DIR, GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, format_formula_for_display, refine_prism_query, validate_retrieval
+from rag_agent import CACHE_VERSION, DATA_DIR, GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, format_formula_for_display, refine_prism_query, source_locator, user_facing_source_name, validate_retrieval
 from runtime_paths import MATHML_CACHE_DIR, STATE_DIR, UPLOAD_DIR
 from system_prompts import get_profile, profiles
 from opentelemetry.trace import Status, StatusCode
@@ -258,22 +258,55 @@ def contextualize_retrieval_question(question: str, scope: dict, chat_id: str) -
 
 
 def enrich_source_links(sources: list[dict]) -> list[dict]:
-    """Attach stable download URLs and restore user-facing upload names."""
+    """Return unique document citations with stable links and human locators."""
     try:
         records = document_sources([str(source.get("file", "")) for source in sources])
     except Exception:
         # Retrieval remains available during a temporary PostgreSQL incident.
-        return sources
-    enriched: list[dict] = []
+        records = {}
+    enriched_by_locator: dict[tuple[str, str], dict] = {}
     for source in sources:
         item = dict(source)
-        record = records.get(str(source.get("file", "")))
+        raw_file = str(source.get("file", ""))
+        record = records.get(raw_file)
         if record:
-            item["file"] = str(record.get("file_name") or item.get("file", ""))
+            item["file"] = str(record.get("file_name") or user_facing_source_name(raw_file))
             item["document_id"] = str(record["id"])
             item["url"] = f"/api/documents/{record['id']}/content"
-        enriched.append(item)
-    return enriched
+        else:
+            item["file"] = user_facing_source_name(raw_file)
+        item["locator"] = source_locator(item.get("section", ""), item.get("page_number"))
+        key = (item["file"].casefold(), item["locator"].casefold())
+        previous = enriched_by_locator.get(key)
+        if previous is None or float(item.get("score", 0)) > float(previous.get("score", 0)):
+            enriched_by_locator[key] = item
+    return list(enriched_by_locator.values())
+
+
+def enrich_answer_source_citations(answer: str, sources: list[dict]) -> str:
+    """Replace model citation markers with document links and human locators."""
+    by_name: dict[str, list[dict]] = {}
+    for source in sources:
+        by_name.setdefault(user_facing_source_name(source.get("file", "")).casefold(), []).append(source)
+
+    pattern = re.compile(r"\[Источник:\s*([^\];]+?)(?:\s*(?:—|;)\s*(?:раздел:\s*)?([^\]]+?))?\]", re.IGNORECASE)
+
+    def replace(match: re.Match[str]) -> str:
+        name = user_facing_source_name(match.group(1).strip())
+        candidates = by_name.get(name.casefold(), [])
+        requested_section = (match.group(2) or "").strip().strip(". ")
+        source = next(
+            (item for item in candidates if requested_section and requested_section.casefold() in str(item.get("section", "")).casefold()),
+            candidates[0] if candidates else None,
+        )
+        if source is None:
+            locator = source_locator(requested_section)
+            return f"[Источник: {name} — {locator}]"
+        label = f"Источник: {source['file']} — {source.get('locator') or source_locator(source.get('section', ''))}"
+        url = str(source.get("url") or "").strip()
+        return f"[{label}]({url})" if url else f"[{label}]"
+
+    return pattern.sub(replace, answer)
 
 
 def excluded_document_sources(scope: dict, chat_id: str) -> set[str]:
@@ -1205,6 +1238,7 @@ class Handler(BaseHTTPRequestHandler):
             from_cache = bool(getattr(agent, "last_generation_from_cache", False))
             sources = [{"file": item["file"], "section": item.get("section_path", ""), "score": item["score"], "text_preview": item["text"][:120]} for item in context]
         sources = enrich_source_links(sources)
+        answer = enrich_answer_source_citations(answer, sources)
         formulas = extract_formula_lines(context, question)
         warnings = validate_retrieval(question, context, answer)
         self.send_json({

@@ -135,7 +135,7 @@ class PrismQueryTests(unittest.TestCase):
 
         self.assertIn("ИВ0 = объём электроэнергии по УДГ − объём электроэнергии по плановому ДГ", answer)
         self.assertIn(rule, answer)
-        self.assertIn("Источник:** Внешняя инициатива ИВ0", answer)
+        self.assertIn("[Источник: документ — раздел «Внешняя инициатива ИВ0»]", answer)
 
     def test_validator_reports_missing_requested_section(self):
         spec = refine_prism_query("дай формулы из пункта 2.1.4")

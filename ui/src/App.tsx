@@ -59,6 +59,7 @@ type ChatEntry = {
   text: string;
   html?: string;
   modelLabel?: string;
+  sources?: ApiSource[];
   status?: "running" | "complete" | "error";
 };
 
@@ -66,6 +67,7 @@ type ApiSource = {
   file: string;
   url?: string;
   section?: string;
+  locator?: string;
   score: number;
   text_preview?: string;
   html_preview?: string;
@@ -263,12 +265,14 @@ function chatFromRecord(record: ChatRecord): ChatSummary {
 }
 
 function messageFromRecord(record: MessageRecord): ChatEntry {
+  const sources = Array.isArray(record.metadata?.sources) ? record.metadata.sources as ApiSource[] : [];
   return {
     id: record.id,
     role: record.role,
     text: record.content,
     html: record.content_html || undefined,
     modelLabel: typeof record.metadata?.model_label === "string" ? record.metadata.model_label : undefined,
+    sources,
     status: record.role === "assistant"
       ? record.status === "running" ? "running" : record.status === "error" ? "error" : "complete"
       : "complete"
@@ -352,7 +356,8 @@ const toThreadMessage = (message: ChatEntry): ThreadMessageLike => ({
   metadata: {
     custom: {
       html: message.html,
-      modelLabel: message.modelLabel
+      modelLabel: message.modelLabel,
+      sources: message.sources
     }
   }
 });
@@ -1652,6 +1657,7 @@ function Thread() {
 function Message() {
   const role = useMessage((state) => state.role);
   const modelLabel = useMessage((state) => state.metadata.custom.modelLabel);
+  const sources = useMessage((state) => state.metadata.custom.sources as ApiSource[] | undefined);
   const text = useMessage((state) => state.content.map((part) => part.type === "text" ? part.text : "").join(""));
   const isAssistant = role === "assistant";
   const [copied, setCopied] = useState(false);
@@ -1669,7 +1675,7 @@ function Message() {
           <div className="model-badge">Ответил: {modelLabel}</div>
         ) : null}
         {isAssistant ? (
-          <MarkdownAnswer markdown={text} />
+          <MarkdownAnswer markdown={text} sources={sources} />
         ) : (
           <MessagePrimitive.Content />
         )}
@@ -1684,7 +1690,7 @@ function Message() {
   );
 }
 
-function MarkdownAnswer({ markdown }: { markdown: string }) {
+function MarkdownAnswer({ markdown, sources = [] }: { markdown: string; sources?: ApiSource[] }) {
   return (
     <ReactMarkdown
       className="answer-markdown"
@@ -1692,7 +1698,7 @@ function MarkdownAnswer({ markdown }: { markdown: string }) {
       rehypePlugins={[rehypeRaw, rehypeSanitize, rehypeKatex]}
       components={{ table: ({ children }) => <MarkdownTable>{children}</MarkdownTable> }}
     >
-      {normalizeMarkdown(markdown)}
+      {normalizeMarkdown(normalizeSourceCitations(markdown, sources))}
     </ReactMarkdown>
   );
 }
@@ -2083,14 +2089,8 @@ function SourcesPanel({ result }: { result: AskResponse }) {
               )}
             </div>
             <div className="source-meta">
-              {source.section ? <span>{source.section}</span> : null}
-              <span>score={source.score}</span>
+              <span>{sourceLocatorLabel(source)}</span>
             </div>
-            <HtmlCard
-              className="source-preview"
-              fallback={source.text_preview}
-              html={source.html_preview}
-            />
           </div>
         ))
       ) : (
@@ -2098,6 +2098,40 @@ function SourcesPanel({ result }: { result: AskResponse }) {
       )}
     </PanelSection>
   );
+}
+
+function uploadedDocumentName(value: string): string {
+  let name = value.replace(/^.*[\\/]/, "");
+  while (/^[0-9a-f]{32}_/i.test(name)) name = name.slice(33);
+  return name || "документ";
+}
+
+export function normalizeSourceCitations(markdown: string, sources: ApiSource[] = []): string {
+  const byName = new Map<string, ApiSource[]>();
+  sources.forEach((source) => {
+    const key = uploadedDocumentName(source.file).toLocaleLowerCase("ru-RU");
+    byName.set(key, [...(byName.get(key) || []), source]);
+  });
+
+  return markdown.replace(
+    /\[Источник:\s*([^\];]+?)(?:\s*(?:—|;)\s*(?:раздел:\s*)?([^\]]+?))?\](?!\()/gi,
+    (_match, rawFile: string, rawSection?: string) => {
+      const name = uploadedDocumentName(rawFile.trim());
+      const requestedSection = (rawSection || "").trim().replace(/[. ]+$/, "");
+      const candidates = byName.get(name.toLocaleLowerCase("ru-RU")) || [];
+      const source = candidates.find((item) => (
+        requestedSection && (item.section || "").toLocaleLowerCase("ru-RU").includes(requestedSection.toLocaleLowerCase("ru-RU"))
+      )) || candidates[0];
+      const displayName = source?.file || name;
+      const locator = sourceLocatorLabel(source || { section: requestedSection || undefined });
+      const label = `Источник: ${displayName} — ${locator}`;
+      return source?.url ? `[${label}](${source.url})` : `[${label}]`;
+    }
+  );
+}
+
+export function sourceLocatorLabel(source: Pick<ApiSource, "locator" | "section">): string {
+  return source.locator || (source.section ? `Раздел «${source.section}»` : "Документ целиком");
 }
 
 function DebugPanel({

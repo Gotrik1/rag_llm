@@ -191,7 +191,7 @@ GROUNDED_SYSTEM_PROMPT = """\
 9. Не показывай внутренние сообщения RAG, сведения о нехватке контекста, retrieval, reranking или технических блоках. Если дополнительная информация не найдена, просто не добавляй её.
 10. Игнорируй нерелевантные фрагменты контекста, даже если они фактически верны. Перед ответом проверь: речь идёт об одной сущности, сценарий завершён, нет сведений из соседних разделов и пустых искусственных секций.
 11. Форматируй ответ строго в CommonMark Markdown. Абзацы разделяй одной пустой строкой. Для перечислений используй `- пункт` или `1. пункт`; заголовки `##` и `###` — только для длинных ответов. Таблицы GFM используй только для сравнения однотипных сущностей с короткими значениями; если ячейка требует несколько пунктов, вместо таблицы используй подзаголовок и маркированный список. Не используй HTML и не оставляй незакрытые Markdown-маркеры.
-12. После фактического утверждения указывай краткую текстовую ссылку вида `[Источник: имя файла — раздел]`. Используй только имя и раздел из КОНТЕКСТА; не придумывай URL или номер страницы. Кликабельные ссылки приложение добавит отдельно.
+12. После фактического утверждения указывай краткую текстовую ссылку вида `[Источник: имя документа — раздел «название»]`. Источник — это документ и понятный ориентир внутри него, а не чанк, UUID, score или другой технический идентификатор. Используй только имя документа и ориентир из КОНТЕКСТА; не придумывай URL или номер страницы. Кликабельные ссылки приложение добавит отдельно.
 """
 
 
@@ -791,6 +791,35 @@ def _compact_section_reference(section_path: str) -> str:
     return section_path or "раздел не определен"
 
 
+def user_facing_source_name(value: object) -> str:
+    """Return the uploaded basename without collision-safe storage prefixes."""
+    name = Path(str(value or "")).name
+    while re.match(r"^[0-9a-fA-F]{32}_", name):
+        name = name[33:]
+    return name or "документ"
+
+
+def source_locator(section_path: object, page_number: object = None) -> str:
+    """Build a stable, human-readable locator without exposing chunk metadata."""
+    parts: list[str] = []
+    if page_number not in (None, ""):
+        parts.append(f"стр. {page_number}")
+    section = _compact_section_reference(str(section_path or "")).strip()
+    if section and section != "раздел не определен":
+        if re.match(r"^(?:п\.?|пункт|раздел|глава|приложение)\s", section, re.IGNORECASE):
+            parts.append(section)
+        else:
+            parts.append(f"раздел «{section}»")
+    return ", ".join(parts) or "документ целиком"
+
+
+def human_source_reference(item: dict) -> str:
+    return (
+        f"{user_facing_source_name(item.get('file', ''))} — "
+        f"{source_locator(item.get('section_path', item.get('section', '')), item.get('page_number'))}"
+    )
+
+
 def generate_extractive_value_answer(question: str, context: list[dict]) -> str | None:
     """Build a deterministic answer for indicator/value calculation questions."""
     if detect_query_intent(question) != "value":
@@ -840,11 +869,11 @@ def generate_extractive_value_answer(question: str, context: list[dict]) -> str 
             if len(snippets) >= 2:
                 break
 
-        section = _compact_section_reference(term_items[0].get("section_path", ""))
+        source = human_source_reference(term_items[0])
         if snippets:
-            lines.append(f"- {term}: {_short_explanation(term, ' '.join(snippets), 520)} Источник: {section}.")
+            lines.append(f"- {term}: {_short_explanation(term, ' '.join(snippets), 520)} [Источник: {source}].")
         else:
-            lines.append(f"- {term}: расчетная фраза не выделена из evidence. Источник: {section}.")
+            lines.append(f"- {term}: расчетная фраза не выделена из evidence. [Источник: {source}].")
 
     lines.extend([
         "",
@@ -1221,9 +1250,9 @@ def generate_formula_only_answer(question: str, context: list[dict], calculation
         # section query.  It remains deterministic evidence, even when the
         # in-memory context fixture has no metadata (for example CLI/tests).
         if calculations:
-            target = f" п. {', '.join(spec.target_sections)}" if spec.target_sections else " извлечённого контекста"
+            target = f"п. {', '.join(spec.target_sections)}" if spec.target_sections else "извлечённый контекст"
             return clean_formula_artifacts(
-                f"**Источник:**{target}.\n\n" + "\n".join(f"- {item}" for item in calculations[:1])
+                f"**Ориентир в источнике:** {target}.\n\n" + "\n".join(f"- {item}" for item in calculations[:1])
             )
         return "Недостаточно подтверждённых данных: для формулы не найден конкретный пункт Регламента."
 
@@ -1231,9 +1260,7 @@ def generate_formula_only_answer(question: str, context: list[dict], calculation
     if not confirmed_calculations:
         return "Недостаточно подтверждённых данных: в найденном пункте нет извлечённой формулы или расчётного правила."
 
-    section = str(confirmed.get("section_path", "")).strip()
-    section_number = re.match(r"(\d+(?:\.\d+)*)", section)
-    source = f"п. {section_number.group(1)}" if section_number else (section or "подтверждённый пункт Регламента")
+    source = human_source_reference(confirmed)
     rendered = [
         format_formula_for_katex(item) if "=" in item else clean_formula_artifacts(item)
         for item in confirmed_calculations[:1]
@@ -1250,7 +1277,7 @@ def generate_formula_only_answer(question: str, context: list[dict], calculation
             "**ИВ0 = объём электроэнергии по УДГ − объём электроэнергии по плановому ДГ.**",
         )
     return clean_formula_artifacts(
-        f"**Источник:** {source}.\n\n" + "\n\n".join(rendered)
+        f"[Источник: {source}]\n\n" + "\n\n".join(rendered)
     )
 
 
@@ -1782,7 +1809,7 @@ class RAGAgent:
             return extractive
 
         context_text = "\n\n---\n\n".join(
-            f"[Источник: {item['file']}; раздел: {item.get('section_path', '')}; score={item['score']}]\n{item['text']}"
+            f"[Источник: {human_source_reference(item)}]\n{item['text']}"
             for item in context
         )
         normalized_question = question.lower()

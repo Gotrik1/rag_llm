@@ -811,10 +811,25 @@ def _short_explanation(term: str, snippet: str, max_chars: int = 240) -> str:
 
 
 def _compact_section_reference(section_path: str) -> str:
-    parts = [part.strip() for part in (section_path or "").split(">") if part.strip()]
+    parts = [
+        re.sub(r"\s+", " ", part).strip(" ,")
+        for part in (section_path or "").split(">")
+        if part.strip()
+    ]
+    # Word style inheritance can leak a preceding table/formula cell into the
+    # hierarchy (for example "110 МВт∙ч").  Such a value is not a locator.
+    parts = [
+        part for part in parts
+        if not re.match(r"^[\d.,]+\s*(?:[кмгт]?вт|руб|%)\b", part, re.IGNORECASE)
+    ]
+    # Metadata is deliberately capped during ingestion.  If the deepest
+    # component was truncated, the preceding complete section title is a much
+    # better user-facing orientation than an ellipsis-heavy pseudo-heading.
+    if len(parts) >= 2 and (parts[-1].endswith("...") or len(parts[-1]) > 220):
+        parts.pop()
     if len(parts) >= 2:
         return " > ".join(parts[-2:])
-    return section_path or "раздел не определен"
+    return parts[0] if parts else "раздел не определен"
 
 
 def user_facing_source_name(value: object) -> str:
@@ -846,7 +861,11 @@ def human_source_reference(item: dict) -> str:
     )
 
 
-def generate_extractive_value_answer(question: str, context: list[dict]) -> str | None:
+def generate_extractive_value_answer(
+    question: str,
+    context: list[dict],
+    calculations: list[str] | None = None,
+) -> str | None:
     """Build a deterministic answer for indicator/value calculation questions."""
     if detect_query_intent(question) != "value":
         return None
@@ -871,6 +890,13 @@ def generate_extractive_value_answer(question: str, context: list[dict]) -> str 
                 str(item.get("section_title", "")),
             ]), term)
         ]
+        # A user-uploaded document is the canonical public source.  Derived
+        # Markdown corpora remain useful retrieval aids, but must not replace
+        # the document the user can actually open from the project inventory.
+        term_items.sort(key=lambda item: (
+            not user_facing_source_name(item.get("file", "")).casefold().endswith(".docx"),
+            -float(item.get("score") or 0.0),
+        ))
         if not term_items:
             lines.append(f"- {term}: базовый активный раздел не найден в evidence.")
             continue
@@ -900,6 +926,21 @@ def generate_extractive_value_answer(question: str, context: list[dict]) -> str 
             lines.append(f"- {term}: {_short_explanation(term, ' '.join(snippets), 520)} [Источник: {source}].")
         else:
             lines.append(f"- {term}: расчетная фраза не выделена из evidence. [Источник: {source}].")
+
+        rule_text = "\n".join(str(item.get("text", "")) for item in term_items)
+        derived_formula = derive_worded_formula(question, rule_text)
+        if derived_formula:
+            lines.extend([
+                "",
+                "**Формула:**",
+                "",
+                f"$${derived_formula}$$",
+                "",
+                "**Обозначения:**",
+                "- $V_{\\mathrm{УДГ}}$ — объём электроэнергии для соответствующих ГТП и часа, определённый согласно УДГ.",
+                "- $V_{\\mathrm{план.\\,ДГ}}$ — объём электроэнергии в плановом ДГ для ГОУ, соответствующего ГТП.",
+                f"[Источник: {source}].",
+            ])
 
     lines.extend([
         "",
@@ -1063,6 +1104,23 @@ def build_section_documents(text: str, source_path: Path, backend: str) -> list[
     return documents
 
 
+def derive_worded_formula(question: str, text: str) -> str | None:
+    """Turn one unambiguous regulation wording into a renderable equality."""
+    normalized_question = question.casefold().replace("ё", "е")
+    normalized_text = text.casefold().replace("ё", "е")
+    is_ivo_request = bool(re.search(r"(?<![а-яa-z0-9])ив\s*0(?![а-яa-z0-9])", normalized_question))
+    has_difference_rule = bool(re.search(r"равн\w*\s+разност", normalized_text))
+    if (
+        is_formula_question(question)
+        and is_ivo_request
+        and has_difference_rule
+        and "согласно удг" in normalized_text
+        and "плановом дг" in normalized_text
+    ):
+        return r"\mathrm{ИВ0} = V_{\mathrm{УДГ}} - V_{\mathrm{план.\,ДГ}}"
+    return None
+
+
 def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> list[str]:
     """Extract allowed calculation evidence: symbolic formulas and textual calculation rules."""
     calculations: list[str] = []
@@ -1098,6 +1156,10 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
         searchable = cleaned.lower().replace("ё", "е")
 
         if formula_request:
+            derived_formula = derive_worded_formula(question, cleaned)
+            if derived_formula:
+                add(derived_formula, requested_term_already_matched=True)
+                return calculations[:1]
             # Keep ordinary Markdown/LaTeX equations as first-class evidence.
             # This covers uploaded technical notes without requiring the
             # regulation-specific [FORMULA] marker used by converted DOCX files.
@@ -1291,17 +1353,6 @@ def generate_formula_only_answer(question: str, context: list[dict], calculation
         format_formula_for_katex(item) if "=" in item else clean_formula_artifacts(item)
         for item in confirmed_calculations[:1]
     ]
-    requested = requested_formula_terms(question)
-    rule = " ".join(confirmed_calculations).lower().replace("ё", "е")
-    if "ИВ0" in requested and all(marker in rule for marker in (
-        "равна разности",
-        "согласно удг",
-        "в плановом дг",
-    )):
-        rendered.insert(
-            0,
-            "**ИВ0 = объём электроэнергии по УДГ − объём электроэнергии по плановому ДГ.**",
-        )
     return clean_formula_artifacts(
         f"[Источник: {source}]\n\n" + "\n\n".join(rendered)
     )
@@ -1830,7 +1881,7 @@ class RAGAgent:
         spec = spec or refine_prism_query(question)
         if spec.answer_mode == "formulas_only":
             return generate_formula_only_answer(evidence_question or question, context, calculations, spec)
-        extractive = generate_extractive_value_answer(question, context)
+        extractive = generate_extractive_value_answer(question, context, calculations)
         if extractive:
             return extractive
 

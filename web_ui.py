@@ -323,9 +323,21 @@ def enrich_answer_source_citations(answer: str, sources: list[dict]) -> str:
         return f"[{label}]({url})" if url else f"[{label}]"
 
     enriched = pattern.sub(replace, answer)
+    citation_pattern = re.compile(r"\[Источник:[^\]\n]+\](?:\([^)\n]+\))?", re.IGNORECASE)
+    seen_inline: set[str] = set()
+
+    def keep_first_citation(match: re.Match[str]) -> str:
+        key = match.group(0).casefold()
+        if key in seen_inline:
+            return ""
+        seen_inline.add(key)
+        return match.group(0)
+
+    enriched = citation_pattern.sub(keep_first_citation, enriched)
     seen_citations: set[str] = set()
     deduplicated_lines: list[str] = []
     for line in enriched.splitlines():
+        line = line.rstrip()
         normalized = line.strip()
         if normalized.startswith("[Источник:") and normalized in seen_citations:
             continue

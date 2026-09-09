@@ -9,6 +9,7 @@ from rag_agent import (
     format_formula_for_display,
     format_formula_for_katex,
     generate_formula_only_answer,
+    generate_extractive_value_answer,
     refine_prism_query,
     rerank_context_results,
     sanitize_grounded_answer,
@@ -192,9 +193,57 @@ class PrismQueryTests(unittest.TestCase):
             refine_prism_query(question),
         )
 
-        self.assertIn("ИВ0 = объём электроэнергии по УДГ − объём электроэнергии по плановому ДГ", answer)
-        self.assertIn(rule, answer)
+        self.assertIn(r"\text{ИВ0} = V_{\text{УДГ}} - V_{\text{план.\,ДГ}}", answer)
+        self.assertNotIn("равна разности", answer)
         self.assertIn("[Источник: документ — раздел «Внешняя инициатива ИВ0»]", answer)
+
+    def test_ivo_worded_rule_becomes_one_formula_in_payload(self):
+        question = "Что такое ИВ0? Как рассчитывается? Приведи точную формулу."
+        rule = (
+            "ИВ0: величина равна разности между объемом электроэнергии, "
+            "определенным согласно УДГ, и объемом электроэнергии, "
+            "определенном в плановом ДГ."
+        )
+
+        formulas = extract_formula_lines_from_texts([rule], question)
+
+        self.assertEqual(formulas, [r"\mathrm{ИВ0} = V_{\mathrm{УДГ}} - V_{\mathrm{план.\,ДГ}}"])
+        self.assertNotIn("равна разности", formulas[0])
+
+    def test_extractive_ivo_answer_prefers_uploaded_document_and_defines_variables(self):
+        question = "Что такое ИВ0? Как рассчитывается? Приведи точную формулу."
+        rule = (
+            "ИВ0: величина равна разности между объемом электроэнергии, "
+            "определенным согласно УДГ, и объемом электроэнергии, "
+            "определенном в плановом ДГ."
+        )
+        context = [
+            {
+                "file": "r12_rag.md",
+                "score": 2.0,
+                "chunk_type": "value",
+                "section_path": "Служебный корпус > ИВ0",
+                "section_title": "ИВ0",
+                "text": rule,
+            },
+            {
+                "file": "abc123_r12.docx",
+                "score": 1.0,
+                "chunk_type": "value",
+                "section_path": "4.4. Внешняя инициатива > ИВ0",
+                "section_title": "ИВ0",
+                "text": rule,
+            },
+        ]
+
+        answer = generate_extractive_value_answer(question, context)
+
+        self.assertIsNotNone(answer)
+        self.assertIn(r"$$\mathrm{ИВ0} = V_{\mathrm{УДГ}} - V_{\mathrm{план.\,ДГ}}$$", answer)
+        self.assertIn(r"V_{\mathrm{УДГ}}", answer)
+        self.assertIn(r"V_{\mathrm{план.\,ДГ}}", answer)
+        self.assertIn("[Источник: abc123_r12.docx —", answer)
+        self.assertNotIn("[Источник: r12_rag.md —", answer)
 
     def test_validator_reports_missing_requested_section(self):
         spec = refine_prism_query("дай формулы из пункта 2.1.4")

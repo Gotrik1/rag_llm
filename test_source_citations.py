@@ -15,6 +15,17 @@ class SourceCitationTests(unittest.TestCase):
         self.assertEqual(reference, "abc123_manual.docx — Глава 2 > Порядок расчёта")
         self.assertEqual(source_locator("Пункт 4.2", 17), "стр. 17, Пункт 4.2")
 
+    def test_locator_drops_measurement_artifact_and_truncated_child(self):
+        section = (
+            "110 МВт∙ч, > Порядок признания процедуры несостоявшейся > "
+            "плановое производство устанавливается равным объемам регулируемых договоров..."
+        )
+
+        self.assertEqual(
+            source_locator(section),
+            "раздел «Порядок признания процедуры несостоявшейся»",
+        )
+
     @patch("web_ui.document_sources")
     def test_sources_are_restored_linked_and_deduplicated_by_document_locator(self, records):
         records.return_value = {
@@ -78,6 +89,21 @@ class SourceCitationTests(unittest.TestCase):
         enriched = enrich_answer_source_citations(answer, [source])
 
         self.assertEqual(enriched.count("Источник: manual.pdf"), 1)
+
+    def test_repeated_identical_inline_citations_are_collapsed(self):
+        answer = (
+            "Первый факт. [Источник: manual.pdf — Запуск]\n\n"
+            "Второй факт. [Источник: manual.pdf — Запуск]"
+        )
+        source = {
+            "file": "manual.pdf", "section": "Запуск", "locator": "раздел «Запуск»",
+            "url": "/api/documents/doc-1/content",
+        }
+
+        enriched = enrich_answer_source_citations(answer, [source])
+
+        self.assertEqual(enriched.count("Источник: manual.pdf"), 1)
+        self.assertIn("Второй факт.", enriched)
 
     def test_non_formula_question_has_no_formula_payload(self):
         chunks = [{"text": "Константы используются в формулах через функцию Const."}]

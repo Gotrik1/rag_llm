@@ -282,6 +282,10 @@ services:
       - ./deploy/nginx/tls.conf.template:/etc/nginx/templates/default.conf.template:ro
       - ${TLS_CERT_FILE:-./deploy/certs/rag.crt}:/etc/nginx/tls/rag.crt:ro
       - ${TLS_KEY_FILE:-./deploy/certs/rag.key}:/etc/nginx/tls/rag.key:ro
+    secrets:
+      - source: gateway_htpasswd
+        target: gateway_htpasswd
+        mode: 0444
     ports:
       - ${RAG_HTTPS_BIND_ADDRESS:-0.0.0.0}:${RAG_HTTPS_PORT:-8443}:8443
     networks:
@@ -545,3 +549,5 @@ secrets:
     file: ${GRAFANA_ADMIN_PASSWORD_FILE:-./deploy/secrets/grafana_admin_password}
   app_secret_key:
     file: ${APP_SECRET_KEY_FILE:-./deploy/secrets/app_secret_key}
+  gateway_htpasswd:
+    file: ${RAG_GATEWAY_HTPASSWD_FILE:-./deploy/secrets/gateway_htpasswd}

@@ -304,11 +304,15 @@ async def ask(payload: AskRequest, principal: Principal = Depends(current_princi
         else:
             result = await asyncio.to_thread(run_ask, question)
         PIPELINE_SECONDS.labels("ask", result.get("flow_mode", "unknown")).observe(time.perf_counter() - started)
-        return JSONResponse(result, status_code=202 if result.get("status") == "running" else 200)
+        return JSONResponse(
+            jsonable_encoder(result),
+            status_code=202 if result.get("status") == "running" else 200,
+        )
 
 
 def _sse(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n"
+    encoded = jsonable_encoder(data)
+    return f"event: {event}\ndata: {json.dumps(encoded, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
 
 @app.post("/api/ask/stream")

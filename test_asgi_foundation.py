@@ -2,6 +2,8 @@ import asyncio
 import threading
 import unittest
 import tempfile
+import uuid
+from datetime import datetime, timezone
 from contextlib import suppress
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -52,6 +54,22 @@ class AsgiFoundationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), payload)
         ask.assert_called_once_with("Test question")
+
+    def test_ask_serializes_registry_uuid_and_timestamp(self):
+        document_id = uuid.uuid4()
+        uploaded_at = datetime(2026, 9, 9, 9, 0, tzinfo=timezone.utc)
+        payload = {
+            "answer": "registry",
+            "flow_mode": "workspace",
+            "documents": [{"id": document_id, "created_at": uploaded_at}],
+        }
+        with patch("asgi_app.run_ask", return_value=payload):
+            response = self.client.post("/api/ask", json={"question": "Какие документы загружены?"})
+
+        self.assertEqual(response.status_code, 200)
+        document = response.json()["documents"][0]
+        self.assertEqual(document["id"], str(document_id))
+        self.assertEqual(document["created_at"], "2026-09-09T09:00:00+00:00")
 
     def test_ask_persists_server_owned_assistant_message(self):
         payload = {"answer": "persistent answer", "html_answer": "<p>persistent answer</p>", "flow_mode": "python"}

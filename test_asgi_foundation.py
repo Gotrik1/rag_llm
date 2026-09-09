@@ -53,7 +53,11 @@ class AsgiFoundationTests(unittest.TestCase):
             response = self.client.post("/api/ask", json={"question": "Test question"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), payload)
-        ask.assert_called_once_with("Test question")
+        ask.assert_called_once_with({
+            "question": "Test question",
+            "_owner_subject": "rag-superadmin",
+            "_owner_admin": True,
+        })
 
     def test_ask_serializes_registry_uuid_and_timestamp(self):
         document_id = uuid.uuid4()
@@ -74,7 +78,8 @@ class AsgiFoundationTests(unittest.TestCase):
     def test_ask_persists_server_owned_assistant_message(self):
         payload = {"answer": "persistent answer", "html_answer": "<p>persistent answer</p>", "flow_mode": "python"}
         created = {"id": "message-1"}
-        with patch("asgi_app.create_message", return_value=created) as create_message, \
+        with patch("asgi_app.get_chat", return_value={"id": "chat-1"}), \
+             patch("asgi_app.create_message", return_value=created) as create_message, \
              patch("asgi_app.update_message", return_value={}) as update_message, \
              patch("asgi_app.run_ask", return_value=payload):
             response = self.client.post("/api/ask", json={"question": "Test question", "chat_id": "chat-1"})
@@ -96,6 +101,7 @@ class AsgiFoundationTests(unittest.TestCase):
             },
         }
         with patch.dict("os.environ", {"RAG_DURABLE_GENERATION": "true"}), \
+             patch("asgi_app.get_chat", return_value={"id": "chat-1"}), \
              patch("asgi_app.create_message", return_value=created), \
              patch("asgi_app.update_message", return_value={}), \
              patch.object(asgi_app.jobs, "submit", AsyncMock(return_value={"id": "job-1"})) as submit, \
@@ -108,13 +114,19 @@ class AsgiFoundationTests(unittest.TestCase):
             "generation",
             {
                 "assistant_message_id": "message-1",
-                "request": {"question": "Test question", "chat_id": "chat-1"},
+                "request": {
+                    "question": "Test question",
+                    "chat_id": "chat-1",
+                    "_owner_subject": "rag-superadmin",
+                    "_owner_admin": True,
+                },
                 "owner_subject": "rag-superadmin",
             },
         )
 
     def test_durable_ask_returns_accepted_when_job_outlives_http_wait(self):
         with patch.dict("os.environ", {"RAG_DURABLE_GENERATION": "true"}), \
+             patch("asgi_app.get_chat", return_value={"id": "chat-1"}), \
              patch("asgi_app.create_message", return_value={"id": "message-1"}), \
              patch("asgi_app.update_message", return_value={}), \
              patch.object(asgi_app.jobs, "submit", AsyncMock(return_value={"id": "job-1"})), \
@@ -210,6 +222,7 @@ class AsgiFoundationTests(unittest.TestCase):
             "result": {"answer": "durable stream", "flow_mode": "python", "status": "complete"},
         }
         with patch.dict("os.environ", {"RAG_DURABLE_GENERATION": "true"}), \
+             patch("asgi_app.get_chat", return_value={"id": "chat-1"}), \
              patch("asgi_app.create_message", return_value={"id": "message-1"}), \
              patch("asgi_app.update_message", return_value={}), \
              patch.object(asgi_app.jobs, "submit", AsyncMock(return_value={"id": "job-1"})), \

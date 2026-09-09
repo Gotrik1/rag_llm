@@ -35,6 +35,7 @@ from db_store import (
     get_project,
     get_workspace,
     list_chats,
+    list_all_documents_for_retrieval,
     list_documents,
     list_messages,
     list_projects,
@@ -363,19 +364,30 @@ def select_user_facing_sources(answer: str, sources: list[dict]) -> list[dict]:
 
 
 def excluded_document_sources(scope: dict, chat_id: str) -> set[str]:
-    """Hide documents attached to other projects/chats while keeping global corpora."""
+    """Hide every vector source outside the active user's configured knowledge scope."""
     try:
-        records = list_documents()
+        records = list_all_documents_for_retrieval()
     except Exception:
         return set()
     current_project = str(scope.get("project_id") or "")
+    current_owner = str(scope.get("owner_subject") or "")
+    include_global = not current_project or str(scope.get("knowledge_scope") or "") != "project_only"
     excluded: set[str] = set()
     for record in records:
         document_project = str(record.get("project_id") or "")
         document_chat = str(record.get("chat_id") or "")
-        if not document_project and not document_chat:
-            continue
-        is_visible = bool(current_project and document_project == current_project) or document_chat == chat_id
+        document_owner = str(record.get("owner_subject") or "")
+        is_global = not document_owner
+        is_visible = (
+            (is_global and include_global)
+            or (
+                document_owner == current_owner
+                and (
+                    bool(current_project and document_project == current_project)
+                    or document_chat == chat_id
+                )
+            )
+        )
         if not is_visible:
             for field in ("source_path", "file_name"):
                 value = str(record.get(field) or "").strip()

@@ -1,6 +1,17 @@
 type ApiErrorPayload = {
   error?: string;
+  detail?: string;
 };
+
+let csrfToken = "";
+
+export function setCsrfToken(value?: string | null): void {
+  csrfToken = value?.trim() ?? "";
+}
+
+export function clearCsrfToken(): void {
+  csrfToken = "";
+}
 
 async function readApiResponse<T>(response: Response): Promise<T & ApiErrorPayload> {
   const contentType = response.headers.get("content-type") ?? "";
@@ -27,10 +38,23 @@ async function request<T>(
   const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(path, { ...options, signal: controller.signal });
+    const headers = new Headers(options.headers);
+    const method = (options.method ?? "GET").toUpperCase();
+    if (csrfToken && !["GET", "HEAD", "OPTIONS"].includes(method)) {
+      headers.set("X-CSRF-Token", csrfToken);
+    }
+    const response = await fetch(path, {
+      ...options,
+      headers,
+      credentials: "same-origin",
+      signal: controller.signal
+    });
     const data = await readApiResponse<T>(response);
     if (!response.ok) {
-      throw new Error(data.error || response.statusText);
+      if (response.status === 401 && !path.startsWith("/api/auth/")) {
+        window.dispatchEvent(new Event("rag:unauthorized"));
+      }
+      throw new Error(data.error || data.detail || response.statusText);
     }
     return data;
   } catch (error) {

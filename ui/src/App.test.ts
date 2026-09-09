@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { documentUploadedLabel, documentVersionLabel, generationResponseIsTerminal, hasRunningAssistantMessage, normalizeSourceCitations, panelStateFromMessageRecords, resultFromMessageRecord, sourceLocatorLabel, uploadFeedback, visibleNavigationChats } from "./App";
+import { documentUploadedLabel, documentVersionLabel, generationResponseIsTerminal, hasRunningAssistantMessage, normalizeSourceCitations, panelStateFromMessageRecords, resultFromMessageRecord, sourceLocatorLabel, splitDocumentsByScope, uploadFeedback, visibleNavigationChats } from "./App";
 
 
 describe("persisted generation state", () => {
@@ -133,7 +133,8 @@ describe("persisted generation state", () => {
     expect(uploadFeedback(result, [{
       id: "document-1",
       file_name: "manual.docx",
-      status: "ready"
+      status: "ready",
+      scope: "project"
     }])).toEqual({
       state: "success",
       message: "1 файл готов и добавлен в базу знаний"
@@ -151,16 +152,26 @@ describe("persisted generation state", () => {
     };
 
     expect(uploadFeedback(result, [
-      { id: "document-1", file_name: "one.docx", status: "ready" },
-      { id: "document-2", file_name: "two.docx", status: "processing" }
+      { id: "document-1", file_name: "one.docx", status: "ready", scope: "project" },
+      { id: "document-2", file_name: "two.docx", status: "processing", scope: "project" }
     ])).toEqual({ state: "pending", message: "Готово 1 из 2 · остальные обрабатываются" });
 
     expect(uploadFeedback(result, [
-      { id: "document-1", file_name: "one.docx", status: "ready" },
-      { id: "document-2", file_name: "two.docx", status: "failed" }
+      { id: "document-1", file_name: "one.docx", status: "ready", scope: "project" },
+      { id: "document-2", file_name: "two.docx", status: "failed", scope: "project" }
     ])).toEqual({
       state: "error",
       message: "Не обработано: 1 из 2. Готово: 1. Проверьте статус документа слева."
     });
+  });
+
+  it("keeps shared and project documents in separate visible groups", () => {
+    const grouped = splitDocumentsByScope([
+      { id: "shared", file_name: "Общий регламент.pdf", status: "ready", scope: "global" },
+      { id: "private", file_name: "Проектный расчёт.docx", status: "ready", scope: "project" }
+    ]);
+
+    expect(grouped.global.map((document) => document.id)).toEqual(["shared"]);
+    expect(grouped.project.map((document) => document.id)).toEqual(["private"]);
   });
 });

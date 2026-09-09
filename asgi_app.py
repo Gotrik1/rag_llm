@@ -9,20 +9,45 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import AsyncIterator
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from opentelemetry.trace import format_trace_id, get_current_span
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from audit import record as audit_record
-from db_store import create_document, create_message, get_document, list_documents, update_document, update_message
+from db_store import (
+    create_document,
+    create_message,
+    get_chat,
+    get_document,
+    list_documents,
+    request_scope,
+    update_document,
+    update_message,
+)
 from document_catalog import annotate_document_versions
 from jobs import JobQueue
 from legacy_adapter import invoke_legacy
+from local_auth import (
+    SESSION_COOKIE_NAME,
+    InvalidCredentials,
+    RegistrationError,
+    authenticate_credentials,
+    authenticate_session,
+    cookie_max_age,
+    cookie_secure,
+    create_session,
+    csrf_token,
+    public_user,
+    register_user,
+    revoke_session,
+    verify_csrf,
+)
 from persistence import get_store
 from security import AuthenticationError, AuthorizationError, Principal, RAG_ACCESS, authorize, configured_identity_provider
 from telemetry import AUTH_DECISIONS, JOBS, PIPELINE_SECONDS, REQUESTS, REQUEST_SECONDS, configure_logging, configure_telemetry, tracer
@@ -32,6 +57,16 @@ from runtime_paths import UPLOAD_DIR
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=20_000)
     chat_id: str | None = None
+
+
+class LoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class RegisterRequest(LoginRequest):
+    display_name: str = Field(default="", max_length=80)
 
 
 ALLOWED_UPLOAD_SUFFIXES = {".docx", ".pdf", ".md", ".txt"}
@@ -50,7 +85,11 @@ def run_ask(payload: dict | str) -> dict:
     """Run the current RAG endpoint through the protected compatibility bridge."""
     if isinstance(payload, str):
         payload = {"question": payload}
-    result, status = legacy_operation("POST", "/api/ask", payload)
+    request_payload = dict(payload)
+    owner_subject = str(request_payload.pop("_owner_subject", "")).strip() or None
+    owner_admin = bool(request_payload.pop("_owner_admin", False))
+    with request_scope(owner_subject, is_admin=owner_admin):
+        result, status = legacy_operation("POST", "/api/ask", request_payload)
     if status >= 400:
         raise RuntimeError(str(result.get("error", "RAG request failed")))
     return result
@@ -81,15 +120,39 @@ def run_ingestion_job(payload: dict) -> dict:
     return result
 
 
-def current_principal(request: Request) -> Principal:
+def _local_auth_enabled() -> bool:
+    return os.getenv("RAG_AUTH_MODE", "development").strip().lower() == "local"
+
+
+async def current_principal(request: Request) -> AsyncIterator[Principal]:
     try:
-        principal = configured_identity_provider().authenticate(request.headers.get("Authorization"))
-        principal = get_store().enrich_principal(principal)
+        if _local_auth_enabled():
+            user = await asyncio.to_thread(authenticate_session, request.cookies.get(SESSION_COOKIE_NAME, ""))
+            is_admin = bool(user.get("is_admin"))
+            principal = Principal(
+                subject=f"local:{user['id']}",
+                roles=frozenset({"superadmin"}) if is_admin else frozenset({"user"}),
+                permissions=frozenset({"*"}) if is_admin else frozenset({RAG_ACCESS}),
+                attributes={
+                    "user_id": str(user["id"]),
+                    "email": str(user["email"]),
+                    "display_name": str(user["display_name"]),
+                    "is_admin": "true" if is_admin else "false",
+                },
+                provider="local",
+            )
+        else:
+            principal = await asyncio.to_thread(
+                configured_identity_provider().authenticate,
+                request.headers.get("Authorization"),
+            )
+        principal = await asyncio.to_thread(get_store().enrich_principal, principal)
         authorize(principal, RAG_ACCESS, request.url.path, {"request": {"method": request.method}})
         request.state.principal = principal
         AUTH_DECISIONS.labels(RAG_ACCESS, "allow", principal.provider).inc()
-        return principal
-    except AuthenticationError as exc:
+        with request_scope(principal.subject, is_admin="superadmin" in principal.roles):
+            yield principal
+    except (AuthenticationError, InvalidCredentials) as exc:
         AUTH_DECISIONS.labels(RAG_ACCESS, "unauthenticated", "unknown").inc()
         audit_record("authentication", request_id=request.headers.get("X-Request-ID"), outcome="denied")
         raise HTTPException(401, str(exc)) from exc
@@ -150,7 +213,21 @@ async def _run_and_persist_ask(request_payload: dict, assistant_message: dict) -
     result["message_id"] = message_id
     return result
 cors_origins = [origin.strip() for origin in os.getenv("RAG_CORS_ORIGINS", "http://127.0.0.1:5173").split(",") if origin.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"], allow_headers=["Authorization", "Content-Type", "X-Request-ID"], expose_headers=["X-Request-ID", "X-Trace-ID"])
+app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"], allow_headers=["Authorization", "Content-Type", "X-Request-ID", "X-CSRF-Token"], expose_headers=["X-Request-ID", "X-Trace-ID"])
+
+
+@app.middleware("http")
+async def csrf_protection(request: Request, call_next):
+    if (
+        _local_auth_enabled()
+        and request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        and request.url.path.startswith("/api/")
+        and request.url.path not in {"/api/auth/login", "/api/auth/register"}
+    ):
+        session_token = request.cookies.get(SESSION_COOKIE_NAME, "")
+        if session_token and not verify_csrf(session_token, request.headers.get("X-CSRF-Token", "")):
+            return JSONResponse({"detail": "Проверка безопасности сессии не пройдена. Обновите страницу."}, status_code=403)
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -206,9 +283,98 @@ async def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
+def _session_response(user: dict, session_token: str, *, status_code: int = 200) -> JSONResponse:
+    response = JSONResponse(
+        jsonable_encoder({"authenticated": True, "user": public_user(user), "csrf_token": csrf_token(session_token)}),
+        status_code=status_code,
+    )
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        session_token,
+        max_age=cookie_max_age(),
+        httponly=True,
+        secure=cookie_secure(),
+        samesite="lax",
+        path="/",
+    )
+    return response
+
+
+@app.get("/api/auth/session")
+async def auth_session(request: Request):
+    if not _local_auth_enabled():
+        return {
+            "authenticated": True,
+            "user": {"id": "development", "email": "", "display_name": "Development", "is_admin": True},
+            "csrf_token": None,
+        }
+    session_token = request.cookies.get(SESSION_COOKIE_NAME, "")
+    try:
+        user = await asyncio.to_thread(authenticate_session, session_token)
+    except InvalidCredentials:
+        response = JSONResponse({"authenticated": False, "user": None, "csrf_token": None})
+        if session_token:
+            response.delete_cookie(SESSION_COOKIE_NAME, path="/", secure=cookie_secure(), samesite="lax")
+        return response
+    return _session_response(user, session_token)
+
+
+@app.post("/api/auth/register", status_code=201)
+async def auth_register(payload: RegisterRequest, request: Request):
+    try:
+        user = await asyncio.to_thread(register_user, payload.email, payload.display_name, payload.password)
+    except RegistrationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    session_token = await asyncio.to_thread(
+        create_session,
+        str(user["id"]),
+        request.headers.get("user-agent", ""),
+        request.client.host if request.client else None,
+    )
+    audit_record("registration", outcome="success", subject=f"local:{user['id']}")
+    return _session_response(user, session_token, status_code=201)
+
+
+@app.post("/api/auth/login")
+async def auth_login(payload: LoginRequest, request: Request):
+    try:
+        user = await asyncio.to_thread(authenticate_credentials, payload.email, payload.password)
+    except InvalidCredentials as exc:
+        audit_record("authentication", outcome="denied")
+        raise HTTPException(401, str(exc)) from exc
+    session_token = await asyncio.to_thread(
+        create_session,
+        str(user["id"]),
+        request.headers.get("user-agent", ""),
+        request.client.host if request.client else None,
+    )
+    audit_record("authentication", outcome="success", subject=f"local:{user['id']}")
+    return _session_response(user, session_token)
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request):
+    session_token = request.cookies.get(SESSION_COOKIE_NAME, "")
+    await asyncio.to_thread(revoke_session, session_token)
+    response = JSONResponse({"authenticated": False})
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/", secure=cookie_secure(), samesite="lax")
+    return response
+
+
 @app.get("/api/me")
 async def me(principal: Principal = Depends(current_principal)):
-    return {"subject": principal.subject, "roles": sorted(principal.roles), "permissions": sorted(principal.permissions), "provider": principal.provider}
+    return {
+        "subject": principal.subject,
+        "roles": sorted(principal.roles),
+        "permissions": sorted(principal.permissions),
+        "provider": principal.provider,
+        "user": {
+            "id": principal.attributes.get("user_id"),
+            "email": principal.attributes.get("email"),
+            "display_name": principal.attributes.get("display_name"),
+            "is_admin": principal.attributes.get("is_admin") == "true",
+        } if principal.provider == "local" else None,
+    }
 
 
 def require_admin(principal: Principal, path: str) -> None:
@@ -244,8 +410,12 @@ async def ask(payload: AskRequest, principal: Principal = Depends(current_princi
         span.set_attribute("rag.principal_provider", principal.provider)
         started = time.perf_counter()
         request_payload = payload.model_dump(exclude_none=True)
+        request_payload["_owner_subject"] = principal.subject
+        request_payload["_owner_admin"] = "superadmin" in principal.roles
         assistant_message: dict | None = None
         if payload.chat_id:
+            if await asyncio.to_thread(get_chat, payload.chat_id) is None:
+                raise HTTPException(404, "chat not found")
             assistant_message = await asyncio.to_thread(
                 create_message,
                 payload.chat_id,
@@ -302,7 +472,7 @@ async def ask(payload: AskRequest, principal: Principal = Depends(current_princi
             # persists its terminal state for the next page load.
             result = await asyncio.shield(task)
         else:
-            result = await asyncio.to_thread(run_ask, question)
+            result = await asyncio.to_thread(run_ask, request_payload)
         PIPELINE_SECONDS.labels("ask", result.get("flow_mode", "unknown")).observe(time.perf_counter() - started)
         return JSONResponse(
             jsonable_encoder(result),
@@ -318,6 +488,11 @@ def _sse(event: str, data: dict) -> str:
 @app.post("/api/ask/stream")
 async def ask_stream(payload: AskRequest, request: Request, principal: Principal = Depends(current_principal)):
     """SSE contract with immediate progress, heartbeats and incremental answer chunks."""
+    request_payload = payload.model_dump(exclude_none=True)
+    request_payload["_owner_subject"] = principal.subject
+    request_payload["_owner_admin"] = "superadmin" in principal.roles
+    if payload.chat_id and await asyncio.to_thread(get_chat, payload.chat_id) is None:
+        raise HTTPException(404, "chat not found")
     if payload.chat_id and os.getenv("RAG_DURABLE_GENERATION", "false").lower() == "true":
         async def durable_events():
             assistant_message = await asyncio.to_thread(
@@ -330,7 +505,7 @@ async def ask_stream(payload: AskRequest, request: Request, principal: Principal
                     "generation",
                     {
                         "assistant_message_id": str(assistant_message["id"]),
-                        "request": payload.model_dump(exclude_none=True),
+                        "request": request_payload,
                         "owner_subject": principal.subject,
                     },
                 )
@@ -380,8 +555,7 @@ async def ask_stream(payload: AskRequest, request: Request, principal: Principal
         deltas: asyncio.Queue[str] = asyncio.Queue()
         loop = asyncio.get_running_loop()
         callback = lambda text: loop.call_soon_threadsafe(deltas.put_nowait, text)
-        request_payload = payload.model_dump(exclude_none=True)
-        task = asyncio.create_task(asyncio.to_thread(run_ask_stream, request_payload if payload.chat_id else payload.question.strip(), callback))
+        task = asyncio.create_task(asyncio.to_thread(run_ask_stream, request_payload, callback))
         while not task.done() or not deltas.empty():
             if await request.is_disconnected():
                 task.cancel()

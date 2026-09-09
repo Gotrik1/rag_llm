@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getJson, patchJson, postFormData, postJson } from "./api";
+import { clearCsrfToken, getJson, patchJson, postFormData, postJson, setCsrfToken } from "./api";
 
 const fetchMock = vi.fn();
 
@@ -35,6 +35,7 @@ function pendingUntilAbort() {
 
 afterEach(() => {
   fetchMock.mockReset();
+  clearCsrfToken();
   vi.useRealTimers();
 });
 
@@ -47,9 +48,10 @@ describe("HTTP client", () => {
 
     expect(fetchMock).toHaveBeenCalledWith("/api/ask", expect.objectContaining({
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
       body: JSON.stringify({ question: "Тест" })
     }));
+    expect((fetchMock.mock.calls[0][1]?.headers as Headers).get("Content-Type")).toBe("application/json");
   });
 
   it("uses the backend error message for unsuccessful JSON requests", async () => {
@@ -97,7 +99,18 @@ describe("HTTP client", () => {
       method: "POST",
       body
     }));
-    expect(fetchMock.mock.calls[0][1]?.headers).toBeUndefined();
+    expect((fetchMock.mock.calls[0][1]?.headers as Headers).has("Content-Type")).toBe(false);
+  });
+
+  it("keeps the CSRF token in memory and sends it only on mutations", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ ok: true }));
+    setCsrfToken("csrf-value");
+
+    await getJson("/api/projects", 1_000);
+    await postJson("/api/projects", { name: "Новый" }, 1_000);
+
+    expect((fetchMock.mock.calls[0][1]?.headers as Headers).has("X-CSRF-Token")).toBe(false);
+    expect((fetchMock.mock.calls[1][1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-value");
   });
 
   it("reports a server error instead of attempting to parse an HTML error page as JSON", async () => {

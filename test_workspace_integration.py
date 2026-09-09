@@ -292,3 +292,53 @@ class WorkspacePersistenceIntegrationTests(unittest.TestCase):
                 self.request_json("DELETE", f"/api/chats/{chat_id}")
             for project_id in project_ids:
                 self.request_json("DELETE", f"/api/projects/{project_id}")
+
+    def test_users_share_global_documents_but_not_project_documents(self) -> None:
+        suffix = uuid.uuid4().hex
+        subject_a = f"local:test-a-{suffix}"
+        subject_b = f"local:test-b-{suffix}"
+        project_id = private_document_id = global_document_id = None
+        try:
+            global_document = db_store.create_document(None, None, {
+                "file_name": f"shared-{suffix}.pdf",
+                "source_path": f"/app/.data/uploads/shared-{suffix}.pdf",
+                "mime_type": "application/pdf",
+                "status": "ready",
+            })
+            global_document_id = str(global_document["id"])
+
+            with db_store.request_scope(subject_a):
+                project = db_store.create_project({
+                    "name": f"private-{suffix}",
+                    "knowledge_scope": "project_and_global",
+                })
+                project_id = str(project["id"])
+                private_document = db_store.create_document(project_id, None, {
+                    "file_name": f"private-{suffix}.docx",
+                    "source_path": f"/app/.data/uploads/private-{suffix}.docx",
+                    "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "status": "ready",
+                })
+                private_document_id = str(private_document["id"])
+                combined = db_store.list_documents(project_id)
+                self.assertEqual({item["scope"] for item in combined}, {"global", "project"})
+                self.assertTrue({global_document_id, private_document_id}.issubset({str(item["id"]) for item in combined}))
+
+                db_store.update_project(project_id, {"knowledge_scope": "project_only"})
+                project_only = db_store.list_documents(project_id)
+                self.assertEqual([str(item["id"]) for item in project_only], [private_document_id])
+                self.assertTrue(all(item["scope"] == "global" for item in db_store.list_documents()))
+
+            with db_store.request_scope(subject_b):
+                self.assertIsNone(db_store.get_project(project_id))
+                self.assertIsNone(db_store.get_document(private_document_id))
+                self.assertIn(global_document_id, [str(item["id"]) for item in db_store.list_documents()])
+        finally:
+            with db_store.db().cursor() as cursor:
+                if private_document_id:
+                    cursor.execute("DELETE FROM documents WHERE id = %s", (private_document_id,))
+                if global_document_id:
+                    cursor.execute("DELETE FROM documents WHERE id = %s", (global_document_id,))
+                if project_id:
+                    cursor.execute("DELETE FROM projects WHERE id = %s", (project_id,))
+            db_store.db().commit()

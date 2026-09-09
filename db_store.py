@@ -1,14 +1,12 @@
-"""PostgreSQL persistence for workspace, projects, chats, and messages.
-
-The module deliberately knows nothing about HTTP or RAG. Authentication is not
-enabled yet; tenant_id and user_id columns remain available for its future use.
-"""
+"""PostgreSQL persistence for user-scoped workspaces and RAG resources."""
 
 from __future__ import annotations
 
 import json
 import os
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 import psycopg
@@ -20,6 +18,32 @@ ENV_PATH = Path(".env")
 
 _db_lock = threading.Lock()
 _db_local = threading.local()
+_request_subject: ContextVar[str | None] = ContextVar("rag_request_subject", default=None)
+_request_admin: ContextVar[bool] = ContextVar("rag_request_admin", default=False)
+
+
+@contextmanager
+def request_scope(subject: str | None, *, is_admin: bool = False):
+    """Apply ownership filtering to all persistence calls in this task context."""
+    subject_token = _request_subject.set(subject.strip() if subject else None)
+    admin_token = _request_admin.set(bool(is_admin))
+    try:
+        yield
+    finally:
+        _request_admin.reset(admin_token)
+        _request_subject.reset(subject_token)
+
+
+def current_subject() -> str | None:
+    return _request_subject.get()
+
+
+def current_is_admin() -> bool:
+    return _request_admin.get()
+
+
+def _knowledge_scope(value: object) -> str:
+    return "project_only" if str(value or "").strip() == "project_only" else "project_and_global"
 
 
 def load_dotenv() -> None:
@@ -111,25 +135,41 @@ def run_migrations() -> None:
 
 def ensure_default_workspace(default_mode: str, default_provider: str, default_model: str) -> dict:
     conn = db()
+    subject = current_subject()
     with conn.cursor() as cur:
-        cur.execute("SELECT * FROM workspace_settings WHERE deleted_at IS NULL ORDER BY created_at ASC LIMIT 1")
+        if subject:
+            cur.execute(
+                "SELECT * FROM workspace_settings WHERE owner_subject = %s AND deleted_at IS NULL LIMIT 1",
+                (subject,),
+            )
+        else:
+            cur.execute("SELECT * FROM workspace_settings WHERE deleted_at IS NULL ORDER BY created_at ASC LIMIT 1")
         workspace = cur.fetchone()
         if workspace is None:
             cur.execute(
-                "INSERT INTO projects (name, description, settings, memory) VALUES (%s, %s, %s, %s) RETURNING *",
-                ("Default project", "Auto-created workspace project", json.dumps({"llm": {}, "ui": {}}), json.dumps({})),
+                """INSERT INTO projects
+                   (owner_subject, name, description, settings, memory, knowledge_scope)
+                   VALUES (%s, %s, %s, %s, %s, %s) RETURNING *""",
+                (
+                    subject,
+                    "Мой проект" if subject else "Default project",
+                    "Личная рабочая область" if subject else "Auto-created workspace project",
+                    json.dumps({"llm": {}, "ui": {}}),
+                    json.dumps({}),
+                    "project_and_global",
+                ),
             )
             project = cur.fetchone()
             cur.execute(
-                """INSERT INTO chats (project_id, title, mode, provider, model_name, metadata)
-                   VALUES (%s, %s, %s, %s, %s, %s) RETURNING *""",
-                (project["id"], "Новый чат", default_mode, default_provider, default_model, json.dumps({})),
+                """INSERT INTO chats (owner_subject, project_id, title, mode, provider, model_name, metadata)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+                (subject, project["id"], "Новый чат", default_mode, default_provider, default_model, json.dumps({})),
             )
             chat = cur.fetchone()
             cur.execute(
-                """INSERT INTO workspace_settings (active_project_id, active_chat_id, settings)
-                   VALUES (%s, %s, %s) RETURNING *""",
-                (project["id"], chat["id"], json.dumps({"theme": "light"})),
+                """INSERT INTO workspace_settings (owner_subject, active_project_id, active_chat_id, settings)
+                   VALUES (%s, %s, %s, %s) RETURNING *""",
+                (subject, project["id"], chat["id"], json.dumps({"theme": "light"})),
             )
             workspace = cur.fetchone()
             conn.commit()
@@ -137,30 +177,40 @@ def ensure_default_workspace(default_mode: str, default_provider: str, default_m
 
 
 def list_projects() -> list[dict]:
+    subject = current_subject()
     with db().cursor() as cur:
-        cur.execute(
-            """
+        query = """
             SELECT p.*,
                 COALESCE((SELECT json_agg(c ORDER BY c.created_at ASC) FROM chats c
-                          WHERE c.project_id = p.id AND c.deleted_at IS NULL), '[]'::json) AS chats
+                          WHERE c.project_id = p.id AND c.deleted_at IS NULL
+                            AND (p.owner_subject IS NULL OR c.owner_subject = p.owner_subject)), '[]'::json) AS chats
             FROM projects p
             WHERE p.deleted_at IS NULL
-            ORDER BY p.created_at ASC
-            """
-        )
+        """
+        params: list[object] = []
+        if subject:
+            query += " AND p.owner_subject = %s"
+            params.append(subject)
+        query += " ORDER BY p.created_at ASC"
+        cur.execute(query, params)
         return [dict(row) for row in cur.fetchall()]
 
 
 def create_project(payload: dict) -> dict:
     conn = db()
+    subject = current_subject()
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO projects (name, description, settings, memory) VALUES (%s, %s, %s, %s) RETURNING *",
+            """INSERT INTO projects
+               (owner_subject, name, description, settings, memory, knowledge_scope)
+               VALUES (%s, %s, %s, %s, %s, %s) RETURNING *""",
             (
+                subject,
                 str(payload.get("name", "")).strip() or "Новый проект",
                 str(payload.get("description", "")).strip(),
                 json.dumps(payload.get("settings") or {}, ensure_ascii=False),
                 json.dumps(payload.get("memory") or {}, ensure_ascii=False),
+                _knowledge_scope(payload.get("knowledge_scope")),
             ),
         )
         row = cur.fetchone()
@@ -169,20 +219,34 @@ def create_project(payload: dict) -> dict:
 
 
 def get_project(project_id: str) -> dict | None:
+    subject = current_subject()
     with db().cursor() as cur:
-        cur.execute("SELECT * FROM projects WHERE id = %s AND deleted_at IS NULL", (project_id,))
+        if subject:
+            cur.execute(
+                "SELECT * FROM projects WHERE id = %s AND owner_subject = %s AND deleted_at IS NULL",
+                (project_id, subject),
+            )
+        else:
+            cur.execute("SELECT * FROM projects WHERE id = %s AND deleted_at IS NULL", (project_id,))
         row = cur.fetchone()
         return dict(row) if row else None
 
 
 def update_project(project_id: str, payload: dict) -> dict | None:
     fields, values = _update_values(payload, ("name", "description"), ("settings", "memory"))
+    if "knowledge_scope" in payload:
+        fields.append("knowledge_scope = %s")
+        values.append(_knowledge_scope(payload.get("knowledge_scope")))
     if not fields:
         return get_project(project_id)
+    if get_project(project_id) is None:
+        return None
     return _update_entity("projects", project_id, fields, values)
 
 
 def delete_project(project_id: str) -> bool:
+    if get_project(project_id) is None:
+        return False
     conn = db()
     with conn.cursor() as cur:
         cur.execute(
@@ -201,6 +265,10 @@ def delete_project(project_id: str) -> bool:
 def list_chats(project_id: str | None = None) -> list[dict]:
     query = "SELECT * FROM chats WHERE deleted_at IS NULL"
     params: list[object] = []
+    subject = current_subject()
+    if subject:
+        query += " AND owner_subject = %s"
+        params.append(subject)
     if project_id:
         query += " AND project_id = %s"
         params.append(project_id)
@@ -215,11 +283,13 @@ def create_chat(project_id: str | None, payload: dict, default_mode: str, defaul
     if normalized_project_id is not None and get_project(normalized_project_id) is None:
         raise ValueError("project not found")
     conn = db()
+    subject = current_subject()
     with conn.cursor() as cur:
         cur.execute(
-            """INSERT INTO chats (project_id, title, mode, provider, model_name, metadata)
-               VALUES (%s, %s, %s, %s, %s, %s) RETURNING *""",
+            """INSERT INTO chats (owner_subject, project_id, title, mode, provider, model_name, metadata)
+               VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *""",
             (
+                subject,
                 normalized_project_id,
                 str(payload.get("title", "")).strip() or "Новый чат",
                 str(payload.get("mode", default_mode)).strip() or default_mode,
@@ -234,13 +304,22 @@ def create_chat(project_id: str | None, payload: dict, default_mode: str, defaul
 
 
 def get_chat(chat_id: str) -> dict | None:
+    subject = current_subject()
     with db().cursor() as cur:
-        cur.execute("SELECT * FROM chats WHERE id = %s AND deleted_at IS NULL", (chat_id,))
+        if subject:
+            cur.execute(
+                "SELECT * FROM chats WHERE id = %s AND owner_subject = %s AND deleted_at IS NULL",
+                (chat_id, subject),
+            )
+        else:
+            cur.execute("SELECT * FROM chats WHERE id = %s AND deleted_at IS NULL", (chat_id,))
         row = cur.fetchone()
         return dict(row) if row else None
 
 
 def update_chat(chat_id: str, payload: dict) -> dict | None:
+    if get_chat(chat_id) is None:
+        return None
     fields, values = _update_values(payload, ("title", "mode", "provider", "model_name"), ("metadata",))
     if "project_id" in payload:
         project_id = str(payload.get("project_id", "")).strip()
@@ -254,10 +333,14 @@ def update_chat(chat_id: str, payload: dict) -> dict | None:
 
 
 def delete_chat(chat_id: str) -> bool:
+    if get_chat(chat_id) is None:
+        return False
     return _soft_delete("chats", chat_id)
 
 
 def list_messages(chat_id: str) -> list[dict]:
+    if get_chat(chat_id) is None:
+        return []
     with db().cursor() as cur:
         cur.execute("SELECT * FROM messages WHERE chat_id = %s AND deleted_at IS NULL ORDER BY created_at ASC", (chat_id,))
         return [dict(row) for row in cur.fetchall()]
@@ -265,51 +348,69 @@ def list_messages(chat_id: str) -> list[dict]:
 
 def get_project_conversation(chat_id: str, limit: int = 40) -> dict | None:
     """Return project history, or only the active chat history for a free chat."""
+    subject = current_subject()
     with db().cursor() as cur:
+        ownership = " AND c.owner_subject = %s" if subject else ""
+        scope_params: tuple[object, ...] = (chat_id, subject) if subject else (chat_id,)
         cur.execute(
-            """
-            SELECT c.project_id, p.name AS project_name, p.memory
+            f"""
+            SELECT c.project_id, c.owner_subject, p.name AS project_name, p.memory, p.knowledge_scope
             FROM chats c
             LEFT JOIN projects p ON p.id = c.project_id AND p.deleted_at IS NULL
             WHERE c.id = %s AND c.deleted_at IS NULL
+            {ownership}
             """,
-            (chat_id,),
+            scope_params,
         )
         scope = cur.fetchone()
         if scope is None:
             return None
         if scope["project_id"] is None:
+            chat_owner_filter = " AND c.owner_subject = %s" if subject else ""
+            message_params: tuple[object, ...] = (
+                (chat_id, subject, max(1, min(limit, 100)))
+                if subject else (chat_id, max(1, min(limit, 100)))
+            )
             cur.execute(
-                """
+                f"""
                 SELECT c.id AS chat_id, c.title AS chat_title, m.role, m.content, m.created_at
                 FROM messages m
                 JOIN chats c ON c.id = m.chat_id
                 WHERE c.id = %s AND c.deleted_at IS NULL
+                  {chat_owner_filter}
                   AND m.deleted_at IS NULL AND m.status = 'complete'
                 ORDER BY m.created_at DESC LIMIT %s
                 """,
-                (chat_id, max(1, min(limit, 100))),
+                message_params,
             )
         else:
+            project_owner_filter = " AND c.owner_subject = %s" if subject else ""
+            message_params = (
+                (scope["project_id"], subject, max(1, min(limit, 100)))
+                if subject else (scope["project_id"], max(1, min(limit, 100)))
+            )
             cur.execute(
-                """
+                f"""
             SELECT c.id AS chat_id, c.title AS chat_title, m.role, m.content, m.created_at
             FROM messages m
             JOIN chats c ON c.id = m.chat_id
             WHERE c.project_id = %s
               AND c.deleted_at IS NULL
+              {project_owner_filter}
               AND m.deleted_at IS NULL
               AND m.status = 'complete'
             ORDER BY m.created_at DESC
             LIMIT %s
                 """,
-                (scope["project_id"], max(1, min(limit, 100))),
+                message_params,
             )
         messages = [dict(row) for row in reversed(cur.fetchall())]
     return {**dict(scope), "messages": messages}
 
 
 def create_message(chat_id: str, payload: dict) -> dict:
+    if get_chat(chat_id) is None:
+        raise ValueError("chat not found")
     conn = db()
     with conn.cursor() as cur:
         cur.execute(
@@ -330,13 +431,24 @@ def create_message(chat_id: str, payload: dict) -> dict:
 
 
 def get_message(message_id: str) -> dict | None:
+    subject = current_subject()
     with db().cursor() as cur:
-        cur.execute("SELECT * FROM messages WHERE id = %s AND deleted_at IS NULL", (message_id,))
+        if subject:
+            cur.execute(
+                """SELECT m.* FROM messages m JOIN chats c ON c.id = m.chat_id
+                   WHERE m.id = %s AND m.deleted_at IS NULL
+                     AND c.deleted_at IS NULL AND c.owner_subject = %s""",
+                (message_id, subject),
+            )
+        else:
+            cur.execute("SELECT * FROM messages WHERE id = %s AND deleted_at IS NULL", (message_id,))
         row = cur.fetchone()
         return dict(row) if row else None
 
 
 def update_message(message_id: str, payload: dict) -> dict | None:
+    if get_message(message_id) is None:
+        return None
     fields, values = _update_values(payload, ("content", "content_html", "status"), ("metadata",), strip_text=False)
     if not fields:
         return get_message(message_id)
@@ -344,59 +456,125 @@ def update_message(message_id: str, payload: dict) -> dict | None:
 
 
 def delete_message(message_id: str) -> bool:
+    if get_message(message_id) is None:
+        return False
     return _soft_delete("messages", message_id)
 
 
 def list_documents(project_id: str | None = None, chat_id: str | None = None) -> list[dict]:
+    subject = current_subject()
     query = "SELECT * FROM documents WHERE deleted_at IS NULL"
     params: list[object] = []
-    if project_id:
-        query += " AND project_id = %s"
-        params.append(project_id)
-    if chat_id:
-        query += " AND chat_id = %s"
-        params.append(chat_id)
+
+    if subject:
+        if project_id:
+            project = get_project(project_id)
+            if project is None:
+                return []
+            if _knowledge_scope(project.get("knowledge_scope")) == "project_only":
+                query += " AND project_id = %s AND owner_subject = %s"
+                params.extend((project_id, subject))
+            else:
+                query += " AND ((project_id = %s AND owner_subject = %s) OR owner_subject IS NULL)"
+                params.extend((project_id, subject))
+        elif chat_id:
+            if get_chat(chat_id) is None:
+                return []
+            query += " AND ((chat_id = %s AND owner_subject = %s) OR owner_subject IS NULL)"
+            params.extend((chat_id, subject))
+        else:
+            query += " AND owner_subject IS NULL"
+    else:
+        if project_id:
+            query += " AND project_id = %s"
+            params.append(project_id)
+        if chat_id:
+            query += " AND chat_id = %s"
+            params.append(chat_id)
+
     query += " ORDER BY created_at DESC"
     with db().cursor() as cur:
         cur.execute(query, params)
-        return [dict(row) for row in cur.fetchall()]
+        return [_document_record(row) for row in cur.fetchall()]
+
+
+def list_all_documents_for_retrieval() -> list[dict]:
+    """Return the full registry for exclusion filtering inside the trusted RAG worker."""
+    with db().cursor() as cur:
+        cur.execute("SELECT * FROM documents WHERE deleted_at IS NULL ORDER BY created_at DESC")
+        return [_document_record(row) for row in cur.fetchall()]
+
+
+def _document_record(row: object) -> dict:
+    record = dict(row)
+    record["scope"] = "global" if not record.get("owner_subject") else "project"
+    return record
 
 
 def create_document(project_id: str | None, chat_id: str | None, payload: dict) -> dict:
+    subject = current_subject()
+    project_id = project_id or None
+    chat_id = chat_id or None
+    if project_id and get_project(project_id) is None:
+        raise ValueError("project not found")
+    if chat_id and get_chat(chat_id) is None:
+        raise ValueError("chat not found")
+    if subject and not project_id and not chat_id and not current_is_admin():
+        raise PermissionError("global document upload requires administrator access")
+
+    document_owner = subject if project_id or chat_id else None
+    metadata = dict(payload.get("metadata") or {})
+    metadata["scope"] = "global" if not document_owner else "project"
     conn = db()
     with conn.cursor() as cur:
         cur.execute(
             """INSERT INTO documents
-               (project_id, chat_id, file_name, source_path, mime_type, status, processing_state, metadata)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+               (owner_subject, project_id, chat_id, file_name, source_path, mime_type, status, processing_state, metadata)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
             (
-                project_id or None,
-                chat_id or None,
+                document_owner,
+                project_id,
+                chat_id,
                 str(payload.get("file_name", "")).strip(),
                 str(payload.get("source_path", "")).strip(),
                 str(payload.get("mime_type", "")).strip(),
                 str(payload.get("status", "queued")).strip() or "queued",
                 json.dumps(payload.get("processing_state") or {}, ensure_ascii=False),
-                json.dumps(payload.get("metadata") or {}, ensure_ascii=False),
+                json.dumps(metadata, ensure_ascii=False),
             ),
         )
         row = cur.fetchone()
     conn.commit()
-    return dict(row)
+    return _document_record(row)
 
 
 def get_document(document_id: str) -> dict | None:
+    subject = current_subject()
     with db().cursor() as cur:
-        cur.execute("SELECT * FROM documents WHERE id = %s AND deleted_at IS NULL", (document_id,))
+        if subject and not current_is_admin():
+            cur.execute(
+                """SELECT * FROM documents
+                   WHERE id = %s AND deleted_at IS NULL
+                     AND (owner_subject = %s OR owner_subject IS NULL)""",
+                (document_id, subject),
+            )
+        else:
+            cur.execute("SELECT * FROM documents WHERE id = %s AND deleted_at IS NULL", (document_id,))
         row = cur.fetchone()
-        return dict(row) if row else None
+        return _document_record(row) if row else None
 
 
 def update_document(document_id: str, payload: dict) -> dict | None:
+    document = get_document(document_id)
+    if document is None:
+        return None
+    if current_subject() and not current_is_admin() and not document.get("owner_subject"):
+        return None
     fields, values = _update_values(payload, ("file_name", "source_path", "mime_type", "status"), ("processing_state", "metadata"))
     if not fields:
-        return get_document(document_id)
-    return _update_entity("documents", document_id, fields, values)
+        return document
+    updated = _update_entity("documents", document_id, fields, values)
+    return _document_record(updated) if updated else None
 
 
 def document_sources(source_names: list[str]) -> dict[str, dict]:
@@ -404,9 +582,17 @@ def document_sources(source_names: list[str]) -> dict[str, dict]:
     names = {str(name).strip() for name in source_names if str(name).strip()}
     if not names:
         return {}
+    subject = current_subject()
     with db().cursor() as cur:
-        cur.execute("SELECT * FROM documents WHERE deleted_at IS NULL AND status = 'ready'")
-        rows = [dict(row) for row in cur.fetchall()]
+        if subject and not current_is_admin():
+            cur.execute(
+                """SELECT * FROM documents WHERE deleted_at IS NULL AND status = 'ready'
+                   AND (owner_subject = %s OR owner_subject IS NULL)""",
+                (subject,),
+            )
+        else:
+            cur.execute("SELECT * FROM documents WHERE deleted_at IS NULL AND status = 'ready'")
+        rows = [_document_record(row) for row in cur.fetchall()]
     resolved: dict[str, dict] = {}
     for row in rows:
         stored_name = Path(str(row.get("source_path", ""))).name
@@ -423,10 +609,18 @@ def get_workspace(default_mode: str, default_provider: str, default_model: str) 
 
 def update_workspace(payload: dict, default_mode: str, default_provider: str, default_model: str) -> dict:
     fields, values = _update_values(payload, (), ("settings",))
-    for key in ("active_project_id", "active_chat_id"):
-        if key in payload:
-            fields.append(f"{key} = %s")
-            values.append(payload[key])
+    if "active_project_id" in payload:
+        project_id = str(payload.get("active_project_id") or "").strip() or None
+        if project_id and get_project(project_id) is None:
+            raise ValueError("project not found")
+        fields.append("active_project_id = %s")
+        values.append(project_id)
+    if "active_chat_id" in payload:
+        chat_id = str(payload.get("active_chat_id") or "").strip() or None
+        if chat_id and get_chat(chat_id) is None:
+            raise ValueError("chat not found")
+        fields.append("active_chat_id = %s")
+        values.append(chat_id)
     workspace = get_workspace(default_mode, default_provider, default_model)
     if not fields:
         return workspace

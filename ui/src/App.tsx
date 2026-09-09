@@ -28,6 +28,8 @@ import {
   Files,
   Folder,
   FolderInput,
+  LockKeyhole,
+  LogOut,
   Maximize2,
   PanelRight,
   PanelLeftClose,
@@ -49,7 +51,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { deleteJson, getJson, patchJson, postFormData, postJson } from "./api";
+import { clearCsrfToken, deleteJson, getJson, patchJson, postFormData, postJson, setCsrfToken } from "./api";
 
 type Role = "user" | "assistant";
 
@@ -141,6 +143,7 @@ type DocumentRecord = {
   version_status?: "latest" | "superseded" | "unknown";
   newer_document_id?: string | null;
   newer_file_name?: string | null;
+  scope: "global" | "project";
 };
 
 type ModelsResponse = {
@@ -192,6 +195,7 @@ type ProjectRecord = {
   name: string;
   memory?: Record<string, unknown>;
   chats?: ChatRecord[];
+  knowledge_scope?: KnowledgeScope;
 };
 
 type ChatRecord = {
@@ -214,6 +218,22 @@ type Project = {
   id: string;
   name: string;
   memory: string;
+  knowledgeScope: KnowledgeScope;
+};
+
+type KnowledgeScope = "project_only" | "project_and_global";
+
+type AuthUser = {
+  id: string;
+  email: string;
+  display_name: string;
+  is_admin: boolean;
+};
+
+type SessionResponse = {
+  authenticated: boolean;
+  user: AuthUser | null;
+  csrf_token: string | null;
 };
 
 type ChatSummary = {
@@ -226,13 +246,15 @@ type ChatSummary = {
 const DEFAULT_PROJECT: Project = {
   id: "regulations",
   name: "Регламенты",
-  memory: "Точный поиск по пунктам регламентов. Формулы и источники показывать явно."
+  memory: "Точный поиск по пунктам регламентов. Формулы и источники показывать явно.",
+  knowledgeScope: "project_and_global"
 };
 
 const FREE_CHAT_WORKSPACE: Project = {
   id: "",
   name: "Свободный чат",
-  memory: "Контекст ограничен текущим чатом."
+  memory: "Контекст ограничен текущим чатом.",
+  knowledgeScope: "project_and_global"
 };
 
 const THEME_KEY = "rag-assistant-theme";
@@ -261,7 +283,12 @@ const createId = () => crypto.randomUUID();
 
 function projectFromRecord(record: ProjectRecord): Project {
   const memory = typeof record.memory?.text === "string" ? record.memory.text : "";
-  return { id: record.id, name: record.name, memory };
+  return {
+    id: record.id,
+    name: record.name,
+    memory,
+    knowledgeScope: record.knowledge_scope === "project_only" ? "project_only" : "project_and_global"
+  };
 }
 
 function chatFromRecord(record: ChatRecord): ChatSummary {
@@ -472,7 +499,162 @@ function useMathTypeset(html?: string) {
   return ref;
 }
 
+export function splitDocumentsByScope(documents: DocumentRecord[]): {
+  global: DocumentRecord[];
+  project: DocumentRecord[];
+} {
+  return {
+    global: documents.filter((document) => document.scope === "global"),
+    project: documents.filter((document) => document.scope !== "global")
+  };
+}
+
 export function App() {
+  const [session, setSession] = useState<SessionResponse | null>(null);
+  const [sessionError, setSessionError] = useState("");
+
+  const refreshSession = useCallback(async () => {
+    setSessionError("");
+    try {
+      const next = await getJson<SessionResponse>("/api/auth/session", API_TIMEOUT_MS);
+      setCsrfToken(next.csrf_token);
+      setSession(next);
+    } catch (error) {
+      clearCsrfToken();
+      setSession({ authenticated: false, user: null, csrf_token: null });
+      setSessionError(error instanceof Error ? error.message : "Сервис временно недоступен");
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshSession();
+    const handleUnauthorized = () => {
+      clearCsrfToken();
+      setSession({ authenticated: false, user: null, csrf_token: null });
+    };
+    window.addEventListener("rag:unauthorized", handleUnauthorized);
+    return () => window.removeEventListener("rag:unauthorized", handleUnauthorized);
+  }, [refreshSession]);
+
+  const logout = useCallback(async () => {
+    try {
+      await postJson<{ authenticated: boolean }>("/api/auth/logout", {}, API_TIMEOUT_MS);
+    } finally {
+      clearCsrfToken();
+      setSession({ authenticated: false, user: null, csrf_token: null });
+    }
+  }, []);
+
+  if (session === null) {
+    return <div className="session-loading" role="status">Открываем рабочее пространство…</div>;
+  }
+  if (!session.authenticated || !session.user) {
+    return <AuthPage initialError={sessionError} onAuthenticated={setSession} />;
+  }
+  return <WorkspaceApp user={session.user} onLogout={logout} />;
+}
+
+function AuthPage({ initialError, onAuthenticated }: {
+  initialError: string;
+  onAuthenticated: (session: SessionResponse) => void;
+}) {
+  const [mode, setMode] = useState<"login" | "register">("login");
+  const [email, setEmail] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmation, setConfirmation] = useState("");
+  const [error, setError] = useState(initialError);
+  const [submitting, setSubmitting] = useState(false);
+
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (submitting) return;
+    if (mode === "register" && password !== confirmation) {
+      setError("Пароли не совпадают.");
+      return;
+    }
+    setSubmitting(true);
+    setError("");
+    try {
+      const path = mode === "login" ? "/api/auth/login" : "/api/auth/register";
+      const payload = mode === "login"
+        ? { email: email.trim(), password }
+        : { email: email.trim(), display_name: displayName.trim(), password };
+      const session = await postJson<SessionResponse>(path, payload, API_TIMEOUT_MS);
+      setCsrfToken(session.csrf_token);
+      onAuthenticated(session);
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Не удалось выполнить вход");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const changeMode = (next: "login" | "register") => {
+    setMode(next);
+    setError("");
+    setPassword("");
+    setConfirmation("");
+  };
+
+  return (
+    <main className="auth-shell">
+      <section className="auth-intro" aria-labelledby="auth-product-title">
+        <div className="auth-brand"><Bot size={22} /> AI ИАС Энергобаланс</div>
+        <div>
+          <div className="auth-eyebrow">Работа с корпоративными знаниями</div>
+          <h1 id="auth-product-title">Документы отвечают.<br />Источники остаются проверяемыми.</h1>
+          <p>Общая библиотека доступна всем пользователям, а документы, чаты и память проекта остаются в вашем рабочем пространстве.</p>
+        </div>
+        <div className="auth-principles" aria-label="Возможности">
+          <span><FileText size={16} /> Ссылка на документ и точный ориентир</span>
+          <span><Sigma size={16} /> Формулы без потери разметки</span>
+          <span><LockKeyhole size={16} /> Изолированные проекты и сохранённые сессии</span>
+        </div>
+      </section>
+
+      <section className="auth-form-panel" aria-labelledby="auth-form-title">
+        <div className="auth-mode" role="tablist" aria-label="Вход или регистрация">
+          <button className={mode === "login" ? "active" : ""} onClick={() => changeMode("login")} role="tab" type="button">Вход</button>
+          <button className={mode === "register" ? "active" : ""} onClick={() => changeMode("register")} role="tab" type="button">Регистрация</button>
+        </div>
+        <div className="auth-heading">
+          <h2 id="auth-form-title">{mode === "login" ? "С возвращением" : "Создать аккаунт"}</h2>
+          <p>{mode === "login" ? "Продолжите работу с вашими проектами и чатами." : "После регистрации будет создано личное рабочее пространство."}</p>
+        </div>
+        <form className="auth-form" onSubmit={submit}>
+          {mode === "register" ? (
+            <label>
+              <span>Имя</span>
+              <input autoComplete="name" maxLength={80} onChange={(event) => setDisplayName(event.target.value)} required value={displayName} />
+            </label>
+          ) : null}
+          <label>
+            <span>Электронная почта</span>
+            <input autoComplete="email" inputMode="email" maxLength={254} onChange={(event) => setEmail(event.target.value)} required type="email" value={email} />
+          </label>
+          <label>
+            <span>Пароль</span>
+            <input autoComplete={mode === "login" ? "current-password" : "new-password"} maxLength={128} minLength={mode === "register" ? 12 : 1} onChange={(event) => setPassword(event.target.value)} required type="password" value={password} />
+            {mode === "register" ? <small>Не менее 12 символов; не используйте почту внутри пароля.</small> : null}
+          </label>
+          {mode === "register" ? (
+            <label>
+              <span>Повторите пароль</span>
+              <input autoComplete="new-password" maxLength={128} minLength={12} onChange={(event) => setConfirmation(event.target.value)} required type="password" value={confirmation} />
+            </label>
+          ) : null}
+          <div className="auth-error" aria-live="polite">{error}</div>
+          <button className="auth-submit" disabled={submitting} type="submit">
+            {submitting ? "Проверяем…" : mode === "login" ? "Войти" : "Зарегистрироваться"}
+          </button>
+        </form>
+      </section>
+    </main>
+  );
+}
+
+function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
   const [messages, setMessages] = useState<ChatEntry[]>([]);
   const [runningChatIds, setRunningChatIds] = useState<string[]>([]);
   const [lastResult, setLastResult] = useState<AskResponse | null>(null);
@@ -553,7 +735,8 @@ export function App() {
 
   const loadDocuments = useCallback(async (projectId: string, chatId: string) => {
     if (!projectId && !chatId) {
-      setDocuments([]);
+      const shared = await getJson<{ items: DocumentRecord[] }>("/api/documents", API_TIMEOUT_MS);
+      setDocuments(shared.items);
       return;
     }
     setIsLoadingDocuments(true);
@@ -562,8 +745,13 @@ export function App() {
       const path = projectId
         ? `/api/projects/${projectId}/documents`
         : `/api/documents?chat_id=${encodeURIComponent(chatId)}`;
-      const data = await getJson<{ items: DocumentRecord[] }>(path, API_TIMEOUT_MS);
-      setDocuments(data.items);
+      const [scoped, shared] = await Promise.all([
+        getJson<{ items: DocumentRecord[] }>(path, API_TIMEOUT_MS),
+        getJson<{ items: DocumentRecord[] }>("/api/documents", API_TIMEOUT_MS)
+      ]);
+      const merged = new Map<string, DocumentRecord>();
+      [...shared.items, ...scoped.items].forEach((document) => merged.set(document.id, document));
+      setDocuments([...merged.values()]);
     } catch (error) {
       setDocumentsError(error instanceof Error ? error.message : "Не удалось загрузить список документов");
     } finally {
@@ -726,6 +914,26 @@ export function App() {
       setWorkspaceError(error instanceof Error ? error.message : "Не удалось сохранить память проекта");
     }
   }, [activeProjectId, projects]);
+
+  const updateProjectKnowledgeScope = useCallback(async (knowledgeScope: KnowledgeScope) => {
+    if (!activeProjectId) return;
+    const previous = projects;
+    setProjects((current) => current.map((project) => project.id === activeProjectId
+      ? { ...project, knowledgeScope }
+      : project));
+    try {
+      const record = await patchJson<ProjectRecord>(
+        `/api/projects/${activeProjectId}`,
+        { knowledge_scope: knowledgeScope },
+        API_TIMEOUT_MS
+      );
+      setProjects((current) => current.map((project) => project.id === activeProjectId ? projectFromRecord(record) : project));
+      await loadDocuments(activeProjectId, activeChatId);
+    } catch (error) {
+      setProjects(previous);
+      setWorkspaceError(error instanceof Error ? error.message : "Не удалось изменить область знаний проекта");
+    }
+  }, [activeChatId, activeProjectId, loadDocuments, projects]);
 
   const renameProject = useCallback(async (projectId: string, name: string) => {
     const project = projects.find((item) => item.id === projectId);
@@ -1005,6 +1213,14 @@ export function App() {
             onProjectRename={(projectId, name) => void renameProject(projectId, name)}
           />
           {workspaceError && <div className="sidebar-note">{workspaceError}</div>}
+          <div className="sidebar-user">
+            <div className="sidebar-user-avatar" aria-hidden="true">{user.display_name.slice(0, 1).toUpperCase()}</div>
+            <div className="sidebar-user-copy">
+              <strong>{user.display_name}</strong>
+              <span>{user.email}</span>
+            </div>
+            <button aria-label="Выйти" onClick={onLogout} title="Выйти" type="button"><LogOut size={16} /></button>
+          </div>
         </aside>
 
         <section className="chat-surface">
@@ -1036,6 +1252,7 @@ export function App() {
           isUploading={isUploading}
           onProviderSettingsChange={setActiveProvider}
           onProjectMemoryChange={(memory) => void updateProjectMemory(memory)}
+          onProjectKnowledgeScopeChange={(scope) => void updateProjectKnowledgeScope(scope)}
           onRefreshModels={loadModels}
           onTabChange={setActiveTab}
           onThemeChange={setTheme}
@@ -1102,6 +1319,7 @@ function NavigationSidebar({
   const pinnedChats = chats.filter((chat) => pinnedChatIds.includes(chat.id));
   const freeChats = chats.filter((chat) => chat.projectId === null);
   const projectNames = new Map(projects.map((project) => [project.id, project.name]));
+  const groupedDocuments = splitDocumentsByScope(documents);
 
   useEffect(() => {
     if (activeProjectId) setExpandedProjectIds([activeProjectId]);
@@ -1182,6 +1400,37 @@ function NavigationSidebar({
     );
   };
 
+  const renderDocuments = (items: DocumentRecord[], emptyCopy: string) => (
+    <div className="nav-document-list" aria-live="polite">
+      {!isLoadingDocuments && !documentsError && !items.length ? <div className="sidebar-empty">{emptyCopy}</div> : null}
+      {items.map((document) => (
+        <a
+          className="nav-document"
+          href={`/api/documents/${document.id}/content`}
+          key={document.id}
+          rel="noreferrer"
+          target="_blank"
+          title={`${document.file_name}. ${documentUploadedLabel(document.created_at)}. ${documentVersionLabel(document)}`}
+        >
+          <FileText size={15} />
+          <span className="nav-document-copy">
+            <span className="nav-document-name">{document.file_name}</span>
+            <span className="nav-document-meta">
+              {documentUploadedLabel(document.created_at)} · {documentVersionLabel(document)}
+            </span>
+          </span>
+          <span className={`nav-document-status ${document.status}`}>
+            {document.status === "ready"
+              ? "Готов"
+              : document.status === "processing"
+                ? `${document.processing_state?.progress ?? 0}%`
+                : document.status}
+          </span>
+        </a>
+      ))}
+    </div>
+  );
+
   return (
     <nav className="navigation-sidebar" aria-label="Проекты и чаты">
       {pinnedProjects.length || pinnedChats.length ? (
@@ -1260,43 +1509,22 @@ function NavigationSidebar({
         ) : null}
       </section>
 
+      <section className="nav-section documents-section" aria-label="Общие документы">
+        <div className="nav-section-header">
+          <div className="nav-section-title">Общие документы</div>
+          <span className="nav-count" title="Количество общих документов">{groupedDocuments.global.length}</span>
+        </div>
+        {isLoadingDocuments ? <div className="sidebar-empty">Обновляем список…</div> : null}
+        {documentsError ? <div className="sidebar-empty error-copy">{documentsError}</div> : null}
+        {renderDocuments(groupedDocuments.global, "Общая библиотека пока пуста.")}
+      </section>
+
       <section className="nav-section documents-section" aria-label={activeProjectId ? "Документы проекта" : "Документы чата"}>
         <div className="nav-section-header">
           <div className="nav-section-title">{activeProjectId ? "Документы проекта" : "Документы чата"}</div>
-          <span className="nav-count" title="Количество загруженных документов">{documents.length}</span>
+          <span className="nav-count" title="Количество приватных документов">{groupedDocuments.project.length}</span>
         </div>
-        <div className="nav-document-list" aria-live="polite">
-          {isLoadingDocuments ? <div className="sidebar-empty">Обновляем список…</div> : null}
-          {documentsError ? <div className="sidebar-empty error-copy">{documentsError}</div> : null}
-          {!isLoadingDocuments && !documentsError && !documents.length ? (
-            <div className="sidebar-empty">Документов пока нет. Загрузить их можно в панели справа.</div>
-          ) : null}
-          {documents.map((document) => (
-            <a
-              className="nav-document"
-              href={`/api/documents/${document.id}/content`}
-              key={document.id}
-              rel="noreferrer"
-              target="_blank"
-              title={`${document.file_name}. ${documentUploadedLabel(document.created_at)}. ${documentVersionLabel(document)}`}
-            >
-              <FileText size={15} />
-              <span className="nav-document-copy">
-                <span className="nav-document-name">{document.file_name}</span>
-                <span className="nav-document-meta">
-                  {documentUploadedLabel(document.created_at)} · {documentVersionLabel(document)}
-                </span>
-              </span>
-              <span className={`nav-document-status ${document.status}`}>
-                {document.status === "ready"
-                  ? "Готов"
-                  : document.status === "processing"
-                    ? `${document.processing_state?.progress ?? 0}%`
-                    : document.status}
-              </span>
-            </a>
-          ))}
-        </div>
+        {renderDocuments(groupedDocuments.project, "Приватных документов пока нет. Загрузить их можно в панели справа.")}
       </section>
 
       {freeChats.length ? (
@@ -1703,6 +1931,7 @@ function KnowledgeLoader({
         <Database size={15} />
         <span>База знаний</span>
       </div>
+      <p className="loader-scope-note">Новые файлы будут доступны только в текущем проекте или чате.</p>
       <label className="file-picker" htmlFor={inputId}>
         <UploadCloud size={17} />
         <span>{selectedFiles.length ? `Выбрано: ${selectedFiles.length}` : "Выбрать файлы"}</span>
@@ -1761,7 +1990,7 @@ function KnowledgeLoader({
         <span>
           {isLoadingDocuments
             ? "Обновляем список документов…"
-            : `${documents.length} документ(ов) · перечень показан слева`}
+            : `${splitDocumentsByScope(documents).project.length} приватных · ${splitDocumentsByScope(documents).global.length} общих`}
         </span>
       </div>
       {documentsError ? (
@@ -1991,6 +2220,7 @@ function EvidencePanel({
   onChangeModel,
   onDebug,
   onProviderSettingsChange,
+  onProjectKnowledgeScopeChange,
   onProjectMemoryChange,
   onRefreshModels,
   onTabChange,
@@ -2023,6 +2253,7 @@ function EvidencePanel({
   onChangeModel: (model: string) => void;
   onDebug: () => void;
   onProviderSettingsChange: (provider: ProviderName) => void;
+  onProjectKnowledgeScopeChange: (scope: KnowledgeScope) => void;
   onProjectMemoryChange: (memory: string) => void;
   onRefreshModels: () => void;
   onTabChange: (tab: PanelTab) => void;
@@ -2100,6 +2331,26 @@ function EvidencePanel({
               <textarea value={activeProject.memory} onChange={(event) => onProjectMemoryChange(event.target.value)} />
             </label>
           </section>
+          {activeProject.id ? (
+            <section className="knowledge-scope-panel">
+              <div className="project-memory-heading"><Database size={14} /><span>Источники проекта</span></div>
+              <label>
+                <span>Область знаний</span>
+                <select
+                  onChange={(event) => onProjectKnowledgeScopeChange(event.target.value as KnowledgeScope)}
+                  value={activeProject.knowledgeScope}
+                >
+                  <option value="project_and_global">Документы проекта и общие</option>
+                  <option value="project_only">Только документы проекта</option>
+                </select>
+              </label>
+              <p>
+                {activeProject.knowledgeScope === "project_only"
+                  ? "Ответы строятся только по приватным документам этого проекта."
+                  : "Ответы используют приватные документы проекта и общую библиотеку."}
+              </p>
+            </section>
+          ) : null}
           <ProviderSettings models={models} onProviderChange={onProviderSettingsChange} />
           <FlowModeSelector isRunning={isRunning} />
           <SystemPromptSelector isRunning={isRunning} />

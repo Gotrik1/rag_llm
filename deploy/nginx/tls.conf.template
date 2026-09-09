@@ -3,6 +3,8 @@ upstream rag_frontend {
     keepalive 32;
 }
 
+limit_req_zone $binary_remote_addr zone=rag_auth:10m rate=10r/m;
+
 server {
     listen 8443 ssl;
     server_name ${RAG_SERVER_NAME};
@@ -20,15 +22,16 @@ server {
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-Frame-Options "DENY" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" always;
 
     location = /nginx-health {
         access_log off;
         return 200 "ok\n";
     }
 
-    location / {
-        auth_basic "RAG Assistant";
-        auth_basic_user_file /run/secrets/gateway_htpasswd;
+    location ~ ^/api/auth/(login|register)$ {
+        limit_req zone=rag_auth burst=10 nodelay;
 
         proxy_pass http://rag_frontend;
         proxy_http_version 1.1;
@@ -36,9 +39,24 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
-        # Basic Auth belongs to this edge only. Forwarding it would make the
-        # application identity provider interpret it as its own bearer token
-        # and return 401, causing browsers to challenge on every API request.
+        proxy_set_header Authorization "";
+        proxy_set_header Proxy-Authorization "";
+        proxy_set_header Connection "";
+        proxy_connect_timeout 10s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+        proxy_buffering off;
+        proxy_cache off;
+    }
+
+    location / {
+
+        proxy_pass http://rag_frontend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
         proxy_set_header Authorization "";
         proxy_set_header Proxy-Authorization "";
         proxy_set_header Connection "";

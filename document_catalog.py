@@ -10,7 +10,7 @@ from uuid import UUID
 
 
 _SEMVER_RE = re.compile(
-    r"(?<![0-9A-Za-zА-Яа-яЁё])(?:v|ver(?:sion)?|версия|ред(?:акция)?|rev|r)\s*[-_.]?\s*(\d+(?:[._-]\d+){0,3})",
+    r"(?<![0-9A-Za-zА-Яа-яЁё])(?:v|ver(?:sion)?|версия|ред(?:акция)?|rev)\s*[-_.]?\s*(\d+(?:[._-]\d+){0,3})",
     re.IGNORECASE,
 )
 _DATE_RE = re.compile(r"(?<!\d)(20\d{2})[-_.](0?[1-9]|1[0-2])[-_.](0?[1-9]|[12]\d|3[01])(?!\d)")
@@ -18,7 +18,7 @@ _RU_DATE_RE = re.compile(r"(?<!\d)(0?[1-9]|[12]\d|3[01])[._-](0?[1-9]|1[0-2])[._
 _YEAR_RE = re.compile(r"(?i)(?:ред(?:акция)?|версия|от)\s*(20\d{2})(?!\d)")
 _BARE_SEMVER_RE = re.compile(r"^\s*(\d+(?:[._-]\d+){0,3})\s*$")
 _CATALOG_INTENT_PATTERNS = (
-    re.compile(r"\bкакие\b.{0,60}\b(регламент|документ|инструкц|файл)", re.IGNORECASE),
+    re.compile(r"\bкакие(?:\s+\S+){0,2}\s+(регламент\w*|документ\w*|инструкц\w*|файл\w*)\b", re.IGNORECASE),
     re.compile(r"\b(список|перечень)\b.{0,60}\b(регламент|документ|инструкц|файл)", re.IGNORECASE),
     re.compile(r"\bчто\b.{0,30}\b(загружено|в памяти|есть из документов|есть из регламентов)", re.IGNORECASE),
     re.compile(r"\bс чем\s+(?:мы\s+)?работаем\b", re.IGNORECASE),

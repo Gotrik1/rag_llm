@@ -33,6 +33,9 @@ class DocumentCatalogTests(unittest.TestCase):
         self.assertTrue(is_document_catalog_question("С чем мы сейчас работаем и когда это загружено?"))
         self.assertTrue(is_document_catalog_question("Есть ли более актуальная версия документа?"))
         self.assertFalse(is_document_catalog_question("Что сказано в регламенте о сроке проверки?"))
+        self.assertFalse(is_document_catalog_question(
+            "Какие типы ценовых заявок перечислены в Регламенте 5 и кто вправе их подавать?"
+        ))
 
     def test_semantic_versions_are_grouped_and_older_record_points_to_newer(self):
         documents = [
@@ -68,6 +71,16 @@ class DocumentCatalogTests(unittest.TestCase):
 
         self.assertEqual(annotated[0]["version_status"], "superseded")
         self.assertEqual(annotated[1]["version_label"], "1.5")
+
+    def test_short_document_code_is_not_invented_as_a_revision(self):
+        annotated = annotate_document_versions([
+            {"id": "1", "file_name": "r5.docx"},
+            {"id": "2", "file_name": "r7.docx"},
+        ])
+
+        self.assertIsNone(annotated[0]["version_label"])
+        self.assertEqual(annotated[0]["version_status"], "unknown")
+        self.assertIsNone(annotated[1]["version_label"])
 
     def test_document_name_cannot_break_generated_markdown_link(self):
         result = build_document_catalog_answer("Проект", [{

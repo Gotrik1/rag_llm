@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import sys
@@ -395,7 +396,11 @@ def ordered_requested_terms(question: str) -> list[str]:
 def detect_query_intent(question: str) -> str:
     normalized = question.lower()
     cost_markers = ("стоим", "ставк", "руб", "оплат", "требован", "обязательств", "платеж")
-    value_markers = ("величин", "объем", "объём", "отклон", "рассчит", "расчет", "расчёт", "формул", "определ", "порядок", "учет", "учёт")
+    # Generic verbs such as "определяется" and the noun "порядок" occur in
+    # almost every normative question.  Treating them as value intent made the
+    # PRISM contract discard whole cost/rate-labelled sections even when the
+    # user was asking about a procedure described by that section.
+    value_markers = ("величин", "объем", "объём", "отклон", "рассчит", "расчет", "расчёт", "формул", "учет", "учёт")
     if any(marker in normalized for marker in cost_markers) or re.search(r"\bцен(?:а|ы|е|у|ой|ам|ах)\b", normalized):
         return "cost"
     if any(marker in normalized for marker in value_markers):
@@ -420,7 +425,8 @@ def section_query_terms(question: str) -> tuple[str, ...]:
     stop = {
         "какие", "какая", "какой", "какое", "формулы", "формула", "расчет",
         "расчёт", "правила", "правило", "пункт", "пункта", "раздел", "для",
-        "что", "как", "это", "есть", "найди", "покажи",
+        "что", "как", "это", "есть", "найди", "покажи", "каких", "когда", "где",
+        "почему", "после", "этого", "такого", "затем", "далее",
     }
     terms = [
         token
@@ -1896,18 +1902,29 @@ class RAGAgent:
             return []
 
         query_key_set = set(query_keys)
-        ranked: list[tuple[float, dict]] = []
+        prepared: list[tuple[object, dict, str, str, str, tuple[str, ...], set[str]]] = []
+        heading_frequency: dict[str, int] = {key: 0 for key in query_key_set}
         for node in self._all_nodes:
             meta = node.metadata or {}
             text = node.text or ""
             section_path = str(meta.get("section_path", ""))
             section_title = str(meta.get("section_title", ""))
-            section_text = f"{section_path} {section_title}".strip()
+            section_text = section_path.strip()
+            if section_title and section_title.casefold() not in section_path.casefold():
+                section_text = f"{section_text} {section_title}".strip()
             if not section_text:
                 continue
-
             section_keys = lexical_term_keys(section_text)
             section_key_set = set(section_keys)
+            prepared.append((node, meta, text, section_path, section_title, section_keys, section_key_set))
+            for key in query_key_set & section_key_set:
+                heading_frequency[key] += 1
+
+        ranked: list[tuple[float, dict]] = []
+        for node, meta, text, section_path, section_title, section_keys, section_key_set in prepared:
+            section_text = section_path.strip()
+            if section_title and section_title.casefold() not in section_path.casefold():
+                section_text = f"{section_text} {section_title}".strip()
             matched = query_key_set & section_key_set
             common_run = longest_common_token_run(query_keys, section_keys)
             minimum_matches = max(3, min(6, round(len(query_key_set) * 0.35)))
@@ -1918,7 +1935,18 @@ class RAGAgent:
             density = len(matched) / max(1, len(section_key_set))
             body_matches = query_key_set & set(lexical_term_keys(text[:2200]))
             body_coverage = len(body_matches) / len(query_key_set)
-            score = 2.0 + common_run * 0.4 + coverage * 3.0 + density + body_coverage * 2.0
+            # Domain boilerplate (for example "конкурентного отбора ценовых
+            # заявок") is frequent across regulations.  Give more weight to
+            # rare heading terms such as the actual event or exception named
+            # by the user.  Averaging normalized IDF over all matched terms
+            # prevents one accidental rare token from dominating the score.
+            total_headings = max(1, len(prepared))
+            idf_scale = max(1.0, math.log(total_headings + 1.0))
+            rarity_bonus = 6.0 * sum(
+                math.log((total_headings + 1.0) / (heading_frequency[key] + 1.0)) / idf_scale
+                for key in matched
+            ) / max(1, len(matched))
+            score = 2.0 + common_run * 0.4 + coverage * 3.0 + density + body_coverage * 2.0 + rarity_bonus
             if len(section_text) > 900:
                 score -= 1.5
             chunk_meta = {

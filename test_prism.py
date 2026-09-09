@@ -42,6 +42,40 @@ class PrismQueryTests(unittest.TestCase):
         self.assertEqual(seeds[0]["file"], "r7.docx")
         self.assertIn("section-lexical", seeds[0]["matched_queries"][0])
 
+    def test_rare_heading_terms_beat_shared_market_boilerplate(self):
+        class Node:
+            def __init__(self, text, metadata):
+                self.text = text
+                self.metadata = metadata
+
+        target = "Порядок признания процедуры конкурентного отбора несостоявшейся и определения планового почасового производства и потребления"
+        generic = "Ценовая заявка включена в процедуру конкурентного отбора ценовых заявок на сутки вперед и определения планового почасового производства и потребления"
+        agent = object.__new__(RAGAgent)
+        agent._all_nodes = [
+            *[
+                Node(
+                    f"Общее уведомление о заявке {index}.",
+                    {"file_name": "r5.docx", "section_path": generic},
+                )
+                for index in range(12)
+            ],
+            Node("При наступлении событий процедура объявляется несостоявшейся.", {"file_name": "r7.docx", "section_path": target}),
+        ]
+
+        seeds = agent._lexical_section_seed_results(
+            "В каких случаях процедура конкурентного отбора ценовых заявок на сутки вперёд признаётся несостоявшейся и как после этого определяется плановое почасовое производство и потребление?"
+        )
+
+        self.assertEqual(seeds[0]["file"], "r7.docx")
+
+    def test_procedural_question_is_not_misclassified_as_value_lookup(self):
+        spec = refine_prism_query(
+            "В каких случаях процедура признаётся несостоявшейся и как после этого определяется производство?"
+        )
+
+        self.assertEqual(spec.intent, "general")
+        self.assertNotIn("cost", spec.excluded_chunk_types)
+
     def test_formula_heading_is_linked_to_the_governing_clause(self):
         markdown = """#### 4.4.2.6. Ставка по собственной инициативе в сторону увеличения определяется как минимальная величина:\n\n#### = MIN(Ц_i,q^-, Т_i,q).\n"""
 

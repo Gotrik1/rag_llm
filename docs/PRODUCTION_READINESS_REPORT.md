@@ -3,6 +3,10 @@
 Date: 2026-09-09. Branch: `dev`. Application release `3c9e780e6` is deployed on
 VM `iprg001` and is available at `https://5.35.120.112:8443/`. The external TLS
 gateway requires Basic Auth; anonymous and invalid credentials are rejected.
+O2 Cloud Edge Firewall permits public ingress only to TCP/8443 for this service;
+the existing DNAT forwards that port to `192.168.30.2`. The endpoint therefore
+does not require a corporate VPN, while the application remains protected by
+the gateway credentials.
 Corporate OIDC remains the required next step for named users, per-user RBAC and
 audit attribution.
 
@@ -66,6 +70,7 @@ so the full Compose runtime remains a required VM acceptance gate.
 | Project isolation | passed at integration-contract level | cross-project exclusion test passes; a destructive live two-project corpus mutation was not performed on the retained VM data |
 | Observability | partially verified | Prometheus, Grafana, Loki, Tempo, Alloy and OpenTelemetry containers are running; dashboard contents and alert delivery were not manually certified in this pass |
 | External authentication | passed for restricted single-admin operation | `/nginx-health` returns `200`; anonymous UI access and an invalid password return `401`; valid gateway credentials return `200`; plaintext recovery credentials are mode `0600`, the salted htpasswd hash is `0644` inside a root-only directory |
+| Public internet ingress | passed | O2 Cloud Edge rule `RAG_8443_public` allows source `ANY` only through application profile `RAG_HTTPS_8443` (`TCP/8443`) to `192.168.30.2`; independent TCP probes succeeded from five internet nodes (Hungary, Indonesia, Netherlands, Russia and Turkey); an external anonymous HTTPS request returned `401`, an authenticated request returned `200 text/html`, and the VM DNAT counter recorded 8 packets on port 8443 |
 | Per-user authentication | remaining enterprise hardening | application auth remains `development` behind the mandatory gateway. Corporate OIDC is still required before issuing individual accounts or claiming per-user RBAC/audit attribution |
 | Final runtime audit | passed | `19` services running, internal health `{"status":"ok"}`, default/ingestion/generation queue lengths `0,0,0`; PostgreSQL contains 1 project, 13 acceptance chats, 49 messages and 1 registered document |
 

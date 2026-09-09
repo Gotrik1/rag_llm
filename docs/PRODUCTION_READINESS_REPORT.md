@@ -1,8 +1,10 @@
 # Production readiness report
 
-Date: 2026-09-08. Branch: `dev`. The application release described below is
-deployed on VM `iprg001`; the remaining authentication gate is called out
-explicitly and prevents treating the Internet-facing endpoint as security-ready.
+Date: 2026-09-09. Branch: `dev`. Application release `fd281cc2b` is deployed on
+VM `iprg001` and is available at `https://5.35.120.112:8443/`. The external TLS
+gateway requires Basic Auth; anonymous and invalid credentials are rejected.
+Corporate OIDC remains the required next step for named users, per-user RBAC and
+audit attribution.
 
 ## Implemented in this hardening pass
 
@@ -18,17 +20,19 @@ explicitly and prevents treating the Internet-facing endpoint as security-ready.
 | Cache | exact Redis namespace/TTL retained; corpus and flow changes invalidate; scope affects key | response-cache and flow tests |
 | Grounding | prompt remains bounded to selected chunks; generalized beyond regulatory documents; textual source policy added | PRISM/prompt-injection contracts |
 | Formulas | KaTeX rendering, short Markdown/LaTeX equality extraction, and same-document formula sibling retrieval | formula/PRISM tests + real production browser |
+| User-facing sources | citations are the original document plus a human locator and stable content link; UUID filename prefixes, chunk previews and retrieval scores are removed; only actually cited linked locators are returned | 6 source-contract tests + live VM fact/formula acceptance |
 | Live API contract | `/api/openapi.json` now serves `app.openapi()` rather than the stale compatibility file | route contract/import test |
 | Deployment | local Compose contract is `rag-assistant`; the existing VM project remains `rag-platform` to preserve named volumes; worker single-writer default and secret templates corrected | rendered Compose validation and live VM services |
 | Documentation | root README, current architecture/runbook, deploy inventory, detailed Russian user guide | link/path review |
 
 ## Test evidence
 
-Latest completed local runs:
+Latest completed release-gate runs:
 
-- Python Pytest suite against a clean PostgreSQL 18 cluster: `86 passed, 2 skipped`; both skips are opt-in live model tests. The equivalent CI `unittest discover` run executes 88 tests with 2 skips.
+- Final application image: `101` Python unit/contract tests executed, `94` passed and `7` environment-dependent tests skipped; `pip check` reports no broken requirements.
+- Earlier clean PostgreSQL 18 integration run: `86 passed, 2 skipped`; both skips are opt-in live model tests.
 - Python branch coverage: `52.2%` overall with a CI regression floor of 50%; document ingestion is `77.9%`, deterministic DOCX parsing `62.2%`, durable generation worker `79.7%`, persistence `83.8%`, the legacy adapter `87.1%`, and ASGI routes `63.7%`. CI publishes `coverage.xml`.
-- UI Vitest: `11 passed`.
+- UI Vitest: `13 passed`.
 - UI production build: success, 2522 modules; application code is split from the assistant and Markdown/KaTeX dependency chunks.
 - Rust: `cargo test` succeeds; the crate currently contains zero Rust unit tests.
 - Compose static validation: succeeds for `compose.yaml`.
@@ -45,27 +49,30 @@ so the full Compose runtime remains a required VM acceptance gate.
 
 | Check | Result | Evidence |
 | --- | --- | --- |
-| Target/release | passed | `iprg001`; `/opt/rag_llm/current` points to an immutable release; the exact revision and archive SHA-256 are recorded in root-only `/opt/rag_llm/shared/deployed-release.txt`; accepted application-code baseline is `941c499da` |
-| Release artifact | passed | release archive was built from tracked files with runtime data, generated artifacts and secrets explicitly excluded; hash was verified before extraction |
-| Backup/rollback | passed | latest backup `/opt/rag_llm/shared/backups/pre-941c499da-20260908T200340Z`; PostgreSQL dump, Qdrant snapshot, app-data archive and `SHA256SUMS`; two deliberately triggered gates proved automatic rollback before final activation |
+| Target/release | passed | `iprg001`; `/opt/rag_llm/current` resolves to `/opt/rag_llm/releases/fd281cc2b`; archive SHA-256 `c0873f4f5d61d757076d7bc42692d967ef9f47569a5c75d38fbd97661f7f6bdd` is recorded in root-only `/opt/rag_llm/shared/deployed-release.txt` |
+| Release artifact | passed | archive was built from tracked files only; runtime data, generated artifacts and secrets were not included; SHA-256 was verified before extraction |
+| Backup/rollback | passed | latest backup `/opt/rag_llm/shared/backups/pre-fd281cc2b-20260909T084549Z`; PostgreSQL dump, Qdrant snapshot, app-data archive and `SHA256SUMS`; failed pre-release TLS gates proved automatic rollback before final activation |
 | Migrations/services | passed | migration container exited successfully; app/proxy/LLM bridge healthy; PostgreSQL, Redis, Qdrant, ingestion worker, generation worker, vLLM and telemetry containers running |
 | Health | passed | internal HTTP and external TLS `/healthz` both return `{"status":"ok"}` |
-| Dependencies/tests | passed | final image `pip check`: no broken requirements; final image `93` unit/contract tests passed, `7` environment-dependent integration/live-model tests skipped |
+| Dependencies/tests | passed | final image `pip check`: no broken requirements; `101` tests executed, `94` passed and `7` environment-dependent integration/live-model tests skipped; UI has `13` passing tests and a successful 2522-module production build |
 | Durable generation | passed | a queued answer survived browser refresh and an API/worker replacement, then completed in its original chat |
 | Concurrent chats | passed with automated contract evidence | server-owned two-chat test passes; UI keeps independent chat state and lists several project chats concurrently |
-| Upload/registry/source | passed | Markdown acceptance file became `ready` with 4 chunks; UI shows it under “Документы в памяти”; the original is available through its document-content link |
-| Retrieval/formulas | passed | clean production chat returned `NEBULA-742`, `I = U/R`, and `I = 3 A`; answer cites both `Unique fact` and `Formula`; browser accessibility tree contains real KaTeX `math` nodes |
+| Upload/registry/source | passed | Markdown acceptance file is `ready` with 4 indexed chunks; UI shows it under “Документы в памяти”; the original is available through its document-content link |
+| Retrieval/formulas | passed | production chat `0ad3e456-1a67-4f25-89d2-58b5139ae110` returned `NEBULA-742`, `I = U/R`, and `I = 3 A`; the fact links to `production_acceptance.md — раздел «Unique fact»`, the formula links to `production_acceptance.md — раздел «Formula»`; the API returns exactly these cited document locators without score, preview or storage filename |
 | Queues | passed | default, ingestion and generation ARQ queue lengths are all zero after acceptance; ingestion and generation use distinct queue names |
 | Cache | passed at contract level | namespace/TTL, scope key, flow invalidation and corpus invalidation tests pass; a separate live repeat/mutation benchmark was not run because chat history intentionally changes the grounded cache key |
 | Project isolation | passed at integration-contract level | cross-project exclusion test passes; a destructive live two-project corpus mutation was not performed on the retained VM data |
 | Observability | partially verified | Prometheus, Grafana, Loki, Tempo, Alloy and OpenTelemetry containers are running; dashboard contents and alert delivery were not manually certified in this pass |
-| Authentication | **blocked** | VM currently has `RAG_AUTH_MODE=development` and no OIDC issuer; requests receive the development bootstrap superadmin identity. This is unacceptable for an open production endpoint. |
+| External authentication | passed for restricted single-admin operation | `/nginx-health` returns `200`; anonymous UI access and an invalid password return `401`; valid gateway credentials return `200`; plaintext recovery credentials are mode `0600`, the salted htpasswd hash is `0644` inside a root-only directory |
+| Per-user authentication | remaining enterprise hardening | application auth remains `development` behind the mandatory gateway. Corporate OIDC is still required before issuing individual accounts or claiming per-user RBAC/audit attribution |
+| Final runtime audit | passed | `19` services running, internal health `{"status":"ok"}`, default/ingestion/generation queue lengths `0,0,0`; PostgreSQL contains 1 project, 9 acceptance chats, 45 messages and 1 registered document |
 
-The technical rollout is complete and rollback-ready, but security acceptance is
-not complete until the operator supplies the corporate OIDC issuer, audience,
-JWKS URL and bootstrap subject, switches `RAG_AUTH_MODE=oidc`, and verifies RBAC
-with both an allowed and a denied user. No credential from the VM access document
-was reused as an application password.
+The technical rollout is complete and rollback-ready for restricted use through
+the mandatory TLS Basic Auth gateway. Before multi-user rollout, the operator
+must supply the corporate OIDC issuer, audience, JWKS URL and bootstrap subject,
+switch `RAG_AUTH_MODE=oidc`, and verify RBAC with both an allowed and a denied
+user. The gateway password was generated independently; no credential from the
+VM access document was reused.
 
 ## Residual risks and scaling triggers
 

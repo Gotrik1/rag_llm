@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { documentUploadedLabel, documentVersionLabel, generationResponseIsTerminal, hasRunningAssistantMessage, normalizeSourceCitations, resultFromMessageRecord, sourceLocatorLabel, visibleNavigationChats } from "./App";
+import { documentUploadedLabel, documentVersionLabel, generationResponseIsTerminal, hasRunningAssistantMessage, normalizeSourceCitations, panelStateFromMessageRecords, resultFromMessageRecord, sourceLocatorLabel, visibleNavigationChats } from "./App";
 
 
 describe("persisted generation state", () => {
@@ -73,5 +73,46 @@ describe("persisted generation state", () => {
     expect(restored?.sources?.[0].url).toBe("/api/documents/1/content");
     expect(restored?.formulas?.[0].text).toContain("Q");
     expect(restored?.from_cache).toBe(true);
+  });
+
+  it("restores the technical panel and its matching question after refresh", () => {
+    const restored = panelStateFromMessageRecords([
+      {
+        id: "question-1",
+        chat_id: "chat-1",
+        role: "user",
+        content: "Что такое ИВ0?",
+        status: "complete"
+      },
+      {
+        id: "answer-1",
+        chat_id: "chat-1",
+        role: "assistant",
+        content: "ИВ0 — величина внешней инициативы.",
+        status: "complete",
+        metadata: {
+          sources: [{ file: "r12.docx", locator: "раздел «ИВ0-1»", url: "/api/documents/r12/content" }],
+          formulas: [{ text: "ИВ0 = V_УДГ - V_план.ДГ" }],
+          usage: { total_tokens_est: 120, context_tokens_est: 80, answer_tokens_est: 40 }
+        }
+      }
+    ]);
+
+    expect(restored.question).toBe("Что такое ИВ0?");
+    expect(restored.result?.sources?.[0].file).toBe("r12.docx");
+    expect(restored.result?.formulas?.[0].text).toContain("ИВ0");
+    expect(restored.result?.usage?.context_tokens_est).toBe(80);
+  });
+
+  it("keeps the latest completed answer paired with its own question", () => {
+    const restored = panelStateFromMessageRecords([
+      { id: "q1", chat_id: "chat-1", role: "user", content: "Первый вопрос", status: "complete" },
+      { id: "a1", chat_id: "chat-1", role: "assistant", content: "Первый ответ", status: "complete" },
+      { id: "q2", chat_id: "chat-1", role: "user", content: "Второй вопрос", status: "complete" },
+      { id: "a2", chat_id: "chat-1", role: "assistant", content: "Второй ответ", status: "complete" }
+    ]);
+
+    expect(restored.question).toBe("Второй вопрос");
+    expect(restored.result?.answer).toBe("Второй ответ");
   });
 });

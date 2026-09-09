@@ -312,6 +312,27 @@ export function resultFromMessageRecord(record: MessageRecord): AskResponse | nu
   };
 }
 
+export function panelStateFromMessageRecords(records: MessageRecord[]): {
+  result: AskResponse | null;
+  question: string;
+} {
+  for (let answerIndex = records.length - 1; answerIndex >= 0; answerIndex -= 1) {
+    const result = resultFromMessageRecord(records[answerIndex]);
+    if (!result) continue;
+    for (let questionIndex = answerIndex - 1; questionIndex >= 0; questionIndex -= 1) {
+      const record = records[questionIndex];
+      if (record.role === "user" && record.content.trim()) {
+        return { result, question: record.content };
+      }
+    }
+    return { result, question: "" };
+  }
+  const latestQuestion = [...records]
+    .reverse()
+    .find((record) => record.role === "user" && record.content.trim());
+  return { result: null, question: latestQuestion?.content ?? "" };
+}
+
 export function hasRunningAssistantMessage(records: Array<Pick<MessageRecord, "role" | "status">>): boolean {
   return records.some((record) => record.role === "assistant" && record.status === "running");
 }
@@ -470,13 +491,11 @@ export function App() {
 
   const loadMessages = useCallback(async (chatId: string) => {
     const data = await getJson<{ items: MessageRecord[] }>(`/api/chats/${chatId}/messages`, API_TIMEOUT_MS);
-    setMessages(data.items.map(messageFromRecord));
     if (activeChatIdRef.current === chatId) {
-      const restored = [...data.items]
-        .reverse()
-        .map(resultFromMessageRecord)
-        .find((item): item is AskResponse => item !== null) ?? null;
-      setLastResult(restored);
+      const restored = panelStateFromMessageRecords(data.items);
+      setMessages(data.items.map(messageFromRecord));
+      setLastResult(restored.result);
+      setLastQuestion(restored.question);
     }
     setRunningChatIds((current) => {
       const persistedRunning = hasRunningAssistantMessage(data.items);
@@ -534,6 +553,7 @@ export function App() {
       setChats(nextChats);
       setActiveProjectId(nextProjectId);
       setActiveChatId(nextChatId);
+      activeChatIdRef.current = nextChatId;
       if (nextChatId) await loadMessages(nextChatId);
       else setMessages([]);
     } catch (error) {
@@ -592,6 +612,7 @@ export function App() {
     setChats((current) => [...current, chat]);
     setActiveProjectId(projectId);
     setActiveChatId(chat.id);
+    activeChatIdRef.current = chat.id;
     await syncWorkspace(projectId, chat.id);
     resetThreadState();
     return chat;
@@ -603,6 +624,7 @@ export function App() {
     setChats((current) => [...current, chat]);
     setActiveProjectId("");
     setActiveChatId(chat.id);
+    activeChatIdRef.current = chat.id;
     await syncWorkspace(null, chat.id);
     resetThreadState();
     return chat;
@@ -611,13 +633,14 @@ export function App() {
   const openChat = useCallback(async (chat: ChatSummary) => {
     setActiveProjectId(chat.projectId ?? "");
     setActiveChatId(chat.id);
-    await syncWorkspace(chat.projectId, chat.id);
-    await loadMessages(chat.id);
+    activeChatIdRef.current = chat.id;
     setLastResult(null);
     setLastQuestion("");
     setDebugResult(null);
     setDebugError("");
     setActiveTab("system");
+    await syncWorkspace(chat.projectId, chat.id);
+    await loadMessages(chat.id);
   }, [loadMessages, syncWorkspace]);
 
   const selectProject = useCallback(async (projectId: string) => {

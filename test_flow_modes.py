@@ -18,16 +18,27 @@ class FakeAgent:
         excluded_sources=None,
         shared_cache_sources=None,
         shared_system_prompt=None,
+        source_aliases=None,
+        priority_sources=None,
     ):
         self.calls.append(("ask", question))
         if retrieval_query is not None:
             self.calls.append(("retrieval_query", retrieval_query))
         if excluded_sources:
             self.calls.append(("excluded_sources", excluded_sources))
+        self.calls.append(("source_scope", source_aliases, priority_sources))
         self.calls.append(("shared_cache", shared_cache_sources, shared_system_prompt))
         return "python answer", [{"file": "python.docx", "section": "1", "score": 1, "text_preview": "evidence"}], False
 
-    def retrieve_context(self, question, top_k, spec=None, excluded_sources=None):
+    def retrieve_context(
+        self,
+        question,
+        top_k,
+        spec=None,
+        excluded_sources=None,
+        source_aliases=None,
+        priority_sources=None,
+    ):
         self.calls.append(("retrieve", question))
         return [context_item("python")]
 
@@ -54,6 +65,7 @@ class FlowModeTests(unittest.TestCase):
              patch.object(web_ui, "get_profile", return_value={"prompt": "test", "id": "test"}), \
              patch.object(web_ui, "get_workspace", return_value={"active_chat_id": "active-chat"}), \
              patch.object(web_ui, "get_project_conversation", return_value={"project_name": "test", "memory": {}, "messages": []}), \
+             patch.object(web_ui, "retrieval_document_scope", return_value=(set(), {})), \
              patch.object(web_ui, "shared_global_document_sources", return_value={"python.docx", "rust.docx"}), \
              patch.object(web_ui, "validate_retrieval", return_value=[]), \
              patch.object(web_ui, "extract_formula_lines", return_value=[]), \
@@ -222,7 +234,9 @@ class FlowModeTests(unittest.TestCase):
                 {"project_id": "project-1", "owner_subject": "user-1", "knowledge_scope": "project_and_global"},
                 "chat-1",
             )
-        self.assertEqual(excluded, {"other-project.pdf", "other-chat.pdf", "deleted.pdf", "failed.pdf"})
+        self.assertEqual(excluded, {
+            "same-project.pdf", "other-project.pdf", "other-chat.pdf", "deleted.pdf", "failed.pdf",
+        })
 
         with patch.object(web_ui, "list_all_documents_for_retrieval", return_value=documents):
             project_only = web_ui.excluded_document_sources(
@@ -230,6 +244,46 @@ class FlowModeTests(unittest.TestCase):
                 "chat-1",
             )
         self.assertIn("global.pdf", project_only)
+
+    def test_scope_uses_unique_upload_source_when_display_names_collide(self):
+        documents = [
+            {
+                "source_path": "C:/uploads/visible-id_ПП 442.md",
+                "file_name": "ПП 442.md",
+                "project_id": "project-1",
+                "chat_id": None,
+                "owner_subject": "user-1",
+                "status": "ready",
+            },
+            {
+                "source_path": "C:/uploads/hidden-id_ПП 442.md",
+                "file_name": "ПП 442.md",
+                "project_id": "project-2",
+                "chat_id": None,
+                "owner_subject": "user-2",
+                "status": "ready",
+            },
+        ]
+        with patch.object(web_ui, "list_all_documents_for_retrieval", return_value=documents):
+            excluded, aliases = web_ui.retrieval_document_scope(
+                {"project_id": "project-1", "owner_subject": "user-1", "knowledge_scope": "project_only"},
+                "chat-1",
+            )
+
+        self.assertEqual(excluded, {"hidden-id_пп 442.md"})
+        self.assertEqual(aliases, {"visible-id_пп 442.md": "ПП 442.md"})
+
+    def test_scope_registry_failure_is_fail_closed(self):
+        with patch.object(
+            web_ui,
+            "list_all_documents_for_retrieval",
+            side_effect=RuntimeError("database unavailable"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "scope is unavailable"):
+                web_ui.retrieval_document_scope(
+                    {"project_id": "project-1", "owner_subject": "user-1"},
+                    "chat-1",
+                )
 
     def test_scoped_context_filter_uses_source_basename(self):
         items = [

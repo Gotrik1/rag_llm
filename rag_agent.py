@@ -695,6 +695,40 @@ def build_targeted_queries(question: str) -> list[str]:
     return deduped[:6]
 
 
+SOURCE_REFERENCE_STOP_WORDS = {
+    "а", "без", "в", "во", "где", "для", "документ", "документа", "и", "из",
+    "как", "какие", "на", "о", "об", "по", "про", "с", "со", "что", "это",
+    "файл", "файле",
+}
+
+
+def source_reference_tokens(value: str) -> set[str]:
+    """Tokenize a question or display filename, including compact ids like ПП442."""
+    name = Path(str(value or "")).stem.casefold().replace("ё", "е")
+    name = re.sub(r"^[0-9a-f]{32}_", "", name)
+    return {
+        token
+        for token in re.findall(r"[a-zа-я]+|\d+", name, flags=re.IGNORECASE)
+        if token not in SOURCE_REFERENCE_STOP_WORDS and (token.isdigit() or len(token) >= 2)
+    }
+
+
+def matching_explicit_sources(question: str, source_aliases: dict[str, str] | None) -> set[str]:
+    """Resolve an explicitly named visible document to its indexed source id."""
+    query_tokens = source_reference_tokens(question)
+    query_numbers = {token for token in query_tokens if token.isdigit() and len(token) >= 2}
+    matches: set[str] = set()
+    for source, alias in (source_aliases or {}).items():
+        alias_tokens = source_reference_tokens(alias)
+        overlap = query_tokens & alias_tokens
+        alpha_overlap = {token for token in overlap if not token.isdigit()}
+        numeric_anchor = bool(query_numbers & alias_tokens and alpha_overlap)
+        descriptive_anchor = len(alpha_overlap) >= 2 and sum(map(len, alpha_overlap)) >= 8
+        if numeric_anchor or descriptive_anchor:
+            matches.add(Path(str(source)).name.casefold())
+    return matches
+
+
 def known_formula_terms() -> tuple[str, ...]:
     return ("ИВ0-1", "ИВ0", "ИВ1", "ИС", "ИВА", "ИВК", "ИВпр", "ИВон", "ИВ")
 
@@ -1465,6 +1499,50 @@ def build_section_documents(text: str, source_path: Path, backend: str) -> list[
                     }),
                 ))
             return documents
+        # Legal Markdown is often exported as plain text: no Markdown headings,
+        # but every normative clause starts at the beginning of a line with a
+        # stable number ("1.", "23.", "159.1.").  Preserve those boundaries so
+        # a re-uploaded regulation has useful point locators and focused chunks.
+        clause_matches = list(re.finditer(
+            r"(?m)^(?P<number>\d{1,4}(?:\.\d{1,4})*)\.\s+(?=\S)",
+            cleaned,
+        ))
+        if len(clause_matches) >= 2:
+            documents: list[Document] = []
+            preamble = cleaned[:clause_matches[0].start()].strip()
+            if preamble:
+                documents.append(Document(
+                    text=preamble,
+                    doc_id=f"{source_path.name}_preamble",
+                    metadata=compact_meta({
+                        "file_name": source_path.name,
+                        "file_path": str(source_path),
+                        "ingestion_backend": backend,
+                        "section_path": "Преамбула",
+                        "section_title": "Преамбула",
+                        "parent_section": "",
+                        "status": "active",
+                        "chunk_type": "unknown",
+                    }),
+                ))
+            for index, match in enumerate(clause_matches):
+                end = clause_matches[index + 1].start() if index + 1 < len(clause_matches) else len(cleaned)
+                body = cleaned[match.start():end].strip()
+                if not body:
+                    continue
+                locator = f"Пункт {match.group('number')}"
+                section_text = f"[SECTION: {locator}]\n{body}"
+                documents.append(Document(
+                    text=section_text,
+                    doc_id=f"{source_path.name}_clause_{match.group('number').replace('.', '_')}_{index}",
+                    metadata=compact_meta({
+                        "file_name": source_path.name,
+                        "file_path": str(source_path),
+                        "ingestion_backend": backend,
+                        **extract_chunk_metadata(section_text),
+                    }),
+                ))
+            return documents
     if not matches:
         meta = {
             "file_name": source_path.name,
@@ -1921,11 +1999,22 @@ def rerank_context_results(results: list[dict], question: str) -> list[dict]:
                 score -= 0.20
 
         for term in requested:
-            score += 0.01 * text.count(term)
+            if term.casefold() in generic_formula_terms:
+                continue
+            # Repetition in a very large regulation chunk is not relevance.
+            # Without a cap a generic word such as "определяется" can add ten
+            # points and drown out the document explicitly named by the user.
+            score += 0.01 * min(text.count(term), 5)
             if term.lower() in section_title:
                 score += 0.10
             if term.lower() in section_path:
                 score += 0.06
+
+        lexical_terms = {
+            term for term in section_query_terms(question)
+            if len(term) >= 5 and term not in generic_formula_terms
+        }
+        score += min(sum(contains_term(lower, term) for term in lexical_terms), 5) * 0.06
 
         if "\\CYR" in text or "<!-- image -->" in text:
             score -= 0.30
@@ -2420,6 +2509,8 @@ class RAGAgent:
         excluded_sources: set[str] | None = None,
         shared_cache_sources: set[str] | None = None,
         shared_system_prompt: str | None = None,
+        source_aliases: dict[str, str] | None = None,
+        priority_sources: set[str] | None = None,
     ) -> tuple[str, list[dict], bool]:
         """
         Возвращает (answer, sources, from_cache).
@@ -2454,6 +2545,8 @@ class RAGAgent:
             spec,
             excluded_sources,
             retrieval_queries=understanding.retrieval_queries,
+            source_aliases=source_aliases,
+            priority_sources=priority_sources,
         )
         if is_document_occurrence_question(understood_question):
             category = price_category_number(understood_question)
@@ -3077,6 +3170,61 @@ class RAGAgent:
         candidates = primary_matches or matches
         return [item for _, item in sorted(candidates, key=lambda pair: pair[0], reverse=True)[:result_limit]]
 
+    def _scoped_lexical_seed_results(
+        self,
+        question: str,
+        source_ids: set[str] | None,
+        *,
+        explicit: bool = False,
+        limit: int = 24,
+    ) -> list[dict]:
+        """Guarantee relevant project/chat chunks enter the candidate pool."""
+        allowed = {Path(str(source)).name.casefold() for source in (source_ids or set())}
+        if not allowed:
+            return []
+        generic = {
+            "документ", "документа", "определяется", "постановление", "правило",
+            "рассказать", "регламент", "согласно",
+        }
+        terms = [
+            term for term in section_query_terms(question)
+            if len(term) >= 4 and term not in generic and not term.isdigit()
+        ]
+        ranked: list[tuple[float, dict]] = []
+        for node in self._all_nodes:
+            meta = node.metadata or {}
+            source = Path(str(meta.get("file_name", meta.get("file_path", "")))).name.casefold()
+            if source not in allowed:
+                continue
+            text = node.text or ""
+            searchable = (
+                f"{meta.get('section_path', '')}\n{meta.get('section_title', '')}\n{text}"
+            ).casefold().replace("ё", "е")
+            matches = sum(contains_term(searchable, term) for term in terms)
+            if terms and not matches:
+                continue
+            chunk_meta = {
+                **extract_chunk_metadata(text),
+                **{
+                    key: value for key, value in meta.items()
+                    if key in {"section_path", "section_title", "parent_section", "status", "chunk_type"}
+                    and value
+                },
+            }
+            if chunk_meta.get("status") == "deleted":
+                continue
+            score = (3.0 if explicit else 0.65) + min(matches, 6) * 0.18
+            ranked.append((score, {
+                "file": meta.get("file_name", meta.get("file_path", "?")),
+                "score": round(score, 4),
+                "text": text,
+                "matched_queries": ["explicit-source" if explicit else "private-scope-lexical"],
+                **chunk_meta,
+            }))
+        return [
+            item for _, item in sorted(ranked, key=lambda pair: pair[0], reverse=True)[:limit]
+        ]
+
     def retrieve_context(
         self,
         question: str,
@@ -3084,6 +3232,8 @@ class RAGAgent:
         spec: PrismQuery | None = None,
         excluded_sources: set[str] | None = None,
         retrieval_queries: tuple[str, ...] | list[str] | None = None,
+        source_aliases: dict[str, str] | None = None,
+        priority_sources: set[str] | None = None,
     ) -> list[dict]:
         """Return chunks after query planning unless a validated plan is supplied."""
         if retrieval_queries is None:
@@ -3092,6 +3242,7 @@ class RAGAgent:
             retrieval_queries = understanding.retrieval_queries
         self._refresh_docstore_if_changed()
         spec = spec or refine_prism_query(question)
+        explicit_sources = matching_explicit_sources(question, source_aliases)
         candidate_k = max(top_k * (12 if excluded_sources else 5), 100 if excluded_sources else 40)
         qe = self._build_query_engine(candidate_k)
         merged: dict[str, dict] = {}
@@ -3130,6 +3281,15 @@ class RAGAgent:
                 query_plan.append(normalized_query)
             if len(query_plan) >= 6:
                 break
+        scoped_seed_sources = explicit_sources or priority_sources
+        for item in self._scoped_lexical_seed_results(
+            question,
+            scoped_seed_sources,
+            explicit=bool(explicit_sources),
+            limit=max(top_k * 3, 24),
+        ):
+            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
+            merged[key] = item
         for query in query_plan:
             nodes = qe.retriever.retrieve(QueryBundle(query_str=query))
             for item in nodes:
@@ -3174,6 +3334,10 @@ class RAGAgent:
         results = [
             item for item in merged.values()
             if Path(str(item.get("file", ""))).name.casefold() not in excluded
+            and (
+                not explicit_sources
+                or Path(str(item.get("file", ""))).name.casefold() in explicit_sources
+            )
             and not contains_prompt_injection(str(item.get("text", "")))
         ]
         ranked = rerank_context_results(results, question)

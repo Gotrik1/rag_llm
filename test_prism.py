@@ -21,6 +21,7 @@ from rag_agent import (
     generate_formula_only_answer,
     generate_extractive_value_answer,
     generate_image_transcription_answer,
+    matching_explicit_sources,
     parse_query_understanding,
     price_category_number,
     refine_prism_query,
@@ -32,6 +33,79 @@ from rag_agent import (
 
 
 class PrismQueryTests(unittest.TestCase):
+    def test_explicit_regulation_reference_resolves_visible_source_alias(self):
+        aliases = {
+            "upload-a_2012-05-04-пп442-функционирование-ррэ.md":
+                "2012-05-04-пп442-функционирование-ррэ.md",
+            "upload-b_методика.docx": "Методика расчета стоимости.docx",
+        }
+
+        matched = matching_explicit_sources(
+            "Как определяется гарантирующий поставщик по ПП 442?",
+            aliases,
+        )
+
+        self.assertEqual(matched, {"upload-a_2012-05-04-пп442-функционирование-ррэ.md"})
+
+    def test_private_scope_lexical_seed_considers_project_document(self):
+        agent = object.__new__(RAGAgent)
+        agent._all_nodes = [
+            SimpleNamespace(
+                metadata={"file_name": "project_pp442.md"},
+                text="Гарантирующий поставщик определяется по правилам розничного рынка.",
+            ),
+            SimpleNamespace(
+                metadata={"file_name": "global_r12.docx"},
+                text="Определяется ставка для балансирующего рынка.",
+            ),
+        ]
+
+        results = agent._scoped_lexical_seed_results(
+            "Как определяется гарантирующий поставщик?",
+            {"project_pp442.md"},
+        )
+
+        self.assertTrue(results)
+        self.assertTrue(all(item["file"] == "project_pp442.md" for item in results))
+
+    def test_plain_legal_markdown_is_split_into_point_locators(self):
+        documents = build_section_documents(
+            "ПОСТАНОВЛЕНИЕ N 442\n\n"
+            "1. Утвердить основные положения розничного рынка.\n"
+            "Продолжение первого пункта.\n"
+            "2. Установить порядок работы гарантирующего поставщика.\n"
+            "159.1. Специальное условие применяется отдельно.",
+            Path("pp442.md"),
+            "text",
+        )
+
+        locators = [document.metadata.get("section_path") for document in documents]
+        self.assertEqual(locators, ["Преамбула", "Пункт 1", "Пункт 2", "Пункт 159.1"])
+        self.assertIn("гарантирующего поставщика", documents[2].text)
+
+    def test_repeated_generic_word_cannot_dominate_reranking(self):
+        results = rerank_context_results(
+            [
+                {
+                    "file": "unrelated.docx",
+                    "score": 0.02,
+                    "text": "определяется " * 2000,
+                    "section_path": "",
+                    "section_title": "",
+                },
+                {
+                    "file": "pp442.md",
+                    "score": 0.01,
+                    "text": "Гарантирующий поставщик определяется в соответствии с ПП 442.",
+                    "section_path": "",
+                    "section_title": "",
+                },
+            ],
+            "Как определяется гарантирующий поставщик по ПП 442?",
+        )
+
+        self.assertEqual(results[0]["file"], "pp442.md")
+
     def test_misspelled_price_category_question_is_understood_as_cost(self):
         question = "что такое 6ЦК и ак она рассчитывается"
 

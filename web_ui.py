@@ -370,38 +370,56 @@ def select_user_facing_sources(answer: str, sources: list[dict]) -> list[dict]:
     return cited or linked
 
 
-def excluded_document_sources(scope: dict, chat_id: str) -> set[str]:
-    """Hide every vector source outside the active user's configured knowledge scope."""
+def retrieval_document_scope(scope: dict, chat_id: str) -> tuple[set[str], dict[str, str]]:
+    """Return exact hidden sources and user-visible aliases for the active scope."""
     try:
         records = list_all_documents_for_retrieval()
-    except Exception:
-        return set()
+    except Exception as exc:
+        # Never fall open: without the registry we cannot prove which private
+        # vector sources belong to the caller.
+        raise RuntimeError("document retrieval scope is unavailable") from exc
     current_project = str(scope.get("project_id") or "")
     current_owner = str(scope.get("owner_subject") or "")
     include_global = not current_project or str(scope.get("knowledge_scope") or "") != "project_only"
     excluded: set[str] = set()
+    visible_aliases: dict[str, str] = {}
     for record in records:
         document_project = str(record.get("project_id") or "")
         document_chat = str(record.get("chat_id") or "")
         document_owner = str(record.get("owner_subject") or "")
         is_global = not document_owner
         is_searchable = not record.get("deleted_at") and str(record.get("status") or "") == "ready"
-        is_visible = is_searchable and (
-            (is_global and include_global)
-            or (
-                document_owner == current_owner
-                and (
-                    bool(current_project and document_project == current_project)
-                    or document_chat == chat_id
-                )
+        if is_global:
+            is_visible = is_searchable and include_global
+        elif document_owner != current_owner:
+            is_visible = False
+        elif document_chat:
+            # A chat attachment remains private to that chat even when the chat
+            # belongs to a project.  Project-wide documents have no chat_id.
+            is_visible = is_searchable and document_chat == chat_id
+        else:
+            is_visible = is_searchable and bool(
+                current_project and document_project == current_project
             )
-        )
+
+        source_path = str(record.get("source_path") or "").strip()
+        file_name = str(record.get("file_name") or "").strip()
+        source_id = Path(source_path or file_name).name.casefold()
+        if not source_id:
+            continue
         if not is_visible:
-            for field in ("source_path", "file_name"):
-                value = str(record.get(field) or "").strip()
-                if value:
-                    excluded.add(Path(value).name.casefold())
-    return excluded
+            # The indexed source is the UUID-prefixed source_path basename.
+            # Excluding the display filename would also hide another user's
+            # visible upload when both files have the same human name.
+            excluded.add(source_id)
+            continue
+        visible_aliases[source_id] = file_name or Path(source_path).name
+    return excluded, visible_aliases
+
+
+def excluded_document_sources(scope: dict, chat_id: str) -> set[str]:
+    """Compatibility wrapper for callers that only need hidden source ids."""
+    return retrieval_document_scope(scope, chat_id)[0]
 
 
 def shared_global_document_sources() -> set[str]:
@@ -1355,8 +1373,12 @@ class Handler(BaseHTTPRequestHandler):
                 "usage": usage_stats(answer, []),
             })
             return
-        excluded_sources = excluded_document_sources(scope, chat_id)
+        excluded_sources, source_aliases = retrieval_document_scope(scope, chat_id)
         shared_sources = shared_global_document_sources()
+        priority_sources = {
+            source for source in source_aliases
+            if Path(source).name.casefold() not in shared_sources
+        }
 
         mode = load_flow_mode()
         agent = get_agent()
@@ -1369,17 +1391,27 @@ class Handler(BaseHTTPRequestHandler):
                 "retrieval_query": retrieval_question,
                 "shared_cache_sources": shared_sources,
                 "shared_system_prompt": profile["prompt"],
+                "source_aliases": source_aliases,
+                "priority_sources": priority_sources,
             }
             if excluded_sources:
                 ask_options["excluded_sources"] = excluded_sources
             answer, sources, from_cache = agent.ask(question, scoped_prompt, profile["id"], **ask_options)
             context = agent.retrieve_context(
-                retrieval_question, TOP_K, excluded_sources=excluded_sources
-            ) if excluded_sources else agent.retrieve_context(retrieval_question, TOP_K)
+                retrieval_question,
+                TOP_K,
+                excluded_sources=excluded_sources or None,
+                source_aliases=source_aliases,
+                priority_sources=priority_sources,
+            )
         elif mode == "rust":
             python_items = agent.retrieve_context(
-                retrieval_question, TOP_K, excluded_sources=excluded_sources
-            ) if excluded_sources else agent.retrieve_context(retrieval_question, TOP_K)
+                retrieval_question,
+                TOP_K,
+                excluded_sources=excluded_sources or None,
+                source_aliases=source_aliases,
+                priority_sources=priority_sources,
+            )
             rust_items = filter_scoped_context(
                 filter_rust_context(retrieval_question, rust_context(retrieval_question)), excluded_sources
             )
@@ -1404,8 +1436,12 @@ class Handler(BaseHTTPRequestHandler):
             } for item in context]
         else:
             python_items = agent.retrieve_context(
-                retrieval_question, TOP_K, excluded_sources=excluded_sources
-            ) if excluded_sources else agent.retrieve_context(retrieval_question, TOP_K)
+                retrieval_question,
+                TOP_K,
+                excluded_sources=excluded_sources or None,
+                source_aliases=source_aliases,
+                priority_sources=priority_sources,
+            )
             rust_items = filter_scoped_context(
                 filter_rust_context(retrieval_question, rust_context(retrieval_question)), excluded_sources
             )

@@ -8,16 +8,20 @@ from rag_agent import (
     RAGAgent,
     build_section_documents,
     build_targeted_queries,
+    contains_price_category,
     detect_query_intent,
     deterministic_query_understanding,
+    diversify_context_results,
     extract_formula_lines_from_texts,
     formula_sibling_results,
     format_formula_for_display,
     format_formula_for_katex,
+    generate_document_occurrence_answer,
     generate_formula_only_answer,
     generate_extractive_value_answer,
     generate_image_transcription_answer,
     parse_query_understanding,
+    price_category_number,
     refine_prism_query,
     rerank_context_results,
     sanitize_grounded_answer,
@@ -46,6 +50,15 @@ class PrismQueryTests(unittest.TestCase):
         self.assertTrue(any("определение" in query for query in queries))
         self.assertTrue(any("расчет стоимости" in query for query in queries))
         self.assertTrue(any("шестая ценовая категория" in query for query in queries))
+
+    def test_document_occurrence_question_is_positive_list_intent(self):
+        understanding = deterministic_query_understanding("В каких документах фигурирует 1ЦК?")
+
+        self.assertIn("list", understanding.facets)
+        self.assertEqual(price_category_number(understanding.canonical_question), "1")
+        self.assertTrue(contains_price_category("Порядок расчета 1 ЦК", "1"))
+        self.assertTrue(contains_price_category("тариф для первой ценовой категории", "1"))
+        self.assertFalse(contains_price_category("Методика расчета 1-6ЦК", "1"))
 
     def test_llm_query_plan_is_validated_and_keeps_identifiers(self):
         plan = parse_query_understanding(
@@ -141,6 +154,7 @@ class PrismQueryTests(unittest.TestCase):
         for method_name in (
             "_procedural_seed_results",
             "_exact_section_seed_results",
+            "_price_category_seed_results",
             "_lexical_section_seed_results",
             "_section_seed_results",
             "_formula_clause_seed_results",
@@ -155,6 +169,92 @@ class PrismQueryTests(unittest.TestCase):
         self.assertIn("6 ЦК определение", searched)
         self.assertIn("6 ЦК расчет стоимости", searched)
         self.assertEqual(result, [])
+
+    def test_price_category_seed_finds_definition_and_calculation_across_documents(self):
+        class Node:
+            def __init__(self, text, metadata):
+                self.text = text
+                self.metadata = metadata
+
+        agent = object.__new__(RAGAgent)
+        agent._all_nodes = [
+            Node(
+                "Шестая ценовая категория предусматривает почасовое планирование.",
+                {"file_name": "categories.docx", "section_path": "Термины"},
+            ),
+            Node(
+                "Стоимость сетевой мощности для 6 ЦК определяется по формуле [MATH: S(сет.6цк,i)=Q(i)×T(i)]",
+                {"file_name": "transfer.docx", "section_path": "5.4 Порядок определения стоимости для 5 и 6 ЦК"},
+            ),
+            Node(
+                "Порядок определения стоимости для 1 ЦК.",
+                {"file_name": "wrong.docx", "section_path": "5.1 Порядок для 1 ЦК"},
+            ),
+            Node(
+                "Для расчета применяется двухставочный тариф.",
+                {"file_name": "network.docx", "section_path": "Тарифы"},
+            ),
+            Node(
+                "Стоимость услуг по передаче определяется по формуле [MATH: S(i)=W(i)×T(i)]",
+                {"file_name": "network.docx", "section_path": "Передача"},
+            ),
+        ]
+
+        seeds = agent._price_category_seed_results("что такое 6ЦК и ак она рассчитывается")
+
+        self.assertEqual({item["file"] for item in seeds}, {"categories.docx", "transfer.docx", "network.docx"})
+        self.assertTrue(any("price-category-related:6" in item["matched_queries"] for item in seeds))
+
+    def test_price_category_rerank_penalizes_other_category_heading(self):
+        results = [
+            {"file": "wrong.docx", "score": 1.0, "section_path": "5.1 Порядок для 1 ЦК", "text": "Общий расчет стоимости."},
+            {"file": "right.docx", "score": 0.2, "section_path": "5.4 Порядок для 5 и 6 ЦК", "text": "Стоимость для 6 ЦК рассчитывается по составляющим.", "matched_queries": ["price-category-exact:6"]},
+        ]
+
+        ranked = rerank_context_results(results, "Как рассчитывается 6 ЦК?")
+
+        self.assertEqual(ranked[0]["file"], "right.docx")
+
+    def test_price_category_diversification_keeps_relevant_sources(self):
+        ranked = [
+            {"file": "a.docx", "score": 3.0, "section_path": "5.1 1 ЦК", "text": "1 ЦК рассчитывается так.", "matched_queries": ["price-category-exact:1"]},
+            {"file": "a.docx", "score": 2.9, "section_path": "5.1 1 ЦК", "text": "Формула 1 ЦК.", "matched_queries": ["price-category-exact:1"]},
+            {"file": "b.docx", "score": 2.0, "section_path": "Передача для 1 ЦК", "text": "Тариф для 1 ЦК."},
+            {"file": "noise.docx", "score": 1.9, "section_path": "Общее", "text": "Здесь категории нет."},
+        ]
+
+        selected = diversify_context_results(ranked, "Как рассчитывается 1 ЦК?", 4)
+        occurrence = diversify_context_results(ranked, "В каких документах фигурирует 1ЦК?", 10)
+
+        self.assertIn("b.docx", {item["file"] for item in selected})
+        self.assertEqual({item["file"] for item in occurrence}, {"a.docx", "b.docx"})
+
+    def test_document_occurrence_answer_never_lists_negative_documents(self):
+        answer = generate_document_occurrence_answer("В каких документах фигурирует 1ЦК?", [
+            {"file": "positive.docx", "section_path": "5.1 1 ЦК", "text": "Расчет 1 ЦК."},
+            {"file": "negative.docx", "section_path": "Общие положения", "text": "Ценовая категория не указана."},
+        ])
+
+        self.assertIn("positive.docx", answer)
+        self.assertNotIn("negative.docx", answer)
+        self.assertNotIn("не указана", answer)
+
+    def test_calculation_question_extracts_docx_math_payloads(self):
+        formulas = extract_formula_lines_from_texts(
+            [
+                "[SECTION: 5.4 Порядок для 6 ЦК]\n"
+                "[MATH: S(э6цк,g,i,n,m)=V(ээ6цк,g,i,n,m)×Ц(пунц6цк,g,i,n,m)]\n"
+                "[MATH: S(пер1ст,i)=W(i)×T(i)]"
+            ],
+            "Как рассчитывается 6 ЦК?",
+        )
+
+        self.assertIn("S(э6цк,g,i,n,m)=V(ээ6цк,g,i,n,m)×Ц(пунц6цк,g,i,n,m)", formulas)
+        self.assertFalse(any("1ст" in formula for formula in formulas))
+        self.assertEqual(
+            format_formula_for_katex(formulas[0], display=True),
+            r"$$S_{\text{э6цк},g,i,n,m}=V_{\text{ээ6цк},g,i,n,m} \times \text{Ц}_{\text{пунц6цк},g,i,n,m}$$",
+        )
 
     def test_lexical_section_seed_finds_long_normative_heading(self):
         class Node:

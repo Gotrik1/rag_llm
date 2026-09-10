@@ -10,6 +10,14 @@ describe("persisted generation state", () => {
     expect(normalizeMarkdown(markdown)).toBe(String.raw`- $\text{ИВ0} = V_{\text{УДГ}} - V_{\text{план.ДГ}}$`);
   });
 
+  it("renders persisted DOCX function notation instead of inline code", () => {
+    const markdown = "Расчет: `S_sub(э1цк,g,i,n,m) = W(ээ,i,n,m) × T(пер1ст,i,n,m)`";
+
+    expect(normalizeMarkdown(markdown)).toBe(
+      String.raw`Расчет: $S_{\text{э1цк},g,i,n,m} = W_{\text{ээ},i,n,m} \times T_{\text{пер1ст},i,n,m}$`
+    );
+  });
+
   it("does not rewrite raw LaTeX examples inside fenced code", () => {
     const markdown = ["```", String.raw`\mathrm{ИВ0} = V_{\mathrm{УДГ}}`, "```"].join("\n");
 

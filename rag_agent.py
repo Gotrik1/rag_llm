@@ -68,7 +68,7 @@ VECTOR_TOP_K     = 12      # кандидатов от вектора
 # A semantic/chunking change must never reuse an older docstore or vector
 # collection: the two indexes must describe precisely the same corpus.
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25_v12"))
-CACHE_VERSION    = "v29-query-understanding"
+CACHE_VERSION    = "v30-price-category-evidence"
 QUERY_UNDERSTANDING_VERSION = "v1"
 MAX_OUTPUT_TOKENS = 4056
 
@@ -247,6 +247,16 @@ def is_formula_question(question: str) -> bool:
     return any(marker in normalized for marker in FORMULA_QUERY_MARKERS)
 
 
+def asks_for_calculation(question: str) -> bool:
+    """Recognise explanatory calculation requests without forcing formula-only mode."""
+    normalized = (question or "").lower().replace("ё", "е")
+    return is_formula_question(question) or bool(re.search(
+        r"\b(?:как\s+(?:(?:она|он|оно|это|ее)\s+)?рассчит\w*|"
+        r"рассчитывается|расчет\w*|порядок\s+расчета)\b",
+        normalized,
+    ))
+
+
 def normalize_user_question(question: str) -> tuple[str, tuple[str, ...]]:
     """Apply only high-confidence corrections before semantic planning."""
     original = re.sub(r"\s+", " ", (question or "").strip())
@@ -270,6 +280,59 @@ def _price_category_variants(question: str) -> list[str]:
     return variants
 
 
+PRICE_CATEGORY_WORDS = {
+    "1": "первая", "2": "вторая", "3": "третья",
+    "4": "четвертая", "5": "пятая", "6": "шестая",
+}
+PRICE_CATEGORY_STEMS = {
+    "1": "перв", "2": "втор", "3": "трет",
+    "4": "четверт", "5": "пят", "6": "шест",
+}
+
+
+def price_category_number(value: str) -> str | None:
+    """Return the explicitly requested numeric price category, if present."""
+    match = re.search(r"(?i)(?<![а-яёa-z0-9])(\d+)\s*цк(?![а-яёa-z0-9])", value or "")
+    return match.group(1) if match else None
+
+
+def contains_price_category(value: str, number: str) -> bool:
+    """Match one category, excluding range-only labels such as ``1-6 ЦК``."""
+    normalized = (value or "").lower().replace("ё", "е")
+    numeric = re.compile(rf"(?<![\d-]){re.escape(number)}\s*цк(?![а-яa-z0-9])", re.IGNORECASE)
+    if numeric.search(normalized):
+        return True
+    numeric_expanded = re.compile(
+        rf"(?<![\d-]){re.escape(number)}(?:-?[яй])?\s+ценов\w*\s+категор\w*\b",
+        re.IGNORECASE,
+    )
+    if numeric_expanded.search(normalized):
+        return True
+    stem = PRICE_CATEGORY_STEMS.get(number)
+    return bool(stem and re.search(rf"\b{stem}\w*\s+ценов\w*\s+категор\w*\b", normalized))
+
+
+def price_category_item_matches(item: dict, number: str) -> bool:
+    haystack = "\n".join([
+        str(item.get("section_path", "")),
+        str(item.get("section_title", "")),
+        str(item.get("text", "")),
+    ])
+    return contains_price_category(haystack, number)
+
+
+def is_document_occurrence_question(question: str) -> bool:
+    normalized = (question or "").lower().replace("ё", "е")
+    return bool(
+        price_category_number(normalized)
+        and re.search(
+            r"\b(?:в\s+каких\s+документ\w*|какие\s+документ\w*|"
+            r"где\s+(?:фигурир\w*|упомина\w*|встреча\w*)|перечисл\w*\s+документ\w*)\b",
+            normalized,
+        )
+    )
+
+
 def deterministic_query_understanding(question: str) -> QueryUnderstanding:
     """Produce a useful plan when the LLM planner is unavailable or malformed."""
     canonical, corrections = normalize_user_question(question)
@@ -286,6 +349,12 @@ def deterministic_query_understanding(question: str) -> QueryUnderstanding:
         facets.append("procedure")
     if re.search(r"\b(?:услови\w*|огранич\w*|требован\w*)\b", normalized):
         facets.append("conditions")
+    if re.search(
+        r"\b(?:в\s+каких\s+документ\w*|какие\s+документ\w*|"
+        r"где\s+(?:фигурир\w*|упомина\w*|встреча\w*)|перечисл\w*\s+документ\w*)\b",
+        normalized,
+    ):
+        facets.append("list")
     if not facets:
         facets.append("fact")
 
@@ -690,12 +759,95 @@ def contains_term(value: str, term: str) -> bool:
 def diversify_context_results(ranked: list[dict], question: str, top_k: int) -> list[dict]:
     requested = sorted(requested_formula_terms(question), key=lambda value: (-len(value), value))
     section_numbers = requested_section_numbers(question)
+    category = price_category_number(question)
+    category_matches = [item for item in ranked if category and price_category_item_matches(item, category)]
+
+    # This is a positive set lookup: one strongest direct hit per document,
+    # without padding the result with documents that do not contain the entity.
+    if category and is_document_occurrence_question(question):
+        per_source: dict[str, dict] = {}
+        for item in category_matches:
+            source = user_facing_source_name(item.get("file", "")).casefold()
+            per_source.setdefault(source, item)
+        return list(per_source.values())[:top_k]
+
     selected: list[dict] = []
     selected_ids: set[int] = set()
 
     def add(item: dict) -> None:
         selected.append(item)
         selected_ids.add(id(item))
+
+    if category:
+        # Keep the best definition/calculation clauses, then ensure every other
+        # relevant document gets a chance to contribute evidence.
+        stem = PRICE_CATEGORY_STEMS.get(category, "")
+        if "definition" in deterministic_query_understanding(question).facets and stem:
+            definition = next((
+                item for item in category_matches
+                if re.search(
+                    rf"\b{stem}\w*\s+ценов\w*\s+категор\w*\s*[-–—]",
+                    "\n".join((
+                        str(item.get("section_path", "")),
+                        str(item.get("section_title", "")),
+                        str(item.get("text", "")),
+                    )).lower().replace("ё", "е"),
+                )
+            ), None)
+            if definition is not None:
+                add(definition)
+        if asks_for_calculation(question):
+            calculation = next((
+                item for item in category_matches
+                if any(
+                    contains_price_category(formula, category)
+                    for formula in re.findall(r"\[MATH:\s*([^\]\n]+)\]", str(item.get("text", "")))
+                )
+            ), None) or next((
+                item for item in category_matches
+                if "[math:" in str(item.get("text", "")).lower()
+            ), None) or next((
+                item for item in category_matches
+                if "порядок определения стоимости" in (
+                    f"{item.get('section_path', '')}\n{item.get('section_title', '')}\n{item.get('text', '')}"
+                ).lower().replace("ё", "е")
+            ), None)
+            if calculation is not None and id(calculation) not in selected_ids:
+                add(calculation)
+        for item in category_matches:
+            if len(selected) >= min(3, top_k):
+                break
+            matched = item.get("matched_queries", [])
+            if any(str(query).startswith("price-category-exact:") for query in matched):
+                add(item)
+        selected_sources = {
+            user_facing_source_name(item.get("file", "")).casefold()
+            for item in selected
+        }
+        for item in category_matches:
+            if len(selected) >= top_k:
+                break
+            source = user_facing_source_name(item.get("file", "")).casefold()
+            if source not in selected_sources and id(item) not in selected_ids:
+                add(item)
+                selected_sources.add(source)
+        if asks_for_calculation(question):
+            for item in ranked:
+                if len(selected) >= top_k or len(selected_sources) >= 6:
+                    break
+                source = user_facing_source_name(item.get("file", "")).casefold()
+                if source in selected_sources or item.get("status") == "deleted":
+                    continue
+                leaf_scope = str(item.get("section_title") or item.get("section_path", "").rsplit(">", 1)[-1])
+                leaf_categories = {
+                    number for number in PRICE_CATEGORY_WORDS
+                    if contains_price_category(leaf_scope, number)
+                }
+                if leaf_categories and category not in leaf_categories:
+                    continue
+                if float(item.get("score", 0.0)) >= 0.5:
+                    add(item)
+                    selected_sources.add(source)
 
     if section_numbers:
         for item in ranked:
@@ -891,6 +1043,32 @@ def format_formula_for_display(formula: str) -> str:
 def format_formula_for_katex(formula: str, *, display: bool = False) -> str:
     """Return valid KaTeX for a legacy formula when possible."""
     value = clean_formula_artifacts(formula).replace("$", "")
+    # OCR/DOCX extraction often serializes indices as S(name,i,n,m). Convert
+    # that notation to real subscripts instead of displaying source-like code.
+    if "\\" not in value:
+        def indexed_symbol(match: re.Match) -> str:
+            symbol = match.group(1)
+            raw_parts = [part.strip().strip(",") for part in match.group(2).split(",")]
+            parts: list[str] = []
+            for part in raw_parts:
+                if not part:
+                    continue
+                escaped = part.replace("{", "").replace("}", "").replace("_", " ")
+                parts.append(f"\\text{{{escaped}}}" if re.search(r"[А-Яа-яЁё]", escaped) else escaped)
+            rendered_symbol = f"\\text{{{symbol}}}" if re.search(r"[А-Яа-яЁё]", symbol) else symbol
+            return f"{rendered_symbol}_{{{','.join(parts)}}}"
+
+        value = re.sub(
+            r"(?<![\\\w])([A-Za-zА-Яа-яЁёΔЦ][A-Za-zА-Яа-яЁё0-9]*)_sub\(([^()\n]{1,180})\)",
+            indexed_symbol,
+            value,
+        )
+        value = re.sub(
+            r"(?<![\\\w])([A-Za-zА-Яа-яЁёΔЦ][A-Za-zА-Яа-яЁё0-9]*)\(([^()\n]{1,180})\)",
+            indexed_symbol,
+            value,
+        )
+        value = re.sub(r"\s*[×*]\s*", r" \\times ", value)
     value = value.replace("\\_", "_").replace("\\ ", " ").replace("\\.", ".")
     # Every legacy ``\\mathrm`` payload here is a flat Word run.  Rendering it
     # as ``\\text`` lets KaTeX display Cyrillic labels without treating them as
@@ -1001,6 +1179,28 @@ def human_source_reference(item: dict) -> str:
         f"{user_facing_source_name(item.get('file', ''))} — "
         f"{source_locator(item.get('section_path', item.get('section', '')), item.get('page_number'))}"
     )
+
+
+def generate_document_occurrence_answer(question: str, context: list[dict]) -> str:
+    """List only documents with a confirmed direct occurrence of the entity."""
+    category = price_category_number(question)
+    if not category:
+        return ""
+    positive: dict[str, dict] = {}
+    for item in context:
+        if not price_category_item_matches(item, category):
+            continue
+        name = user_facing_source_name(item.get("file", ""))
+        positive.setdefault(name.casefold(), item)
+    if not positive:
+        return f"В доступных документах прямых упоминаний {category} ЦК не найдено."
+
+    lines = [f"{category} ЦК прямо упоминается в следующих документах:", ""]
+    for item in positive.values():
+        name = user_facing_source_name(item.get("file", ""))
+        locator = source_locator(item.get("section_path", item.get("section", "")), item.get("page_number"))
+        lines.append(f"- **{name}** — {locator}. [Источник: {human_source_reference(item)}]")
+    return "\n".join(lines)
 
 
 def generate_image_transcription_answer(question: str, context: list[dict]) -> str:
@@ -1317,7 +1517,9 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
     seen: set[str] = set()
     requested = requested_formula_terms(question)
     intent = detect_query_intent(question)
-    formula_request = is_formula_question(question)
+    formula_request = asks_for_calculation(question)
+    explicit_formula_request = is_formula_question(question)
+    category = price_category_number(question)
     question_terms = tuple(term.replace("ё", "е") for term in section_query_terms(question))
     generic_formula_terms = {
         "формуле", "формулу", "формулы", "формул", "определяется",
@@ -1333,6 +1535,11 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
         minimum_length = 5 if "=" in candidate else 20
         if not candidate or len(candidate) < minimum_length:
             return
+        if "=" in candidate and re.search(
+            r"(?:[×*]\s*,\s*\+\s*,\s*-|,\s*\+\s*,\s*-|[×*]\s*[×*])",
+            candidate,
+        ):
+            return
         if requested and not requested_term_already_matched and not any(contains_term(candidate, term) for term in requested):
             return
         key = re.sub(r"\W+", "", candidate.lower())[:220]
@@ -1346,6 +1553,31 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
         searchable = cleaned.lower().replace("ё", "е")
 
         if formula_request:
+            direct_category_match = bool(category and contains_price_category(cleaned, category))
+            category_scope_relevant = direct_category_match or bool(re.search(
+                r"(?:стоимост\w*\s+услуг\w*\s+по\s+передач|тариф\w*\s+на\s+услуг\w*\s+по\s+передач)",
+                searchable,
+            ))
+            for formula in re.findall(r"\[MATH:\s*([^\]\n]+)\]", raw):
+                normalized_formula = formula.lower().replace(" ", "")
+                formula_categories = {
+                    number for number in PRICE_CATEGORY_WORDS
+                    if contains_price_category(formula, number)
+                }
+                if (
+                    "=" in formula
+                    and not (category == "1" and "2ст" in normalized_formula)
+                    and not (category == "6" and "1ст" in normalized_formula)
+                    and (not category or category_scope_relevant)
+                    and (not category or not formula_categories or category in formula_categories)
+                ):
+                    add(formula, requested_term_already_matched=direct_category_match)
+            if calculations and category and len(calculations) >= 8:
+                return calculations[:8]
+            if category:
+                # Narrative and tables remain in the grounded context; only
+                # actual Word equation payloads belong in the formula block.
+                continue
             derived_formula = derive_worded_formula(question, cleaned)
             if derived_formula:
                 add(derived_formula, requested_term_already_matched=True)
@@ -1358,7 +1590,7 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
             for equation in markdown_equations:
                 if "=" in equation:
                     add(equation)
-                    if calculations:
+                    if calculations and explicit_formula_request and not category:
                         return calculations[:1]
             linked_formulas = re.findall(
                 r"\[FORMULA\]\s*(?:#{1,6}\s*)?([^\n]+)",
@@ -1367,7 +1599,8 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
             for formula in linked_formulas:
                 if "=" in formula:
                     add(formula)
-                    return calculations[:1]
+                    if explicit_formula_request and not category:
+                        return calculations[:1]
             # Prefer a compact equality from a section that actually matches the
             # question.  This prevents a formula-only answer from turning into a
             # dump of adjacent narrative rules.
@@ -1381,7 +1614,8 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
                 )
                 if equations:
                     add(equations[0])
-                    return calculations[:1]
+                    if explicit_formula_request and not category:
+                        return calculations[:1]
                 # In the RAG Markdown, a normative rule can be the heading
                 # itself (with no following paragraph). Keep that wording as
                 # the evidence instead of discarding it as section metadata.
@@ -1431,7 +1665,7 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
                     return calculations[:12]
             # For a formula request, one clause with strong lexical coverage is
             # safer than concatenating neighbouring formulas from other rules.
-            if formula_request and enough_overlap and calculations:
+            if explicit_formula_request and enough_overlap and calculations and not category:
                 return calculations[:1]
 
     return calculations[:12]
@@ -1439,7 +1673,7 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
 
 def formula_sibling_results(nodes: list, merged: dict[str, dict], question: str) -> list[dict]:
     """Add formula chunks from a source already retrieved for a compound query."""
-    if not is_formula_question(question) or not merged:
+    if not asks_for_calculation(question) or price_category_number(question) or not merged:
         return []
 
     def canonical_source(value: object) -> str:
@@ -1569,6 +1803,7 @@ def rerank_context_results(results: list[dict], question: str) -> list[dict]:
     requested = requested_formula_terms(question)
     normalized_question = question.lower().replace("ё", "е")
     formula_request = is_formula_question(question)
+    category = price_category_number(question)
     generic_formula_terms = {
         "формуле", "определяется", "ставка", "объемов", "собственной", "инициативе",
     }
@@ -1589,6 +1824,29 @@ def rerank_context_results(results: list[dict], question: str) -> list[dict]:
         section_title = str(item.get("section_title", "")).lower()
         chunk_type = item.get("chunk_type", "unknown")
         status = item.get("status", "active")
+
+        if category:
+            section_scope = f"{section_path}\n{section_title}"
+            leaf_scope = section_title or section_path.rsplit(">", 1)[-1]
+            direct_body = contains_price_category(text, category)
+            direct_section = contains_price_category(section_scope, category)
+            if direct_section:
+                score += 1.10
+            if direct_body:
+                score += 0.55
+            if any(
+                str(query).startswith(f"price-category-exact:{category}")
+                for query in item.get("matched_queries", [])
+            ):
+                score += 0.85
+            leaf_categories = {
+                number for number in PRICE_CATEGORY_WORDS
+                if contains_price_category(leaf_scope, number)
+            }
+            if leaf_categories and category not in leaf_categories:
+                score -= 2.50
+            if not (direct_section or direct_body):
+                score -= 0.80
 
         if formula_request and formula_terms:
             matches = sum(contains_term(lower, term) for term in formula_terms)
@@ -1750,7 +2008,26 @@ def sanitize_grounded_answer(answer: str, question: str, allowed_calculations: l
         answer,
     )
     answer = re.sub(r"(?im)^.*учредител\w*\s+пдг.*(?:\n|$)", "", answer)
-    answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
+    # Never expose formula notation as inline code. Convert model-emitted
+    # equalities to math delimiters so the React client renders them with KaTeX.
+    answer = re.sub(
+        r"`([^`\n]{1,500}=[^`\n]{1,500})`",
+        lambda match: format_formula_for_katex(match.group(1)),
+        answer,
+    )
+    rendered_lines: list[str] = []
+    for line in answer.splitlines():
+        stripped = line.strip()
+        candidate = re.sub(r"^[-*]\s+", "", stripped)
+        if (
+            "=" in candidate
+            and "$" not in candidate
+            and re.match(r"^[A-Za-zА-Яа-яЁёΔЦ][\wА-Яа-яЁё]*(?:\([^\n]+\)|_\{[^\n]+\})\s*=", candidate)
+        ):
+            rendered_lines.append(format_formula_for_katex(candidate, display=True))
+        else:
+            rendered_lines.append(line)
+    answer = re.sub(r"\n{3,}", "\n\n", "\n".join(rendered_lines)).strip()
     return answer
 
 
@@ -2147,15 +2424,27 @@ class RAGAgent:
             excluded_sources,
             retrieval_queries=understanding.retrieval_queries,
         )
+        if is_document_occurrence_question(understood_question):
+            category = price_category_number(understood_question)
+            context = [
+                item for item in context
+                if category and price_category_item_matches(item, category)
+            ]
         calculations = extract_formula_lines_from_texts([item["text"] for item in context], understood_question)
-        answer = self._generate_grounded_answer(
-            question,
-            context,
-            calculations,
-            spec,
-            system_prompt,
-            evidence_question=understood_question,
+        answer = (
+            generate_document_occurrence_answer(understood_question, context)
+            if is_document_occurrence_question(understood_question)
+            else ""
         )
+        if not answer:
+            answer = self._generate_grounded_answer(
+                question,
+                context,
+                calculations,
+                spec,
+                system_prompt,
+                evidence_question=understood_question,
+            )
 
         sources = [{
             "file": item["file"],
@@ -2198,14 +2487,12 @@ class RAGAgent:
         )
         normalized_question = question.lower()
         is_procedural = bool(re.search(r"\bкак\s+(создать|настроить|добавить|открыть|заполнить|изменить)\b", normalized_question))
-        is_calculation_question = not is_procedural and any(
-            marker in normalized_question
-            for marker in ("как рассчитыва", "формула", "расчетное правило", "расчётное правило")
-        )
+        is_calculation_question = not is_procedural and asks_for_calculation(evidence_question or question)
         calculations_block = ""
         if is_calculation_question and calculations:
             calculations_block = "\nРАЗРЕШЕННЫЕ РАСЧЕТНЫЕ ПРАВИЛА:\n" + "\n".join(
-                f"- {calculation}" for calculation in calculations
+                f"- {format_formula_for_katex(calculation, display=True) if '=' in calculation else calculation}"
+                for calculation in calculations
             )
         interpretation_block = ""
         if evidence_question and evidence_question.strip() != question.strip():
@@ -2218,6 +2505,7 @@ class RAGAgent:
 
 Ниже приведены данные для ответа. Используй их как единственный фактический контекст: не выдумывай сведения, которых в нём нет. Всегда отвечай на русском языке.
 После каждого самостоятельного факта или группы пунктов ставь ровно одну цитату из соответствующего блока контекста в формате [Источник: имя файла — точный раздел или пункт]. Не заменяй точный раздел названием документа и не повторяй одну и ту же цитату подряд.
+Если вопрос о расчете, объясни порядок и используй все относящиеся к нему документы. Каждую формулу выводи отдельным блоком только в корректном LaTeX между $$ и $$; никогда не помещай формулу в обратные кавычки и не показывай служебную запись вида S(...), W(...), T(...).
 
 КОНТЕКСТ:
 {context_text}
@@ -2495,6 +2783,102 @@ class RAGAgent:
                 seeds.append(best[1])
         return seeds
 
+    def _price_category_seed_results(self, question: str, limit: int = 60) -> list[dict]:
+        """Seed direct definition and calculation clauses for one price category."""
+        category = price_category_number(question)
+        if not category:
+            return []
+        source_signals: dict[str, dict[str, bool]] = {}
+        for node in self._all_nodes:
+            meta = node.metadata or {}
+            source = user_facing_source_name(meta.get("file_name", meta.get("file_path", "?"))).casefold()
+            lower = (
+                f"{meta.get('section_path', '')}\n{meta.get('section_title', '')}\n{node.text or ''}"
+            ).lower().replace("ё", "е")
+            signals = source_signals.setdefault(source, {
+                "category": False, "transfer": False, "one_rate": False, "two_rate": False,
+            })
+            signals["category"] = signals["category"] or contains_price_category(lower, category)
+            signals["transfer"] = signals["transfer"] or "передач" in lower
+            signals["one_rate"] = signals["one_rate"] or "одноставоч" in lower
+            signals["two_rate"] = signals["two_rate"] or "двухставоч" in lower
+        ranked: list[tuple[float, dict]] = []
+        for node in self._all_nodes:
+            meta = node.metadata or {}
+            text = node.text or ""
+            section_path = str(meta.get("section_path", ""))
+            section_title = str(meta.get("section_title", ""))
+            section_haystack = f"{section_path}\n{section_title}"
+            body_match = contains_price_category(text, category)
+            section_match = contains_price_category(section_haystack, category)
+            lower = f"{section_haystack}\n{text}".lower().replace("ё", "е")
+            source = user_facing_source_name(meta.get("file_name", meta.get("file_path", "?"))).casefold()
+            signals = source_signals.get(source, {})
+            related_source = bool(
+                signals.get("transfer")
+                and (signals.get("one_rate") if category == "1" else signals.get("two_rate") if category == "6" else False)
+            )
+            related_transfer = related_source and any(
+                marker in lower for marker in (
+                    "стоимость услуг по передаче",
+                    "стоимости услуг по передаче",
+                    "тариф на услуги по передаче",
+                    "одноставоч",
+                    "двухставоч",
+                )
+            ) or (
+                category == "1" and "одноставоч" in lower and "передач" in lower
+            ) or (
+                category == "6" and "двухставоч" in lower and "передач" in lower
+            )
+            if not (body_match or section_match or related_transfer):
+                continue
+            chunk_meta = {
+                **extract_chunk_metadata(text),
+                **{key: value for key, value in meta.items() if key in {
+                    "section_path", "section_title", "parent_section", "status", "chunk_type",
+                } and value},
+            }
+            if chunk_meta.get("status") == "deleted":
+                continue
+            score = 3.0 if (body_match or section_match) else 4.0
+            if section_match:
+                score += 2.0
+            if body_match:
+                score += 1.0
+            stem = PRICE_CATEGORY_STEMS.get(category, "")
+            if stem and re.search(rf"\b{stem}\w*\s+ценов\w*\s+категор\w*\b", lower):
+                score += 6.0
+            if "порядок определения стоимости" in lower:
+                score += 1.8
+            if any(marker in lower for marker in ("рассчитывается", "определяется по формуле", "[math:", "[formula]")):
+                score += 1.4
+            if any(marker in lower for marker in ("стоимость электроэнергии", "покупной мощности", "сетевой мощности")):
+                score += 0.7
+            item = {
+                "file": meta.get("file_name", meta.get("file_path", "?")),
+                "score": round(score, 4),
+                "text": text,
+                "matched_queries": [
+                    f"price-category-exact:{category}"
+                    if (body_match or section_match)
+                    else f"price-category-related:{category}"
+                ],
+                **chunk_meta,
+            }
+            ranked.append((score, item))
+        selected: list[dict] = []
+        per_source: dict[str, int] = {}
+        for _, item in sorted(ranked, key=lambda pair: pair[0], reverse=True):
+            source = user_facing_source_name(item.get("file", "")).casefold()
+            if per_source.get(source, 0) >= 12:
+                continue
+            selected.append(item)
+            per_source[source] = per_source.get(source, 0) + 1
+            if len(selected) >= limit:
+                break
+        return selected
+
     def _formula_clause_seed_results(self, question: str) -> list[dict]:
         """Seed the clause whose wording most exactly matches a formula request."""
         normalized = question.lower().replace("ё", "е")
@@ -2680,6 +3064,11 @@ class RAGAgent:
             merged[key] = item
         concept_seeds = self._regulation_concept_seed_results(question)
         for item in concept_seeds:
+            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
+            merged[key] = item
+        # Run exact category seeding last so broad lexical/section seeds cannot
+        # overwrite its stronger score and provenance for the same chunk.
+        for item in self._price_category_seed_results(question):
             key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
             merged[key] = item
         query_candidates = [*(retrieval_queries or ()), *build_targeted_queries(question)]

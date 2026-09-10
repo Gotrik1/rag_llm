@@ -2231,7 +2231,29 @@ function MarkdownAnswer({ markdown, sources = [] }: { markdown: string; sources?
 
 const legacyLatexCommand = /\\(?:mathrm|text|frac|sqrt|sum|prod|min|max|Delta|cdot|times)\b/;
 
+function plainFormulaToLatex(formula: string): string {
+  return formula
+    .replace(
+      /(?<![\\\p{L}\p{N}_])([A-Za-zА-Яа-яЁёΔЦ][A-Za-zА-Яа-яЁё0-9]*)(?:_sub)?\(([^()\n]{1,180})\)/gu,
+      (_whole, symbol: string, rawIndices: string) => {
+        const renderedSymbol = /[А-Яа-яЁё]/.test(symbol) ? `\\text{${symbol}}` : symbol;
+        const indices = rawIndices
+          .split(",")
+          .map((value) => value.trim().replace(/[{}_]/g, " ").trim())
+          .filter(Boolean)
+          .map((value) => /[А-Яа-яЁё]/.test(value) ? `\\text{${value}}` : value)
+          .join(",");
+        return `${renderedSymbol}_{${indices}}`;
+      }
+    )
+    .replace(/\s*[×*]\s*/g, " \\times ")
+    .trim();
+}
+
 function normalizeLegacyLatexLine(line: string): string {
+  line = line.replace(/`([^`\n]{1,500}=[^`\n]{1,500})`/g, (_whole, formula: string) => (
+    `$${plainFormulaToLatex(formula)}$`
+  ));
   if (line.includes("$") || !line.includes("=") || !legacyLatexCommand.test(line)) return line;
   const match = line.match(/^(\s*(?:[-*+]\s+)?)(.+)$/);
   if (!match) return line;

@@ -357,9 +357,19 @@ def build() -> None:
         bullet = re.match(r"^-\s+(.+)$", stripped)
         if bullet:
             flush_buffer()
-            p = doc.add_paragraph(style="List Bullet")
-            add_inline(p, bullet.group(1))
+            parts = [bullet.group(1)]
             index += 1
+            while index < len(lines):
+                continuation = lines[index]
+                if not continuation.strip():
+                    break
+                if continuation.startswith("  ") and not continuation.strip().startswith("-"):
+                    parts.append(continuation.strip())
+                    index += 1
+                    continue
+                break
+            p = doc.add_paragraph(style="List Bullet")
+            add_inline(p, " ".join(parts))
             continue
         numbered = re.match(r"^(\d+)\.\s+(.+)$", stripped)
         if numbered:

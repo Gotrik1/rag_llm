@@ -685,6 +685,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [documentsError, setDocumentsError] = useState("");
   const [isLoadingDocuments, setIsLoadingDocuments] = useState(false);
+  const [deletingDocumentIds, setDeletingDocumentIds] = useState<string[]>([]);
   const [models, setModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState("");
   const [modelError, setModelError] = useState("");
@@ -1002,6 +1003,25 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     }
   }, [activeChatId, activeProjectId, projects, syncWorkspace]);
 
+  const deleteDocument = useCallback(async (document: DocumentRecord) => {
+    const scope = document.chat_id ? "из этого чата" : document.project_id ? "из проекта" : "из общей библиотеки";
+    if (!window.confirm(`Удалить документ «${document.file_name}» ${scope}? Он перестанет участвовать в ответах.`)) return;
+    setDeletingDocumentIds((current) => current.includes(document.id) ? current : [...current, document.id]);
+    setDocumentsError("");
+    try {
+      await deleteJson<{ id: string; status: "deleting"; job_id: string }>(
+        `/api/documents/${document.id}`,
+        API_TIMEOUT_MS
+      );
+      setDocuments((current) => current.filter((item) => item.id !== document.id));
+    } catch (error) {
+      setDocumentsError(error instanceof Error ? error.message : "Не удалось удалить документ");
+      await loadDocuments(activeProjectId, activeChatId).catch(() => undefined);
+    } finally {
+      setDeletingDocumentIds((current) => current.filter((id) => id !== document.id));
+    }
+  }, [activeChatId, activeProjectId, loadDocuments]);
+
   const moveChat = useCallback(async (chatId: string, projectId: string): Promise<boolean> => {
     const chat = chats.find((item) => item.id === chatId);
     if (!chat) return false;
@@ -1218,6 +1238,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
             chats={chats}
             documents={documents}
             documentsError={documentsError}
+            deletingDocumentIds={deletingDocumentIds}
             isLoadingDocuments={isLoadingDocuments}
             pinnedChatIds={pinnedChatIds}
             pinnedProjectIds={pinnedProjectIds}
@@ -1227,12 +1248,14 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
             onChatDelete={(chatId) => void deleteChat(chatId)}
             onChatPin={(chatId) => void updatePinnedItems("chat", chatId)}
             onChatRename={(chatId, title) => void renameChat(chatId, title)}
+            onDocumentDelete={(document) => void deleteDocument(document)}
             onProjectChange={(projectId) => void selectProject(projectId)}
             onProjectChatCreate={(projectId) => void createChat(projectId)}
             onProjectCreate={() => void createProject()}
             onProjectDelete={(projectId) => void deleteProject(projectId)}
             onProjectPin={(projectId) => void updatePinnedItems("project", projectId)}
             onProjectRename={(projectId, name) => void renameProject(projectId, name)}
+            canDeleteGlobalDocuments={user.is_admin}
           />
           {workspaceError && <div className="sidebar-note">{workspaceError}</div>}
           <div className="sidebar-user">
@@ -1310,6 +1333,7 @@ function NavigationSidebar({
   chats,
   documents,
   documentsError,
+  deletingDocumentIds,
   isLoadingDocuments,
   pinnedChatIds,
   pinnedProjectIds,
@@ -1319,18 +1343,21 @@ function NavigationSidebar({
   onChatMove,
   onChatPin,
   onChatRename,
+  onDocumentDelete,
   onProjectChange,
   onProjectChatCreate,
   onProjectCreate,
   onProjectDelete,
   onProjectPin,
-  onProjectRename
+  onProjectRename,
+  canDeleteGlobalDocuments
 }: {
   activeChatId: string;
   activeProjectId: string;
   chats: ChatSummary[];
   documents: DocumentRecord[];
   documentsError: string;
+  deletingDocumentIds: string[];
   isLoadingDocuments: boolean;
   pinnedChatIds: string[];
   pinnedProjectIds: string[];
@@ -1340,12 +1367,14 @@ function NavigationSidebar({
   onChatMove: (chatId: string, projectId: string) => Promise<boolean>;
   onChatPin: (chatId: string) => void;
   onChatRename: (chatId: string, title: string) => void;
+  onDocumentDelete: (document: DocumentRecord) => void;
   onProjectChange: (projectId: string) => void;
   onProjectChatCreate: (projectId: string) => void;
   onProjectCreate: () => void;
   onProjectDelete: (projectId: string) => void;
   onProjectPin: (projectId: string) => void;
   onProjectRename: (projectId: string, name: string) => void;
+  canDeleteGlobalDocuments: boolean;
 }) {
   const [showAllProjects, setShowAllProjects] = useState(false);
   const [expandedProjectIds, setExpandedProjectIds] = useState<string[]>([]);
@@ -1442,29 +1471,42 @@ function NavigationSidebar({
     <div className="nav-document-list" aria-live="polite">
       {!isLoadingDocuments && !documentsError && !items.length ? <div className="sidebar-empty">{emptyCopy}</div> : null}
       {items.map((document) => (
-        <a
-          className="nav-document"
-          href={`/api/documents/${document.id}/content`}
-          key={document.id}
-          rel="noreferrer"
-          target="_blank"
-          title={`${document.file_name}. ${documentUploadedLabel(document.created_at)}. ${documentVersionLabel(document)}`}
-        >
-          {/\.(?:png|jpe?g|webp|tiff?|bmp)$/i.test(document.file_name) ? <ImageIcon size={15} /> : <FileText size={15} />}
-          <span className="nav-document-copy">
-            <span className="nav-document-name">{document.file_name}</span>
-            <span className="nav-document-meta">
-              {documentUploadedLabel(document.created_at)} · {document.chat_id ? "только этот чат" : documentVersionLabel(document)}
+        <div className="nav-document-row" key={document.id}>
+          <a
+            className="nav-document"
+            href={`/api/documents/${document.id}/content`}
+            rel="noreferrer"
+            target="_blank"
+            title={`${document.file_name}. ${documentUploadedLabel(document.created_at)}. ${documentVersionLabel(document)}`}
+          >
+            {/\.(?:png|jpe?g|webp|tiff?|bmp)$/i.test(document.file_name) ? <ImageIcon size={15} /> : <FileText size={15} />}
+            <span className="nav-document-copy">
+              <span className="nav-document-name">{document.file_name}</span>
+              <span className="nav-document-meta">
+                {documentUploadedLabel(document.created_at)} · {document.chat_id ? "только этот чат" : documentVersionLabel(document)}
+              </span>
             </span>
-          </span>
-          <span className={`nav-document-status ${document.status}`}>
-            {document.status === "ready"
-              ? "Готов"
-              : document.status === "processing"
-                ? `${document.processing_state?.progress ?? 0}%`
-                : document.status}
-          </span>
-        </a>
+            <span className={`nav-document-status ${document.status}`}>
+              {document.status === "ready"
+                ? "Готов"
+                : document.status === "processing"
+                  ? `${document.processing_state?.progress ?? 0}%`
+                  : document.status}
+            </span>
+          </a>
+          {(document.scope !== "global" || canDeleteGlobalDocuments) ? (
+            <button
+              aria-label={`Удалить документ ${document.file_name}`}
+              className="nav-document-delete"
+              disabled={deletingDocumentIds.includes(document.id)}
+              onClick={() => onDocumentDelete(document)}
+              title="Удалить документ"
+              type="button"
+            >
+              {deletingDocumentIds.includes(document.id) ? <RefreshCw className="spin" size={14} /> : <Trash2 size={14} />}
+            </button>
+          ) : null}
+        </div>
       ))}
     </div>
   );

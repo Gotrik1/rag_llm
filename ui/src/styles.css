@@ -1148,6 +1148,14 @@ textarea {
   scrollbar-color: #363636 transparent;
 }
 
+.nav-document-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  min-width: 0;
+  align-items: center;
+  gap: 2px;
+}
+
 .nav-document {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
@@ -1157,6 +1165,30 @@ textarea {
   color: #dce5ef;
   padding: 7px 6px;
   text-decoration: none;
+}
+
+.nav-document-delete {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #9aa7b7;
+  cursor: pointer;
+}
+
+.nav-document-delete:hover:not(:disabled),
+.nav-document-delete:focus-visible {
+  background: #4b2a2a;
+  color: #ffb0a8;
+  outline: 0;
+}
+
+.nav-document-delete:disabled {
+  cursor: wait;
+  opacity: .62;
 }
 
 .nav-document:hover,
@@ -2271,6 +2303,16 @@ sub {
 .theme-portal .nav-document-status.cancelled,
 .theme-portal .error-copy {
   color: #9a3412;
+}
+
+.theme-portal .nav-document-delete {
+  color: #697586;
+}
+
+.theme-portal .nav-document-delete:hover:not(:disabled),
+.theme-portal .nav-document-delete:focus-visible {
+  background: #fff0eb;
+  color: #a63232;
 }
 
 .theme-portal .nav-item {

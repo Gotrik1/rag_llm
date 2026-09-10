@@ -499,9 +499,9 @@ def list_documents(project_id: str | None = None, chat_id: str | None = None) ->
 
 
 def list_all_documents_for_retrieval() -> list[dict]:
-    """Return the full registry for exclusion filtering inside the trusted RAG worker."""
+    """Return active records and tombstones for retrieval access filtering."""
     with db().cursor() as cur:
-        cur.execute("SELECT * FROM documents WHERE deleted_at IS NULL ORDER BY created_at DESC")
+        cur.execute("SELECT * FROM documents ORDER BY created_at DESC")
         return [_document_record(row) for row in cur.fetchall()]
 
 
@@ -575,6 +575,27 @@ def update_document(document_id: str, payload: dict) -> dict | None:
         return document
     updated = _update_entity("documents", document_id, fields, values)
     return _document_record(updated) if updated else None
+
+
+def tombstone_document(document_id: str) -> dict | None:
+    """Immediately hide an owned document while queued index cleanup runs."""
+    document = get_document(document_id)
+    if document is None:
+        return None
+    if current_subject() and not current_is_admin() and not document.get("owner_subject"):
+        raise PermissionError("shared document deletion requires administrator access")
+    conn = db()
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE documents
+               SET status = 'deleting', deleted_at = now(), updated_at = now()
+               WHERE id = %s AND deleted_at IS NULL
+               RETURNING *""",
+            (document_id,),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return _document_record(row) if row else None
 
 
 def document_sources(source_names: list[str]) -> dict[str, dict]:

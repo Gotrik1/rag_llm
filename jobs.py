@@ -62,6 +62,7 @@ class JobQueue:
             raise RuntimeError("RAG_DATABASE_URL is required for persistent jobs")
         route = {
             "ingestion": ("ingest_document_job", INGESTION_QUEUE_NAME),
+            "deletion": ("delete_document_job", INGESTION_QUEUE_NAME),
             "generation": ("generate_answer_job", GENERATION_QUEUE_NAME),
         }.get(kind)
         if route is None:

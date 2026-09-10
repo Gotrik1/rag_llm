@@ -6,6 +6,7 @@ import os
 import json
 import sys
 import time
+from pathlib import Path
 
 from arq import cron
 from arq.connections import RedisSettings
@@ -13,6 +14,7 @@ from arq.connections import RedisSettings
 from persistence import get_store
 from db_store import update_document
 from jobs import INGESTION_QUEUE_NAME
+from runtime_paths import UPLOAD_DIR
 
 
 async def ingest_document_job(ctx: dict, job_id: str, payload: dict | None = None) -> dict:
@@ -98,13 +100,103 @@ async def ingest_document_job(ctx: dict, job_id: str, payload: dict | None = Non
         raise
 
 
+async def delete_document_job(ctx: dict, job_id: str, payload: dict | None = None) -> dict:
+    """Serialize vector, BM25 and file cleanup with document ingestion."""
+    del ctx
+    store = get_store()
+    job = await asyncio.to_thread(store.get_job, job_id)
+    if payload is None:
+        payload = await asyncio.to_thread(store.get_job_payload, job_id)
+    if not isinstance(payload, dict):
+        raise ValueError("deletion job payload not found")
+    if not job or job["cancel_requested"]:
+        await asyncio.to_thread(store.update_job, job_id, status="cancelled", progress=100, finished_at=time.time())
+        return {"cancelled": True}
+
+    await asyncio.to_thread(store.update_job, job_id, status="running", progress=10, started_at=time.time())
+    process = None
+    try:
+        raw_path = str(payload.get("path", "")).strip()
+        if not raw_path:
+            raise ValueError("deletion path is required")
+        path = Path(raw_path).resolve()
+        upload_root = UPLOAD_DIR.resolve()
+        if upload_root not in path.parents:
+            raise ValueError("document path is outside the upload directory")
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "deletion_task",
+            str(path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        while process.returncode is None:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=1)
+            except TimeoutError:
+                pass
+            latest = await asyncio.to_thread(store.get_job, job_id)
+            if latest and latest["cancel_requested"]:
+                process.terminate()
+                await process.wait()
+                await asyncio.to_thread(
+                    store.update_job,
+                    job_id,
+                    status="cancelled",
+                    progress=100,
+                    finished_at=time.time(),
+                )
+                return {"cancelled": True}
+            await asyncio.to_thread(store.update_job, job_id, progress=70)
+
+        stdout, stderr = await process.communicate()
+        lines = stdout.decode("utf-8", errors="replace").splitlines()
+        result = json.loads(lines[-1]) if lines else {
+            "error": stderr.decode("utf-8", errors="replace")[-1000:]
+        }
+        if process.returncode != 0:
+            raise RuntimeError(str(result.get("error", "document deletion failed")))
+        path.unlink(missing_ok=True)
+        await asyncio.to_thread(
+            store.update_job,
+            job_id,
+            status="completed",
+            progress=100,
+            result=result,
+            finished_at=time.time(),
+        )
+        return result
+    except asyncio.CancelledError:
+        if process and process.returncode is None:
+            process.terminate()
+            await process.wait()
+        await asyncio.to_thread(
+            store.update_job,
+            job_id,
+            status="cancelled",
+            progress=100,
+            finished_at=time.time(),
+        )
+        raise
+    except Exception as exc:
+        await asyncio.to_thread(
+            store.update_job,
+            job_id,
+            status="failed",
+            error=str(exc),
+            finished_at=time.time(),
+        )
+        raise
+
+
 async def purge_expired_audit_events(ctx: dict) -> int:
     del ctx
     return await asyncio.to_thread(get_store().purge_audit, int(os.getenv("RAG_AUDIT_RETENTION_DAYS", "90")))
 
 
 class WorkerSettings:
-    functions = [ingest_document_job]
+    functions = [ingest_document_job, delete_document_job]
     queue_name = INGESTION_QUEUE_NAME
     cron_jobs = [cron(purge_expired_audit_events, hour=3, minute=15)]
     redis_settings = RedisSettings.from_dsn(os.getenv("RAG_REDIS_URL", "redis://localhost:6379/0"))

@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from jobs import GENERATION_QUEUE_NAME, INGESTION_QUEUE_NAME, JobQueue
 from generation_worker import WorkerSettings as GenerationWorkerSettings, generate_answer_job
-from ingestion_worker import WorkerSettings as IngestionWorkerSettings, ingest_document_job
+from ingestion_worker import WorkerSettings as IngestionWorkerSettings, delete_document_job, ingest_document_job
 
 
 class JobQueueTests(unittest.IsolatedAsyncioTestCase):
@@ -51,10 +51,28 @@ class JobQueueTests(unittest.IsolatedAsyncioTestCase):
             _queue_name=INGESTION_QUEUE_NAME,
         )
 
+    async def test_submit_routes_deletion_through_single_writer_queue(self) -> None:
+        store = Mock(enabled=True)
+        store.create_job.return_value = {"id": "job-deletion"}
+        queue = JobQueue("redis://example.invalid:6379/0")
+        queue._redis = Mock()
+        queue._redis.enqueue_job = AsyncMock()
+
+        with patch("jobs.get_store", return_value=store):
+            await queue.submit("deletion", {"path": "/data/uploads/manual.pdf"})
+
+        queue._redis.enqueue_job.assert_awaited_once_with(
+            "delete_document_job",
+            "job-deletion",
+            _job_id="job-deletion",
+            _queue_name=INGESTION_QUEUE_NAME,
+        )
+
     def test_workers_consume_distinct_dedicated_queues(self) -> None:
         self.assertEqual(IngestionWorkerSettings.queue_name, INGESTION_QUEUE_NAME)
         self.assertEqual(GenerationWorkerSettings.queue_name, GENERATION_QUEUE_NAME)
         self.assertNotEqual(IngestionWorkerSettings.queue_name, GenerationWorkerSettings.queue_name)
+        self.assertIn(delete_document_job, IngestionWorkerSettings.functions)
 
     async def test_submit_rejects_unknown_job_kind_before_persisting(self) -> None:
         store = Mock(enabled=True)
@@ -163,6 +181,29 @@ class JobQueueTests(unittest.IsolatedAsyncioTestCase):
         store.update_job.assert_called_once_with("job-1", status="cancelled", finished_at=unittest.mock.ANY)
         self.assertEqual(update_document.call_args.args[0], "document-1")
         self.assertEqual(update_document.call_args.args[1]["status"], "cancelled")
+
+    async def test_ingestion_failure_marks_job_and_document_failed(self) -> None:
+        store = Mock()
+        store.get_job.return_value = {"cancel_requested": False}
+
+        with patch("ingestion_worker.get_store", return_value=store), \
+             patch("ingestion_worker.update_document", return_value={}) as update_document, \
+             patch("ingestion_worker.asyncio.create_subprocess_exec", AsyncMock(side_effect=RuntimeError("boom"))):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                await ingest_document_job(
+                    {},
+                    "job-1",
+                    {"document_id": "document-1", "path": "manual.pdf"},
+                )
+
+        store.update_job.assert_any_call(
+            "job-1",
+            status="failed",
+            error="boom",
+            finished_at=unittest.mock.ANY,
+        )
+        self.assertEqual(update_document.call_args.args[0], "document-1")
+        self.assertEqual(update_document.call_args.args[1]["status"], "failed")
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ from db_store import (
     get_document,
     list_documents,
     request_scope,
+    tombstone_document,
     update_document,
     update_message,
 )
@@ -683,6 +684,40 @@ async def document_content(document_id: str, _: Principal = Depends(current_prin
     if upload_root not in path.parents or not path.is_file():
         raise HTTPException(404, "document content is unavailable")
     return FileResponse(path, media_type=str(document.get("mime_type") or "application/octet-stream"), filename=str(document["file_name"]))
+
+
+@app.delete("/api/documents/{document_id}")
+async def delete_document(document_id: str, principal: Principal = Depends(current_principal)):
+    """Hide a document immediately and queue serialized index/file cleanup."""
+    document = await asyncio.to_thread(get_document, document_id)
+    if document is None:
+        raise HTTPException(404, "document not found")
+    if not document.get("owner_subject") and "superadmin" not in principal.roles:
+        raise HTTPException(403, "shared document deletion requires administrator access")
+    try:
+        tombstone = await asyncio.to_thread(tombstone_document, document_id)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    if tombstone is None:
+        raise HTTPException(409, "document is already being deleted")
+    try:
+        job = await jobs.submit(
+            "deletion",
+            {
+                "path": str(document.get("source_path") or ""),
+                "document_id": document_id,
+                "owner_subject": principal.subject,
+            },
+        )
+    except Exception as exc:
+        # The tombstone deliberately remains: stale chunks must never become
+        # searchable again merely because the cleanup queue is unavailable.
+        raise HTTPException(503, "document is hidden, but cleanup queue is unavailable") from exc
+    JOBS.labels("deletion", "queued").inc()
+    return JSONResponse(
+        {"id": document_id, "status": "deleting", "job_id": str(job["id"])},
+        status_code=202,
+    )
 
 
 @app.get("/api/openapi.json", include_in_schema=False)

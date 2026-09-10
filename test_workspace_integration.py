@@ -231,6 +231,14 @@ class WorkspacePersistenceIntegrationTests(unittest.TestCase):
             self.assertEqual(str(sources[stored_name]["id"]), document_id)
             self.assertEqual(str(sources["manual.pdf"]["id"]), document_id)
             self.assertNotIn("other.pdf", sources)
+
+            tombstone = db_store.tombstone_document(document_id)
+            self.assertEqual(tombstone["status"], "deleting")
+            self.assertIsNotNone(tombstone["deleted_at"])
+            self.assertEqual(db_store.list_documents(project_id), [])
+            self.assertNotIn("manual.pdf", db_store.document_sources(["manual.pdf"]))
+            registry = db_store.list_all_documents_for_retrieval()
+            self.assertIn(document_id, [str(item["id"]) for item in registry if item.get("deleted_at")])
         finally:
             if document_id:
                 with db_store.db().cursor() as cursor:

@@ -378,7 +378,8 @@ def excluded_document_sources(scope: dict, chat_id: str) -> set[str]:
         document_chat = str(record.get("chat_id") or "")
         document_owner = str(record.get("owner_subject") or "")
         is_global = not document_owner
-        is_visible = (
+        is_searchable = not record.get("deleted_at") and str(record.get("status") or "") == "ready"
+        is_visible = is_searchable and (
             (is_global and include_global)
             or (
                 document_owner == current_owner

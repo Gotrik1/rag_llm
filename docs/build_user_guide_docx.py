@@ -338,8 +338,6 @@ def build() -> None:
             flush_buffer()
             level = min(len(heading.group(1)) - 1, 3)
             p = doc.add_paragraph(style=f"Heading {level}")
-            if heading.group(2).startswith("16."):
-                p.paragraph_format.page_break_before = True
             add_inline(p, heading.group(2))
             index += 1
             continue

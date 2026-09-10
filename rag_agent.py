@@ -1811,6 +1811,48 @@ class RAGAgent:
         print(f"✓ Проиндексировано {len(nodes)} чанков из {p.name}")
         return len(nodes)
 
+    def delete_source(self, path: str) -> int:
+        """Remove every chunk for one stored upload from Qdrant and BM25."""
+        target = Path(path)
+        target_name = target.name.casefold()
+        self._refresh_docstore_if_changed()
+
+        def belongs_to_target(node) -> bool:
+            metadata = getattr(node, "metadata", None) or {}
+            stored_path = str(metadata.get("file_path") or "").strip()
+            stored_name = str(metadata.get("file_name") or "").strip()
+            return (
+                (stored_path and Path(stored_path).name.casefold() == target_name)
+                or (stored_name and Path(stored_name).name.casefold() == target_name)
+            )
+
+        nodes = [node for node in self._all_nodes if belongs_to_target(node)]
+        node_ids = [str(node.id_) for node in nodes]
+        if node_ids:
+            # Qdrant stores node text itself, so LlamaIndex intentionally does
+            # not remove our separate BM25 docstore. Delete both explicitly.
+            self.vector_store.delete_nodes(node_ids)
+            for node_id in node_ids:
+                self.docstore.delete_document(node_id, raise_error=False)
+
+            temp_docstore_path = self.docstore_path.with_name(
+                f".{self.docstore_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            try:
+                self.docstore.persist(persist_path=str(temp_docstore_path))
+                os.replace(temp_docstore_path, self.docstore_path)
+            finally:
+                temp_docstore_path.unlink(missing_ok=True)
+            deleted_node_ids = set(node_ids)
+            self._all_nodes = [node for node in self._all_nodes if str(node.id_) not in deleted_node_ids]
+            self._docstore_mtime_ns = self.docstore_path.stat().st_mtime_ns
+
+        # Cached answers may cite a deleted source even when no local node was
+        # found (for example after a previously interrupted cleanup).
+        self.clear_cache()
+        print(f"✓ Удалено {len(node_ids)} чанков из {target.name}")
+        return len(node_ids)
+
     def ask(
         self,
         question: str,

@@ -163,19 +163,21 @@ class FlowModeTests(unittest.TestCase):
 
     def test_project_scope_excludes_documents_from_other_projects_and_chats(self):
         documents = [
-            {"source_path": "C:/uploads/global.pdf", "project_id": None, "chat_id": None, "owner_subject": None},
-            {"source_path": "C:/uploads/current.pdf", "project_id": "project-1", "chat_id": "chat-1", "owner_subject": "user-1"},
-            {"source_path": "C:/uploads/same-project.pdf", "project_id": "project-1", "chat_id": "chat-2", "owner_subject": "user-1"},
-            {"source_path": "C:/uploads/private-chat.pdf", "project_id": None, "chat_id": "chat-1", "owner_subject": "user-1"},
-            {"source_path": "C:/uploads/other-project.pdf", "project_id": "project-2", "chat_id": "chat-9", "owner_subject": "user-2"},
-            {"source_path": "C:/uploads/other-chat.pdf", "project_id": None, "chat_id": "chat-9", "owner_subject": "user-2"},
+            {"source_path": "C:/uploads/global.pdf", "project_id": None, "chat_id": None, "owner_subject": None, "status": "ready"},
+            {"source_path": "C:/uploads/current.pdf", "project_id": "project-1", "chat_id": "chat-1", "owner_subject": "user-1", "status": "ready"},
+            {"source_path": "C:/uploads/same-project.pdf", "project_id": "project-1", "chat_id": "chat-2", "owner_subject": "user-1", "status": "ready"},
+            {"source_path": "C:/uploads/private-chat.pdf", "project_id": None, "chat_id": "chat-1", "owner_subject": "user-1", "status": "ready"},
+            {"source_path": "C:/uploads/other-project.pdf", "project_id": "project-2", "chat_id": "chat-9", "owner_subject": "user-2", "status": "ready"},
+            {"source_path": "C:/uploads/other-chat.pdf", "project_id": None, "chat_id": "chat-9", "owner_subject": "user-2", "status": "ready"},
+            {"source_path": "C:/uploads/deleted.pdf", "project_id": "project-1", "chat_id": None, "owner_subject": "user-1", "status": "deleting", "deleted_at": "2026-09-10"},
+            {"source_path": "C:/uploads/failed.pdf", "project_id": "project-1", "chat_id": None, "owner_subject": "user-1", "status": "failed"},
         ]
         with patch.object(web_ui, "list_all_documents_for_retrieval", return_value=documents):
             excluded = web_ui.excluded_document_sources(
                 {"project_id": "project-1", "owner_subject": "user-1", "knowledge_scope": "project_and_global"},
                 "chat-1",
             )
-        self.assertEqual(excluded, {"other-project.pdf", "other-chat.pdf"})
+        self.assertEqual(excluded, {"other-project.pdf", "other-chat.pdf", "deleted.pdf", "failed.pdf"})
 
         with patch.object(web_ui, "list_all_documents_for_retrieval", return_value=documents):
             project_only = web_ui.excluded_document_sources(

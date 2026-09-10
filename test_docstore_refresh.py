@@ -8,6 +8,35 @@ import rag_agent
 
 
 class DocstoreRefreshTests(unittest.TestCase):
+    def test_delete_source_removes_matching_qdrant_and_bm25_nodes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory) / "docstore.json"
+            snapshot.write_text("{}", encoding="utf-8")
+            target = Path(directory) / "unique_manual.pdf"
+            target.write_text("test", encoding="utf-8")
+            matching = Mock(id_="node-1", metadata={"file_path": str(target), "file_name": target.name})
+            other = Mock(id_="node-2", metadata={"file_path": str(Path(directory) / "other.pdf")})
+            agent = object.__new__(rag_agent.RAGAgent)
+            agent.docstore_path = snapshot
+            agent._docstore_mtime_ns = snapshot.stat().st_mtime_ns
+            agent._all_nodes = [matching, other]
+            agent.vector_store = Mock()
+            agent.docstore = Mock()
+            agent._refresh_docstore_if_changed = Mock()
+            agent.clear_cache = Mock()
+
+            def persist_snapshot(*, persist_path: str) -> None:
+                Path(persist_path).write_text("{}", encoding="utf-8")
+
+            agent.docstore.persist.side_effect = persist_snapshot
+            deleted = agent.delete_source(str(target))
+
+            self.assertEqual(deleted, 1)
+            agent.vector_store.delete_nodes.assert_called_once_with(["node-1"])
+            agent.docstore.delete_document.assert_called_once_with("node-1", raise_error=False)
+            self.assertEqual([node.id_ for node in agent._all_nodes], ["node-2"])
+            agent.clear_cache.assert_called_once_with()
+
     def test_api_agent_reloads_snapshot_published_by_ingestion_worker(self):
         with tempfile.TemporaryDirectory() as directory:
             snapshot = Path(directory) / "docstore.json"

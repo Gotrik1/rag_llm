@@ -36,6 +36,7 @@ class AsgiFoundationTests(unittest.TestCase):
         self.assertIn("/api/ask", paths)
         self.assertIn("/api/upload", paths)
         self.assertIn("/api/projects/{project_id}/documents", paths)
+        self.assertIn("/api/documents/{document_id}", paths)
 
     def test_development_bootstrap_is_superadmin(self):
         response = self.client.get("/api/me")
@@ -298,6 +299,30 @@ class AsgiFoundationTests(unittest.TestCase):
         self.assertEqual(document["version_status"], "unknown")
         self.assertIsNone(document["version_label"])
         list_documents.assert_called_once_with("project-1", None)
+
+    def test_document_delete_tombstones_before_queued_index_cleanup(self):
+        document = {
+            "id": "document-1",
+            "file_name": "manual.pdf",
+            "source_path": "/data/uploads/unique_manual.pdf",
+            "owner_subject": "rag-superadmin",
+        }
+        with patch("asgi_app.get_document", return_value=document), \
+             patch("asgi_app.tombstone_document", return_value={**document, "status": "deleting"}) as tombstone, \
+             patch.object(asgi_app.jobs, "submit", AsyncMock(return_value={"id": "job-delete"})) as submit:
+            response = self.client.delete("/api/documents/document-1")
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json(), {"id": "document-1", "status": "deleting", "job_id": "job-delete"})
+        tombstone.assert_called_once_with("document-1")
+        submit.assert_awaited_once_with(
+            "deletion",
+            {
+                "path": "/data/uploads/unique_manual.pdf",
+                "document_id": "document-1",
+                "owner_subject": "rag-superadmin",
+            },
+        )
 
 
 if __name__ == "__main__":

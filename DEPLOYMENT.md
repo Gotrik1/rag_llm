@@ -41,8 +41,12 @@ CORS origin, server name, TLS paths, data root and GPU limits. The TLS gateway
 must not enable HTTP Basic Auth: registration, login, logout, lockout, CSRF and
 session restoration belong to the application. Configure
 `RAG_LOCAL_ADMIN_EMAILS` only when an explicitly approved account must receive
-administrator rights at registration. OIDC issuer/audience/JWKS values are
-optional until corporate SSO is enabled.
+administrator rights at registration. Set
+`RAG_ALL_USERS_MANAGE_GLOBAL_DOCUMENTS=true` for the current acceptance phase:
+this lets every authenticated tester upload and delete shared documents without
+granting access to private projects or administrative APIs. Set it to `false`
+when dedicated shared-library managers are assigned. OIDC
+issuer/audience/JWKS values are optional until corporate SSO is enabled.
 
 ## 3. Preflight and backup
 

@@ -270,25 +270,33 @@ class AsgiFoundationTests(unittest.TestCase):
         self.assertEqual(create_document.call_args.args[1], "chat-1")
         self.assertEqual(submit.await_args.args[1]["document_id"], "document-1")
 
-    def test_global_upload_requires_admin_and_has_no_project_or_chat_scope(self):
+    def test_global_upload_is_available_to_authenticated_tester_and_has_no_private_scope(self):
         queued = {"id": "job-global", "kind": "ingestion", "status": "queued", "progress": 0}
         document = {"id": "document-global"}
         with tempfile.TemporaryDirectory() as directory, \
+             patch.dict("os.environ", {"RAG_ALL_USERS_MANAGE_GLOBAL_DOCUMENTS": "true"}), \
              patch("asgi_app.UPLOAD_DIR", Path(directory)), \
-             patch("asgi_app.require_admin") as require_admin, \
              patch("asgi_app.create_document", return_value=document) as create_document, \
              patch("asgi_app.update_document", return_value=document), \
              patch.object(__import__("asgi_app").jobs, "submit", AsyncMock(return_value=queued)):
             response = self.client.post(
                 "/api/upload",
                 files={"files": ("shared.md", b"# Shared", "text/markdown")},
+                headers={"Authorization": "Bearer ordinary-user:rag.access"},
             )
 
         self.assertEqual(response.status_code, 202)
-        require_admin.assert_called_once()
-        self.assertEqual(require_admin.call_args.args[1], "/api/upload")
         self.assertEqual(create_document.call_args.args[0], None)
         self.assertEqual(create_document.call_args.args[1], None)
+
+    def test_global_upload_can_be_restricted_without_granting_superadmin(self):
+        with patch.dict("os.environ", {"RAG_ALL_USERS_MANAGE_GLOBAL_DOCUMENTS": "false"}):
+            response = self.client.post(
+                "/api/upload",
+                files={"files": ("shared.md", b"# Shared", "text/markdown")},
+                headers={"Authorization": "Bearer ordinary-user:rag.access"},
+            )
+        self.assertEqual(response.status_code, 403)
 
     def test_image_upload_is_accepted_and_queued_for_chat(self):
         queued = {"id": "job-image", "kind": "ingestion", "status": "queued", "progress": 0}
@@ -325,12 +333,16 @@ class AsgiFoundationTests(unittest.TestCase):
             "id": "document-1",
             "file_name": "manual.pdf",
             "source_path": "/data/uploads/unique_manual.pdf",
-            "owner_subject": "rag-superadmin",
+            "owner_subject": None,
         }
-        with patch("asgi_app.get_document", return_value=document), \
+        with patch.dict("os.environ", {"RAG_ALL_USERS_MANAGE_GLOBAL_DOCUMENTS": "true"}), \
+             patch("asgi_app.get_document", return_value=document), \
              patch("asgi_app.tombstone_document", return_value={**document, "status": "deleting"}) as tombstone, \
              patch.object(asgi_app.jobs, "submit", AsyncMock(return_value={"id": "job-delete"})) as submit:
-            response = self.client.delete("/api/documents/document-1")
+            response = self.client.delete(
+                "/api/documents/document-1",
+                headers={"Authorization": "Bearer ordinary-user:rag.access"},
+            )
 
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json(), {"id": "document-1", "status": "deleting", "job_id": "job-delete"})
@@ -340,9 +352,25 @@ class AsgiFoundationTests(unittest.TestCase):
             {
                 "path": "/data/uploads/unique_manual.pdf",
                 "document_id": "document-1",
-                "owner_subject": "rag-superadmin",
+                "owner_subject": "ordinary-user",
             },
         )
+
+    def test_global_document_delete_can_be_restricted_separately_from_rag_access(self):
+        document = {
+            "id": "document-global",
+            "source_path": "/data/uploads/global.pdf",
+            "owner_subject": None,
+        }
+        with patch.dict("os.environ", {"RAG_ALL_USERS_MANAGE_GLOBAL_DOCUMENTS": "false"}), \
+             patch("asgi_app.get_document", return_value=document), \
+             patch("asgi_app.tombstone_document") as tombstone:
+            response = self.client.delete(
+                "/api/documents/document-global",
+                headers={"Authorization": "Bearer ordinary-user:rag.access"},
+            )
+        self.assertEqual(response.status_code, 403)
+        tombstone.assert_not_called()
 
 
 if __name__ == "__main__":

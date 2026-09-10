@@ -76,6 +76,7 @@ ALLOWED_UPLOAD_SUFFIXES = DOCUMENT_UPLOAD_SUFFIXES | IMAGE_UPLOAD_SUFFIXES
 MAX_UPLOAD_BYTES = int(os.getenv("RAG_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 MAX_UPLOAD_FILES = int(os.getenv("RAG_MAX_UPLOAD_FILES", "20"))
 GENERATION_WAIT_SECONDS = float(os.getenv("RAG_GENERATION_WAIT_SECONDS", "900"))
+GLOBAL_DOCUMENT_MANAGEMENT_PERMISSION = "rag.global_documents.manage"
 
 
 def safe_upload_name(filename: str) -> str:
@@ -127,6 +128,25 @@ def _local_auth_enabled() -> bool:
     return os.getenv("RAG_AUTH_MODE", "development").strip().lower() == "local"
 
 
+def _all_users_manage_global_documents() -> bool:
+    return os.getenv("RAG_ALL_USERS_MANAGE_GLOBAL_DOCUMENTS", "false").strip().lower() == "true"
+
+
+def can_manage_global_documents(principal: Principal) -> bool:
+    return (
+        _all_users_manage_global_documents()
+        or "superadmin" in principal.roles
+        or "*" in principal.permissions
+        or GLOBAL_DOCUMENT_MANAGEMENT_PERMISSION in principal.permissions
+    )
+
+
+def session_user(user: dict) -> dict:
+    result = public_user(user)
+    result["can_manage_global_documents"] = bool(result.get("is_admin")) or _all_users_manage_global_documents()
+    return result
+
+
 async def current_principal(request: Request) -> AsyncIterator[Principal]:
     try:
         if _local_auth_enabled():
@@ -153,7 +173,11 @@ async def current_principal(request: Request) -> AsyncIterator[Principal]:
         authorize(principal, RAG_ACCESS, request.url.path, {"request": {"method": request.method}})
         request.state.principal = principal
         AUTH_DECISIONS.labels(RAG_ACCESS, "allow", principal.provider).inc()
-        with request_scope(principal.subject, is_admin="superadmin" in principal.roles):
+        with request_scope(
+            principal.subject,
+            is_admin="superadmin" in principal.roles,
+            can_manage_global_documents=can_manage_global_documents(principal),
+        ):
             yield principal
     except (AuthenticationError, InvalidCredentials) as exc:
         AUTH_DECISIONS.labels(RAG_ACCESS, "unauthenticated", "unknown").inc()
@@ -288,7 +312,7 @@ async def metrics():
 
 def _session_response(user: dict, session_token: str, *, status_code: int = 200) -> JSONResponse:
     response = JSONResponse(
-        jsonable_encoder({"authenticated": True, "user": public_user(user), "csrf_token": csrf_token(session_token)}),
+        jsonable_encoder({"authenticated": True, "user": session_user(user), "csrf_token": csrf_token(session_token)}),
         status_code=status_code,
     )
     response.set_cookie(
@@ -308,7 +332,13 @@ async def auth_session(request: Request):
     if not _local_auth_enabled():
         return {
             "authenticated": True,
-            "user": {"id": "development", "email": "", "display_name": "Development", "is_admin": True},
+            "user": {
+                "id": "development",
+                "email": "",
+                "display_name": "Development",
+                "is_admin": True,
+                "can_manage_global_documents": True,
+            },
             "csrf_token": None,
         }
     session_token = request.cookies.get(SESSION_COOKIE_NAME, "")
@@ -376,6 +406,7 @@ async def me(principal: Principal = Depends(current_principal)):
             "email": principal.attributes.get("email"),
             "display_name": principal.attributes.get("display_name"),
             "is_admin": principal.attributes.get("is_admin") == "true",
+            "can_manage_global_documents": can_manage_global_documents(principal),
         } if principal.provider == "local" else None,
     }
 
@@ -600,8 +631,8 @@ async def upload_documents(
         raise HTTPException(400, f"upload between 1 and {MAX_UPLOAD_FILES} files")
     normalized_project = project_id.strip() or None
     normalized_chat = chat_id.strip() or None
-    if not normalized_project and not normalized_chat:
-        require_admin(principal, "/api/upload")
+    if not normalized_project and not normalized_chat and not can_manage_global_documents(principal):
+        raise HTTPException(403, "global document upload is not permitted for this account")
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     queued: list[dict] = []
     for upload in files:
@@ -694,8 +725,8 @@ async def delete_document(document_id: str, principal: Principal = Depends(curre
     document = await asyncio.to_thread(get_document, document_id)
     if document is None:
         raise HTTPException(404, "document not found")
-    if not document.get("owner_subject") and "superadmin" not in principal.roles:
-        raise HTTPException(403, "shared document deletion requires administrator access")
+    if not document.get("owner_subject") and not can_manage_global_documents(principal):
+        raise HTTPException(403, "shared document deletion is not permitted for this account")
     try:
         tombstone = await asyncio.to_thread(tombstone_document, document_id)
     except PermissionError as exc:

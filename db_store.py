@@ -20,16 +20,29 @@ _db_lock = threading.Lock()
 _db_local = threading.local()
 _request_subject: ContextVar[str | None] = ContextVar("rag_request_subject", default=None)
 _request_admin: ContextVar[bool] = ContextVar("rag_request_admin", default=False)
+_request_global_document_manager: ContextVar[bool] = ContextVar(
+    "rag_request_global_document_manager",
+    default=False,
+)
 
 
 @contextmanager
-def request_scope(subject: str | None, *, is_admin: bool = False):
+def request_scope(
+    subject: str | None,
+    *,
+    is_admin: bool = False,
+    can_manage_global_documents: bool = False,
+):
     """Apply ownership filtering to all persistence calls in this task context."""
     subject_token = _request_subject.set(subject.strip() if subject else None)
     admin_token = _request_admin.set(bool(is_admin))
+    global_manager_token = _request_global_document_manager.set(
+        bool(can_manage_global_documents) or bool(is_admin)
+    )
     try:
         yield
     finally:
+        _request_global_document_manager.reset(global_manager_token)
         _request_admin.reset(admin_token)
         _request_subject.reset(subject_token)
 
@@ -40,6 +53,10 @@ def current_subject() -> str | None:
 
 def current_is_admin() -> bool:
     return _request_admin.get()
+
+
+def current_can_manage_global_documents() -> bool:
+    return _request_global_document_manager.get()
 
 
 def _knowledge_scope(value: object) -> str:
@@ -519,8 +536,8 @@ def create_document(project_id: str | None, chat_id: str | None, payload: dict) 
         raise ValueError("project not found")
     if chat_id and get_chat(chat_id) is None:
         raise ValueError("chat not found")
-    if subject and not project_id and not chat_id and not current_is_admin():
-        raise PermissionError("global document upload requires administrator access")
+    if subject and not project_id and not chat_id and not current_can_manage_global_documents():
+        raise PermissionError("global document upload is not permitted for this account")
 
     document_owner = subject if project_id or chat_id else None
     metadata = dict(payload.get("metadata") or {})
@@ -568,8 +585,8 @@ def update_document(document_id: str, payload: dict) -> dict | None:
     document = get_document(document_id)
     if document is None:
         return None
-    if current_subject() and not current_is_admin() and not document.get("owner_subject"):
-        return None
+    if current_subject() and not current_can_manage_global_documents() and not document.get("owner_subject"):
+        raise PermissionError("shared document update is not permitted for this account")
     fields, values = _update_values(payload, ("file_name", "source_path", "mime_type", "status"), ("processing_state", "metadata"))
     if not fields:
         return document
@@ -582,8 +599,8 @@ def tombstone_document(document_id: str) -> dict | None:
     document = get_document(document_id)
     if document is None:
         return None
-    if current_subject() and not current_is_admin() and not document.get("owner_subject"):
-        raise PermissionError("shared document deletion requires administrator access")
+    if current_subject() and not current_can_manage_global_documents() and not document.get("owner_subject"):
+        raise PermissionError("shared document deletion is not permitted for this account")
     conn = db()
     with conn.cursor() as cur:
         cur.execute(

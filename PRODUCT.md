@@ -13,7 +13,8 @@ Web application for desktop and mobile browsers, deployed as an HTTPS site on a 
 
 - Registered employees who ask questions across corporate documents.
 - Project owners who keep private project documents, chat history and project memory.
-- Administrators who maintain the shared document library.
+- Registered testers who currently maintain the shared document library; this
+  capability can later be restricted without granting access to private projects.
 
 ## Core purpose
 
@@ -22,6 +23,8 @@ Provide production-grade grounded answers over documents without placing whole d
 ## Product rules
 
 - Existing documents form the shared library and are readable by every authenticated user.
+- During the current acceptance phase, every authenticated user can upload and
+  delete shared documents without becoming a system superadministrator.
 - Every user's projects, chats, memory and uploaded project documents are private to that user.
 - Each project chooses one knowledge scope: project documents only, or project documents plus the shared library.
 - Page refresh and temporary disconnects must not lose the authenticated session, chat history or an in-progress durable generation.

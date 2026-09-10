@@ -32,14 +32,14 @@ keeps an authenticated session in a secure HttpOnly cookie.
 | Extractive image answers | explicit transcription requests are answered directly from OCR evidence, including first-line/card requests, without losing the recognized text in a generative round trip | focused PRISM tests and live PNG acceptance |
 | Human sources | answer citations and the `Sources` panel link to the original document and show a human locator; internal chunk IDs/scores are not user-facing | source-contract tests and live production answer |
 | Formulas | Markdown/KaTeX renders validated LaTeX, including persisted display blocks with duplicated inner delimiters; formula payloads contain equations and variable definitions | formula tests plus live `ИВ0`, `1 ЦК` and malformed `6 ЦК` acceptance |
-| Technical panel | `Evidence`, `Sources` and `Debug` show metadata for the selected answer; `Система` exposes the global upload control only to administrators and never accepts project/chat files | UI tests, release-image authorization test and live non-admin acceptance |
+| Technical panel | `Evidence`, `Sources` and `Debug` show metadata for the selected answer; in the current acceptance phase `Система` exposes global upload and deletion to every authenticated tester but never accepts project/chat files | UI tests, capability-flag API tests and live ordinary-user acceptance |
 | Deletion lifecycle | deleting a document immediately removes it from the visible registry, then a serialized worker removes the source file, Qdrant nodes and BM25/docstore nodes and clears answer cache | queue/API/unit tests and full live delete audit |
 | Prompt-injection resistance | uploaded text is treated as evidence, never as a replacement for system/user instructions | policy and injection tests |
 
 ## Automated verification
 
-- Full release-image Python suite: `171` tests, `163 passed`, `8 skipped`.
-- PostgreSQL integration suite: `6/6 passed` against an isolated temporary
+- Full release-image Python suite: `174` tests, `165 passed`, `9 skipped`.
+- PostgreSQL integration suite: `7/7 passed` against an isolated temporary
   PostgreSQL 17 database.
 - Current branch-aware coverage: `54.8%` across `5,494` statements and `1,948`
   branches. Focused modules include deletion/ingestion tasks `100%`, document
@@ -54,7 +54,7 @@ keeps an authenticated session in a secure HttpOnly cookie.
 - Full production image health gates: `compileall`, dependency consistency,
   migrations `0001`-`0004`, Rust release build and container readiness passed.
 
-Six skipped tests are PostgreSQL integration cases that were executed separately
+Seven skipped tests are PostgreSQL integration cases that were executed separately
 and passed. The remaining two require optional live Qdrant/Ollama fixtures.
 They are not silently treated as passed; equivalent public production RAG
 behavior was exercised separately. Coverage excludes test and generated
@@ -72,8 +72,8 @@ artifact files.
 | Health | `/healthz` -> `{"status":"ok"}`; `/readyz` -> `{"status":"ready"}` |
 | Public access | root returns `200` without VPN/Basic Auth; anonymous `/api/me` returns JSON `401` without `WWW-Authenticate` |
 | Registration/session UI | registration created a workspace and user card; repeated reloads preserved the session; explicit logout showed the application login page; re-login restored the same chat without a Basic Auth prompt |
-| Upload entry points | the `+` panel contains only `Добавить в текущий чат` and `Загрузить в чат`; the project menu contains `Память и документы`, a project-only registry and `Загрузить в проект`; the non-admin technical panel contains no file picker and reports six available common documents |
-| Scope enforcement | project and chat QA files independently reached `Готов`; a second chat retained the project file but showed zero chat files, and returning to the first chat restored only its chat file; a direct non-admin global upload returned `403` |
+| Upload entry points | the `+` panel contains only `Добавить в текущий чат` and `Загрузить в чат`; the project menu contains `Память и документы`, a project-only registry and `Загрузить в проект`; the ordinary-user technical panel contains the global-only picker |
+| Scope enforcement | project and chat QA files independently reached `Готов`; a second chat retained the project file but showed zero chat files, and returning to the first chat restored only its chat file; global-library management is a separate capability and does not bypass private project ownership |
 | Project state | memory text and `Только документы проекта` were saved through the project panel and remained selected after a full browser reload |
 | Mobile acceptance | at `390x844`, authenticated reload preserved the workspace, the `+` attachment action remained available and document width equalled viewport width (`390 px`), with no horizontal overflow |
 | OCR runtime | release image contains Tesseract language packs `rus`, `eng` and `osd`; the supplied PNG was parsed through the real ingestion path and the final answer reproduced `дай формулу ИВ0` exactly with a clickable original-image source |

@@ -41,7 +41,11 @@ class LocalAuthApiTests(unittest.TestCase):
 
     def test_session_endpoint_restores_user_and_issues_csrf_value(self):
         self.client.cookies.set("rag_session", "opaque-session")
-        with patch.dict(os.environ, {"RAG_AUTH_MODE": "local", "RAG_SECRET_KEY": "s" * 40}), \
+        with patch.dict(os.environ, {
+            "RAG_AUTH_MODE": "local",
+            "RAG_SECRET_KEY": "s" * 40,
+            "RAG_ALL_USERS_MANAGE_GLOBAL_DOCUMENTS": "true",
+        }), \
              patch("asgi_app.authenticate_session", return_value=self.user):
             response = self.client.get("/api/auth/session")
             csrf_is_valid = verify_csrf("opaque-session", response.json()["csrf_token"])
@@ -49,6 +53,8 @@ class LocalAuthApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["authenticated"])
         self.assertEqual(response.json()["user"]["email"], "user@example.com")
+        self.assertTrue(response.json()["user"]["can_manage_global_documents"])
+        self.assertFalse(response.json()["user"]["is_admin"])
         self.assertTrue(csrf_is_valid)
         self.assertIn("HttpOnly", response.headers["set-cookie"])
 

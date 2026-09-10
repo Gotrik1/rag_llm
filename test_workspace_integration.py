@@ -350,3 +350,37 @@ class WorkspacePersistenceIntegrationTests(unittest.TestCase):
                 if project_id:
                     cursor.execute("DELETE FROM projects WHERE id = %s", (project_id,))
             db_store.db().commit()
+
+    def test_global_document_management_is_shared_without_private_scope_bypass(self) -> None:
+        suffix = uuid.uuid4().hex
+        subject_a = f"local:global-manager-a-{suffix}"
+        subject_b = f"local:global-manager-b-{suffix}"
+        document_id = None
+        try:
+            with db_store.request_scope(subject_a, can_manage_global_documents=True):
+                document = db_store.create_document(None, None, {
+                    "file_name": f"shared-managed-{suffix}.md",
+                    "source_path": f"/app/.data/uploads/shared-managed-{suffix}.md",
+                    "mime_type": "text/markdown",
+                    "status": "queued",
+                })
+                document_id = str(document["id"])
+                self.assertIsNone(document["owner_subject"])
+
+            with db_store.request_scope(subject_b):
+                self.assertEqual(db_store.get_document(document_id)["scope"], "global")
+                with self.assertRaises(PermissionError):
+                    db_store.update_document(document_id, {"status": "ready"})
+                with self.assertRaises(PermissionError):
+                    db_store.tombstone_document(document_id)
+
+            with db_store.request_scope(subject_b, can_manage_global_documents=True):
+                updated = db_store.update_document(document_id, {"status": "ready"})
+                self.assertEqual(updated["status"], "ready")
+                deleted = db_store.tombstone_document(document_id)
+                self.assertEqual(deleted["status"], "deleting")
+        finally:
+            if document_id:
+                with db_store.db().cursor() as cursor:
+                    cursor.execute("DELETE FROM documents WHERE id = %s", (document_id,))
+                db_store.db().commit()

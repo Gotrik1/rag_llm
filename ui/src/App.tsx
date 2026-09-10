@@ -232,6 +232,7 @@ type AuthUser = {
   email: string;
   display_name: string;
   is_admin: boolean;
+  can_manage_global_documents: boolean;
 };
 
 type SessionResponse = {
@@ -1264,7 +1265,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
             onProjectManage={(projectId) => void manageProject(projectId)}
             onProjectPin={(projectId) => void updatePinnedItems("project", projectId)}
             onProjectRename={(projectId, name) => void renameProject(projectId, name)}
-            canDeleteGlobalDocuments={user.is_admin}
+            canDeleteGlobalDocuments={user.can_manage_global_documents}
           />
           {workspaceError && <div className="sidebar-note">{workspaceError}</div>}
           <div className="sidebar-user">
@@ -1298,7 +1299,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
         <EvidencePanel
           activeTab={activeTab}
           activeProvider={activeProvider}
-          canManageGlobalDocuments={user.is_admin}
+          canManageGlobalDocuments={user.can_manage_global_documents}
           theme={theme}
           debugError={debugError}
           debugResult={debugResult}
@@ -2779,7 +2780,7 @@ function EvidencePanel({
           ) : (
             <section className="global-library-note">
               <div className="loader-title"><Database size={15} /><span>Общая база знаний</span></div>
-              <p>Общие документы доступны для поиска во всех проектах. Загружать и удалять их может только администратор.</p>
+              <p>Общие документы доступны для поиска во всех проектах. У этой учётной записи нет права загрузки и удаления.</p>
               <strong>{splitDocumentsByScope(documents).global.length} документов доступно</strong>
             </section>
           )}

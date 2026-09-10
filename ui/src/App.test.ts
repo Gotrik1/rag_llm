@@ -24,6 +24,20 @@ describe("persisted generation state", () => {
     expect(normalizeMarkdown(markdown)).toBe(markdown);
   });
 
+  it("removes nested dollar delimiters copied around display formulas", () => {
+    const markdown = String.raw`$$$$S_{\text{э1цк}} = V_{\text{ЭЭ}} \times \text{Ц}_{\text{ПУНЦ}}$$$$`;
+
+    expect(normalizeMarkdown(markdown)).toBe(
+      String.raw`$$S_{\text{э1цк}} = V_{\text{ЭЭ}} \times \text{Ц}_{\text{ПУНЦ}}$$`
+    );
+  });
+
+  it("leaves nested delimiter examples inside fenced code unchanged", () => {
+    const markdown = ["```latex", String.raw`$$$$S = V \times C$$$$`, "```"].join("\n");
+
+    expect(normalizeMarkdown(markdown)).toBe(markdown);
+  });
+
   it("shows upload time and conservative version status", () => {
     expect(documentUploadedLabel()).toBe("Время загрузки неизвестно");
     expect(documentVersionLabel({ version_label: null, version_status: "unknown" })).toBe("Версия не указана");

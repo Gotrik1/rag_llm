@@ -2489,7 +2489,14 @@ export function normalizeMarkdown(markdown: string): string {
     const tableSafeLine = line.includes("|")
       ? line.replace(/(\S)\s+•\s*/g, "$1<br />• ")
       : line;
-    return normalizeLegacyLatexLine(tableSafeLine);
+    // Qwen can copy an already-delimited formula from the retrieval prompt and
+    // wrap it in another pair of dollar delimiters (for example
+    // `$$$$S = V \\times C$$$$`). remark-math treats the outer pair as the
+    // block delimiter and passes the inner dollars to KaTeX, which then renders
+    // a red parse error. Collapse only runs of three or more dollars; ordinary
+    // inline `$...$`, display `$$...$$`, and currency text stay untouched.
+    const mathSafeLine = tableSafeLine.replace(/\${3,}/g, () => "$$");
+    return normalizeLegacyLatexLine(mathSafeLine);
   }).join("\n");
 }
 

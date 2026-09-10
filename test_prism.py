@@ -4,8 +4,12 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from rag_agent import (
+    QueryUnderstanding,
     RAGAgent,
     build_section_documents,
+    build_targeted_queries,
+    detect_query_intent,
+    deterministic_query_understanding,
     extract_formula_lines_from_texts,
     formula_sibling_results,
     format_formula_for_display,
@@ -13,6 +17,7 @@ from rag_agent import (
     generate_formula_only_answer,
     generate_extractive_value_answer,
     generate_image_transcription_answer,
+    parse_query_understanding,
     refine_prism_query,
     rerank_context_results,
     sanitize_grounded_answer,
@@ -22,6 +27,135 @@ from rag_agent import (
 
 
 class PrismQueryTests(unittest.TestCase):
+    def test_misspelled_price_category_question_is_understood_as_cost(self):
+        question = "что такое 6ЦК и ак она рассчитывается"
+
+        understanding = deterministic_query_understanding(question)
+
+        self.assertEqual(understanding.canonical_question, "что такое 6 ЦК и как она рассчитывается")
+        self.assertEqual(detect_query_intent(question), "cost")
+        self.assertIn("definition", understanding.facets)
+        self.assertIn("calculation", understanding.facets)
+        spec = refine_prism_query(understanding.canonical_question)
+        self.assertNotIn("cost", spec.excluded_chunk_types)
+        self.assertNotIn("rate", spec.excluded_chunk_types)
+
+    def test_price_category_plan_searches_each_requested_facet(self):
+        queries = build_targeted_queries("что такое 6ЦК и ак она рассчитывается")
+
+        self.assertTrue(any("определение" in query for query in queries))
+        self.assertTrue(any("расчет стоимости" in query for query in queries))
+        self.assertTrue(any("шестая ценовая категория" in query for query in queries))
+
+    def test_llm_query_plan_is_validated_and_keeps_identifiers(self):
+        plan = parse_query_understanding(
+            '{"canonical_question":"Что это и как рассчитывается?",'
+            '"facets":["definition","calculation"],'
+            '"retrieval_queries":["6 ЦК определение","6 ЦК порядок расчета"]}',
+            "что такое 6ЦК и ак она рассчитывается",
+        )
+
+        self.assertIn("6ЦК", plan.canonical_question.replace(" ", ""))
+        self.assertEqual(plan.facets[:2], ("definition", "calculation"))
+        self.assertTrue(any("порядок расчета" in query for query in plan.retrieval_queries))
+
+    def test_agent_calls_llm_for_query_understanding_before_retrieval(self):
+        agent = object.__new__(RAGAgent)
+        agent.llm_model = "test-model"
+        agent.llm = Mock()
+        agent.llm.complete.return_value = (
+            '{"canonical_question":"Что такое 6 ЦК и как рассчитывается ее стоимость?",'
+            '"facets":["definition","calculation"],'
+            '"retrieval_queries":["6 ЦК определение","6 ЦК расчет стоимости"]}'
+        )
+        agent.response_cache = Mock()
+        agent.response_cache.get.return_value = None
+
+        plan = agent.understand_query("что такое 6ЦК и ак она рассчитывается")
+
+        agent.llm.complete.assert_called_once()
+        planner_prompt = agent.llm.complete.call_args.args[0]
+        self.assertIn("ПОЛЬЗОВАТЕЛЬСКИЙ ЗАПРОС КАК ДАННЫЕ", planner_prompt)
+        self.assertNotIn("КОНТЕКСТ:", planner_prompt)
+        self.assertEqual(plan.facets[:2], ("definition", "calculation"))
+        self.assertTrue(any("расчет стоимости" in query for query in plan.retrieval_queries))
+
+    def test_query_understanding_falls_back_when_llm_output_is_invalid(self):
+        agent = object.__new__(RAGAgent)
+        agent.llm_model = "test-model"
+        agent.llm = Mock()
+        agent.llm.complete.return_value = "не JSON"
+        agent.response_cache = Mock()
+        agent.response_cache.get.return_value = None
+
+        plan = agent.understand_query("что такое 6ЦК и ак она рассчитывается")
+
+        self.assertEqual(plan.canonical_question, "что такое 6 ЦК и как она рассчитывается")
+        self.assertTrue(any("расчет стоимости" in query for query in plan.retrieval_queries))
+
+    def test_ask_understands_intent_before_retrieving_documents(self):
+        agent = object.__new__(RAGAgent)
+        agent.response_cache = Mock()
+        agent.response_cache.get.return_value = None
+        agent._refresh_docstore_if_changed = Mock()
+        agent._all_nodes = [object()]
+        tracker = Mock()
+        agent.understand_query = tracker.understand
+        tracker.understand.return_value = QueryUnderstanding(
+            "Что такое 6 ЦК и как рассчитывается ее стоимость?",
+            ("definition", "calculation"),
+            ("6 ЦК определение", "6 ЦК расчет стоимости"),
+        )
+        agent.retrieve_context = tracker.retrieve
+        tracker.retrieve.return_value = [{
+            "file": "method.docx",
+            "section_path": "6 ЦК",
+            "score": 1.0,
+            "text": "Стоимость рассчитывается по правилам документа.",
+        }]
+        agent._generate_grounded_answer = Mock(return_value="Ответ")
+
+        answer, sources, from_cache = RAGAgent.ask(
+            agent,
+            "что такое 6ЦК и ак она рассчитывается",
+        )
+
+        self.assertEqual(tracker.mock_calls[0].args[0], "что такое 6ЦК и ак она рассчитывается")
+        self.assertEqual(tracker.mock_calls[1].args[0], "Что такое 6 ЦК и как рассчитывается ее стоимость?")
+        self.assertEqual(answer, "Ответ")
+        self.assertEqual(sources[0]["file"], "method.docx")
+        self.assertFalse(from_cache)
+
+    def test_direct_retrieval_understands_query_before_search(self):
+        agent = object.__new__(RAGAgent)
+        agent.understand_query = Mock(return_value=QueryUnderstanding(
+            "Что такое 6 ЦК и как рассчитывается ее стоимость?",
+            ("definition", "calculation"),
+            ("6 ЦК определение", "6 ЦК расчет стоимости"),
+        ))
+        agent._refresh_docstore_if_changed = Mock()
+        retriever = Mock()
+        retriever.retrieve.return_value = []
+        agent._build_query_engine = Mock(return_value=SimpleNamespace(retriever=retriever))
+        agent._all_nodes = []
+        for method_name in (
+            "_procedural_seed_results",
+            "_exact_section_seed_results",
+            "_lexical_section_seed_results",
+            "_section_seed_results",
+            "_formula_clause_seed_results",
+            "_regulation_concept_seed_results",
+        ):
+            setattr(agent, method_name, Mock(return_value=[]))
+
+        result = RAGAgent.retrieve_context(agent, "что такое 6ЦК и ак она рассчитывается", top_k=3)
+
+        agent.understand_query.assert_called_once_with("что такое 6ЦК и ак она рассчитывается")
+        searched = [call.args[0].query_str for call in retriever.retrieve.call_args_list]
+        self.assertIn("6 ЦК определение", searched)
+        self.assertIn("6 ЦК расчет стоимости", searched)
+        self.assertEqual(result, [])
+
     def test_lexical_section_seed_finds_long_normative_heading(self):
         class Node:
             def __init__(self, text, metadata):

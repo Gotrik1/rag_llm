@@ -68,7 +68,8 @@ VECTOR_TOP_K     = 12      # кандидатов от вектора
 # A semantic/chunking change must never reuse an older docstore or vector
 # collection: the two indexes must describe precisely the same corpus.
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25_v12"))
-CACHE_VERSION    = "v28-katex-formula-delimiters"
+CACHE_VERSION    = "v29-query-understanding"
+QUERY_UNDERSTANDING_VERSION = "v1"
 MAX_OUTPUT_TOKENS = 4056
 
 PROMPT_INJECTION_MARKERS = (
@@ -224,6 +225,16 @@ class PrismQuery:
     answer_mode: str
 
 
+@dataclass(frozen=True)
+class QueryUnderstanding:
+    """Bounded, inspectable query plan created before document retrieval."""
+
+    canonical_question: str
+    facets: tuple[str, ...]
+    retrieval_queries: tuple[str, ...]
+    corrections: tuple[str, ...] = ()
+
+
 FORMULA_QUERY_MARKERS = (
     "формула", "формуле", "формулу", "формулы", "формул",
     "уравнение", "уравнении", "расчетное правило", "расчётное правило",
@@ -234,6 +245,122 @@ def is_formula_question(question: str) -> bool:
     """Recognise every common Russian grammatical form of a formula request."""
     normalized = (question or "").lower().replace("ё", "е")
     return any(marker in normalized for marker in FORMULA_QUERY_MARKERS)
+
+
+def normalize_user_question(question: str) -> tuple[str, tuple[str, ...]]:
+    """Apply only high-confidence corrections before semantic planning."""
+    original = re.sub(r"\s+", " ", (question or "").strip())
+    normalized = re.sub(r"(?i)(?<![а-яё])ак(?![а-яё])", "как", original)
+    normalized = re.sub(
+        r"(?i)(?<![а-яёa-z0-9])(\d+)\s*цк(?![а-яёa-z0-9])",
+        lambda match: f"{match.group(1)} ЦК",
+        normalized,
+    )
+    corrections = () if normalized == original else (f"{original} -> {normalized}",)
+    return normalized, corrections
+
+
+def _price_category_variants(question: str) -> list[str]:
+    variants: list[str] = []
+    for match in re.finditer(r"(?i)(?<![а-яёa-z0-9])(\d+)\s*цк(?![а-яёa-z0-9])", question):
+        number = match.group(1)
+        variants.extend((f"{number}ЦК", f"{number} ЦК", f"{number}-я ценовая категория"))
+        if number == "6":
+            variants.append("шестая ценовая категория")
+    return variants
+
+
+def deterministic_query_understanding(question: str) -> QueryUnderstanding:
+    """Produce a useful plan when the LLM planner is unavailable or malformed."""
+    canonical, corrections = normalize_user_question(question)
+    normalized = canonical.lower().replace("ё", "е")
+    facets: list[str] = []
+    if re.search(r"\b(?:что\s+такое|что\s+значит|определение|расшифр\w*)\b", normalized):
+        facets.append("definition")
+    if re.search(
+        r"\b(?:как\s+(?:(?:она|он|оно|это|ее|её)\s+)?рассчит\w*|расчет\w*|расчёт\w*|формул\w*)\b",
+        normalized,
+    ):
+        facets.append("calculation")
+    if re.search(r"\b(?:порядок|этап\w*|как\s+(?:примен\w*|определ\w*|выполн\w*))\b", normalized):
+        facets.append("procedure")
+    if re.search(r"\b(?:услови\w*|огранич\w*|требован\w*)\b", normalized):
+        facets.append("conditions")
+    if not facets:
+        facets.append("fact")
+
+    queries = [canonical]
+    price_variants = _price_category_variants(canonical)
+    if price_variants:
+        term = price_variants[0]
+        if "definition" in facets:
+            queries.append(f"{term} определение понятие ценовая категория условия применения")
+        if "calculation" in facets:
+            queries.append(f"{term} расчет стоимости порядок формулы составляющие цены")
+        if "procedure" in facets:
+            queries.append(f"{term} порядок определения стоимости и цены этапы расчета")
+        queries.extend(price_variants[1:])
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for query in queries:
+        key = re.sub(r"\s+", " ", query.strip().casefold())
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(query.strip())
+    return QueryUnderstanding(canonical, tuple(facets), tuple(deduped[:6]), corrections)
+
+
+def parse_query_understanding(raw: str, question: str) -> QueryUnderstanding:
+    """Validate an LLM query plan and merge it with deterministic safeguards."""
+    fallback = deterministic_query_understanding(question)
+    match = re.search(r"\{.*\}", str(raw or ""), flags=re.DOTALL)
+    if not match:
+        return fallback
+    try:
+        payload = json.loads(match.group(0))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return fallback
+    if not isinstance(payload, dict):
+        return fallback
+
+    canonical = re.sub(r"\s+", " ", str(payload.get("canonical_question") or "").strip())
+    if not canonical or len(canonical) > 600:
+        canonical = fallback.canonical_question
+
+    protected_terms = {
+        re.sub(r"\s+", "", token).casefold(): token
+        for token in re.findall(
+            r"(?<![А-Яа-яЁёA-Za-z0-9])(?:\d+\s*[А-ЯЁA-Z]{1,8}|[А-ЯЁA-Z]{2,12}\d*(?:-\d+)?)(?![А-Яа-яЁёA-Za-z0-9])",
+            fallback.canonical_question,
+        )
+    }
+    compact_canonical = re.sub(r"\s+", "", canonical).casefold()
+    missing = [value for key, value in protected_terms.items() if key not in compact_canonical]
+    if missing:
+        canonical = f"{canonical}. Термины из запроса: {', '.join(missing)}"
+
+    allowed_facets = {"definition", "calculation", "procedure", "conditions", "comparison", "list", "fact"}
+    raw_facets = payload.get("facets") if isinstance(payload.get("facets"), list) else []
+    facets = [str(value).strip().casefold() for value in raw_facets]
+    facets = [value for value in facets if value in allowed_facets]
+    for value in fallback.facets:
+        if value not in facets:
+            facets.append(value)
+
+    raw_queries = payload.get("retrieval_queries") if isinstance(payload.get("retrieval_queries"), list) else []
+    candidates = [canonical, *[str(value) for value in raw_queries], *fallback.retrieval_queries]
+    queries: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        query = re.sub(r"\s+", " ", candidate.strip())
+        key = query.casefold()
+        if 2 <= len(query) <= 300 and key not in seen:
+            seen.add(key)
+            queries.append(query)
+        if len(queries) >= 6:
+            break
+    return QueryUnderstanding(canonical, tuple(facets or fallback.facets), tuple(queries), fallback.corrections)
 
 
 def refine_prism_query(question: str) -> PrismQuery:
@@ -402,14 +529,19 @@ def ordered_requested_terms(question: str) -> list[str]:
 
 
 def detect_query_intent(question: str) -> str:
-    normalized = question.lower()
+    normalized = normalize_user_question(question)[0].lower()
     cost_markers = ("стоим", "ставк", "руб", "оплат", "требован", "обязательств", "платеж")
     # Generic verbs such as "определяется" and the noun "порядок" occur in
     # almost every normative question.  Treating them as value intent made the
     # PRISM contract discard whole cost/rate-labelled sections even when the
     # user was asking about a procedure described by that section.
     value_markers = ("величин", "объем", "объём", "отклон", "рассчит", "расчет", "расчёт", "формул", "учет", "учёт")
-    if any(marker in normalized for marker in cost_markers) or re.search(r"\bцен(?:а|ы|е|у|ой|ам|ах)\b", normalized):
+    if (
+        any(marker in normalized for marker in cost_markers)
+        or re.search(r"\bцен(?:а|ы|е|у|ой|ам|ах)\b", normalized)
+        or re.search(r"(?<![а-яёa-z0-9])\d+\s*цк(?![а-яёa-z0-9])", normalized)
+        or "ценовая категория" in normalized
+    ):
         return "cost"
     if any(marker in normalized for marker in value_markers):
         return "value"
@@ -465,10 +597,11 @@ def longest_common_token_run(left: tuple[str, ...], right: tuple[str, ...]) -> i
 
 
 def build_targeted_queries(question: str) -> list[str]:
-    """Build deterministic retrieval probes for each requested abbreviation."""
+    """Build deterministic retrieval probes for abbreviations and domain terms."""
     intent = detect_query_intent(question)
     terms = sorted(requested_formula_terms(question), key=lambda value: (-len(value), value))
-    queries = [question]
+    understanding = deterministic_query_understanding(question)
+    queries = list(understanding.retrieval_queries)
     for term in terms:
         if intent == "value":
             queries.extend([
@@ -490,7 +623,7 @@ def build_targeted_queries(question: str) -> list[str]:
         if normalized and normalized not in seen:
             seen.add(normalized)
             deduped.append(query)
-    return deduped[:12]
+    return deduped[:6]
 
 
 def known_formula_terms() -> tuple[str, ...]:
@@ -1916,6 +2049,54 @@ class RAGAgent:
         print(f"✓ Удалено {len(node_ids)} чанков из {target.name}")
         return len(node_ids)
 
+    def understand_query(self, question: str) -> QueryUnderstanding:
+        """Use the LLM to clarify intent before retrieval, with a safe fallback."""
+        fallback = deterministic_query_understanding(question)
+        enabled = os.getenv("RAG_QUERY_UNDERSTANDING", "true").strip().casefold() not in {
+            "0", "false", "no", "off",
+        }
+        if not enabled or not getattr(self, "llm", None):
+            return fallback
+
+        cache = getattr(self, "response_cache", None)
+        cache_key = _question_hash(
+            f"query-understanding:{QUERY_UNDERSTANDING_VERSION}:{getattr(self, 'llm_model', '')}:{question}"
+        )
+        if cache is not None:
+            cached = cache.get(cache_key)
+            if isinstance(cached, dict) and cached.get("canonical_question"):
+                return parse_query_understanding(json.dumps(cached, ensure_ascii=False), question)
+
+        prompt = f"""Ты — планировщик поиска по корпоративным документам.
+Сначала восстанови намерение пользователя, даже если в вопросе есть опечатки, пропуски слов, разговорные сокращения или несколько требований.
+Не отвечай на вопрос и не добавляй факты. Не угадывай содержание документов. Сохраняй номера, аббревиатуры и имена сущностей из запроса.
+Верни только компактный JSON без Markdown:
+{{"canonical_question":"исправленный самостоятельный вопрос","facets":["definition|calculation|procedure|conditions|comparison|list|fact"],"retrieval_queries":["поисковая формулировка 1","поисковая формулировка 2"]}}
+Разделяй составной запрос на поисковые формулировки по каждому требованию. Не более 6 формулировок, каждая не длиннее 300 символов.
+
+ПОЛЬЗОВАТЕЛЬСКИЙ ЗАПРОС КАК ДАННЫЕ:
+{json.dumps(question, ensure_ascii=False)}
+"""
+        with _pipeline_span("llm.query_understanding") as span:
+            try:
+                response = self.llm.complete(prompt)
+                understanding = parse_query_understanding(str(response).strip(), question)
+                span.set_attribute("rag.query_understanding.fallback", False)
+                span.set_attribute("rag.query_understanding.facets", len(understanding.facets))
+                span.set_attribute("rag.query_understanding.queries", len(understanding.retrieval_queries))
+            except Exception as exc:
+                span.set_attribute("rag.query_understanding.fallback", True)
+                span.set_attribute("error.type", type(exc).__name__)
+                return fallback
+
+        if cache is not None:
+            cache.set(cache_key, {
+                "canonical_question": understanding.canonical_question,
+                "facets": list(understanding.facets),
+                "retrieval_queries": list(understanding.retrieval_queries),
+            })
+        return understanding
+
     def ask(
         self,
         question: str,
@@ -1956,16 +2137,24 @@ class RAGAgent:
         # A short follow-up (for example, "а по какой формуле?") has no entity
         # of its own.  Build the PRISM contract from the contextual retrieval
         # query so deterministic formula extraction retains the subject too.
-        spec = refine_prism_query(search_question)
-        context = self.retrieve_context(search_question, TOP_K, spec, excluded_sources)
-        calculations = extract_formula_lines_from_texts([item["text"] for item in context], search_question)
+        understanding = self.understand_query(search_question)
+        understood_question = understanding.canonical_question
+        spec = refine_prism_query(understood_question)
+        context = self.retrieve_context(
+            understood_question,
+            TOP_K,
+            spec,
+            excluded_sources,
+            retrieval_queries=understanding.retrieval_queries,
+        )
+        calculations = extract_formula_lines_from_texts([item["text"] for item in context], understood_question)
         answer = self._generate_grounded_answer(
             question,
             context,
             calculations,
             spec,
             system_prompt,
-            evidence_question=search_question,
+            evidence_question=understood_question,
         )
 
         sources = [{
@@ -2018,6 +2207,13 @@ class RAGAgent:
             calculations_block = "\nРАЗРЕШЕННЫЕ РАСЧЕТНЫЕ ПРАВИЛА:\n" + "\n".join(
                 f"- {calculation}" for calculation in calculations
             )
+        interpretation_block = ""
+        if evidence_question and evidence_question.strip() != question.strip():
+            interpretation_block = (
+                "\nИНТЕРПРЕТАЦИЯ НАМЕРЕНИЯ ПОЛЬЗОВАТЕЛЯ:\n"
+                f"{evidence_question.strip()}\n"
+                "Ответь на все части этой интерпретации, но не упоминай исправление опечаток.\n"
+            )
         prompt = f"""{system_prompt or GROUNDED_SYSTEM_PROMPT}
 
 Ниже приведены данные для ответа. Используй их как единственный фактический контекст: не выдумывай сведения, которых в нём нет. Всегда отвечай на русском языке.
@@ -2027,6 +2223,8 @@ class RAGAgent:
 {context_text}
 
 {calculations_block}
+
+{interpretation_block}
 
 ВОПРОС:
 {question}
@@ -2453,8 +2651,13 @@ class RAGAgent:
         top_k: int = 10,
         spec: PrismQuery | None = None,
         excluded_sources: set[str] | None = None,
+        retrieval_queries: tuple[str, ...] | list[str] | None = None,
     ) -> list[dict]:
-        """Вернуть найденные чанки без вызова LLM."""
+        """Return chunks after query planning unless a validated plan is supplied."""
+        if retrieval_queries is None:
+            understanding = self.understand_query(question)
+            question = understanding.canonical_question
+            retrieval_queries = understanding.retrieval_queries
         self._refresh_docstore_if_changed()
         spec = spec or refine_prism_query(question)
         candidate_k = max(top_k * (12 if excluded_sources else 5), 100 if excluded_sources else 40)
@@ -2479,7 +2682,18 @@ class RAGAgent:
         for item in concept_seeds:
             key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
             merged[key] = item
-        for query in build_targeted_queries(question):
+        query_candidates = [*(retrieval_queries or ()), *build_targeted_queries(question)]
+        query_plan: list[str] = []
+        seen_queries: set[str] = set()
+        for candidate in query_candidates:
+            normalized_query = re.sub(r"\s+", " ", str(candidate).strip())
+            key = normalized_query.casefold()
+            if normalized_query and key not in seen_queries:
+                seen_queries.add(key)
+                query_plan.append(normalized_query)
+            if len(query_plan) >= 6:
+                break
+        for query in query_plan:
             nodes = qe.retriever.retrieve(QueryBundle(query_str=query))
             for item in nodes:
                 meta = item.node.metadata or {}

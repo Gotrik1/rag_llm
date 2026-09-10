@@ -72,6 +72,7 @@ artifact files.
 | Runtime | 20 Compose services running and `0` unhealthy/exited/restarting; application, proxy, TLS proxy, LLM bridge, vLLM, PostgreSQL, Redis and Qdrant report healthy where health checks are defined |
 | Health | `/healthz` -> `{"status":"ok"}`; `/readyz` -> `{"status":"ready"}` |
 | Public access | root returns `200` without VPN/Basic Auth; anonymous `/api/me` returns JSON `401` without `WWW-Authenticate` |
+| VM restart recovery | the final availability check found the exact Cloud Director VM `iprg001` unexpectedly `POWERED_OFF`; it was powered on through O2 Cloud, returned to `POWERED_ON`, retained `current` -> `9fc3b2e8c` and `rollback` -> `47fa298eb`, and `/`, `/healthz` and `/readyz` again returned `200` while anonymous `/api/me` returned `401` without a Basic Auth challenge |
 | Post-release errors | application log contains `0` HTTP 5xx responses since activation of `9fc3b2e8c` |
 | Registration/session UI | registration created a workspace and user card; repeated reloads preserved the session; explicit logout showed the application login page; re-login restored the same chat without a Basic Auth prompt |
 | Upload entry points | the `+` panel contains only `Добавить в текущий чат` and `Загрузить в чат`; the project menu contains `Память и документы`, a project-only registry and `Загрузить в проект`; the ordinary-user technical panel contains the global-only picker |
@@ -111,6 +112,11 @@ were retained. The release archive was hash-checked before extraction, database
 backup was taken before migration, and the prior release remains available via
 the `rollback` symlink. Operational/user documentation is also copied to
 `/opt/rag_llm/shared/docs`, outside rotating release directories.
+
+The application release survived a provider-level VM power cycle without a
+session/data migration or rollback. The public service recovered on the same IP
+and port. A separate infrastructure monitor should alert on Cloud Director VM
+power state so a powered-off host is distinguished from an application fault.
 
 ## Known follow-up hardening
 

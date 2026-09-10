@@ -20,6 +20,8 @@ rank-bm25>=0.2.2
 
 # Document parsers
 docling>=2.111.0          # structured DOCX/PDF/PPTX ingestion for RAG
+pillow>=11.0.0            # safe raster decoding and OCR preprocessing
+pytesseract>=0.3.13       # local Russian/English OCR for image uploads
 mammoth>=1.12.0           # lightweight DOCX to Markdown fallback
 # Optional heavier fallback:
 # unstructured>=0.18.0

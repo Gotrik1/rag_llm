@@ -1556,6 +1556,9 @@ sub {
 }
 
 .icon-button:focus-visible,
+.attach-button:focus-visible,
+.attachment-panel button:focus-visible,
+.attachment-panel label:focus-within,
 .send-button:focus-visible,
 .markdown-table-toolbar button:focus-visible,
 .markdown-table-modal-heading button:focus-visible {
@@ -1563,11 +1566,18 @@ sub {
   outline-offset: 2px;
 }
 
+.composer-stack {
+  position: relative;
+  display: grid;
+  width: min(860px, 100%);
+  gap: 8px;
+}
+
 .composer {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 42px;
+  grid-template-columns: 42px minmax(0, 1fr) 42px;
   gap: 8px;
-  width: min(860px, 100%);
+  width: 100%;
   border: 0;
   border-radius: 14px;
   background: var(--surface-2);
@@ -1590,6 +1600,7 @@ sub {
   color: #8a94a2;
 }
 
+.attach-button,
 .send-button {
   display: grid;
   width: 42px;
@@ -1601,6 +1612,19 @@ sub {
   background: var(--blue);
   color: white;
   cursor: pointer;
+}
+
+.attach-button {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.attach-button:hover,
+.attach-button[aria-expanded="true"] {
+  border-color: var(--blue);
+  background: color-mix(in srgb, var(--blue) 10%, var(--surface));
+  color: var(--blue);
 }
 
 .send-button:hover {
@@ -1627,6 +1651,203 @@ sub {
   background: #fbfcfd;
   padding: 18px;
   box-shadow: none;
+}
+
+.attachment-panel {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 12;
+  display: grid;
+  max-height: min(610px, calc(100vh - 170px));
+  gap: 14px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+  padding: 18px;
+  box-shadow: 0 18px 42px rgb(24 32 45 / 22%);
+}
+
+.attachment-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.attachment-heading h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 18px;
+  letter-spacing: -0.02em;
+}
+
+.attachment-heading p,
+.attachment-ocr-note {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.attachment-targets,
+.attachment-kinds {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.attachment-targets button,
+.attachment-kinds label {
+  display: flex;
+  min-width: 0;
+  min-height: 58px;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  padding: 10px 12px;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.attachment-targets button:hover,
+.attachment-kinds label:hover {
+  border-color: var(--blue);
+}
+
+.attachment-targets button.active {
+  border-color: var(--blue);
+  background: color-mix(in srgb, var(--blue) 9%, var(--surface));
+  color: var(--blue);
+}
+
+.attachment-targets button:disabled {
+  opacity: 0.52;
+  cursor: not-allowed;
+}
+
+.attachment-targets button > span,
+.attachment-kinds label > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.attachment-targets strong,
+.attachment-kinds strong {
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-targets small,
+.attachment-kinds small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-kinds label {
+  border-style: dashed;
+  background: var(--surface);
+}
+
+.attachment-files {
+  display: grid;
+  gap: 6px;
+}
+
+.attachment-files > div {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 30px;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  padding: 6px 7px 6px 10px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.attachment-files span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-files button {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.attachment-files button:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.attachment-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.attachment-upload {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--blue);
+  padding: 0 16px;
+  color: white;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.attachment-upload:hover {
+  background: var(--interaction-highlight);
+}
+
+.attachment-upload:disabled {
+  background: #b8c4d6;
+  cursor: not-allowed;
+}
+
+.upload-target-field {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.upload-target-field select {
+  min-height: 38px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  padding: 0 9px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
 }
 
 .workspace-heading {
@@ -2176,6 +2397,22 @@ sub {
   color: rgb(255 255 255 / 72%);
 }
 
+.theme-portal .attach-button {
+  border-color: transparent;
+  background: rgb(255 255 255 / 16%);
+  color: #ffffff;
+}
+
+.theme-portal .attach-button:hover,
+.theme-portal .attach-button[aria-expanded="true"] {
+  background: #ffffff;
+  color: #1c1c1c;
+}
+
+.theme-portal .attachment-upload {
+  background: #f28a32;
+}
+
 .theme-portal .evidence-panel {
   border: 0;
   background: #ffc45f;
@@ -2439,6 +2676,16 @@ sub {
 
   .thread-footer {
     padding: 12px;
+  }
+
+  .attachment-panel {
+    max-height: calc(100vh - 140px);
+    padding: 14px;
+  }
+
+  .attachment-targets,
+  .attachment-kinds {
+    grid-template-columns: 1fr;
   }
 }
 

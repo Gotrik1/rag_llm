@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,7 +12,8 @@ from runtime_paths import INGESTION_CACHE_DIR
 
 
 CACHE_DIR = INGESTION_CACHE_DIR
-INGESTION_CACHE_VERSION = "v3-omml-mathml-ref"
+INGESTION_CACHE_VERSION = "v4-ocr-images"
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
 
 
 @dataclass
@@ -28,25 +30,31 @@ def ingest_document(path: str | Path) -> IngestedDocument:
         return cached
 
     warnings: list[str] = []
-    if path.suffix.lower() == ".docx":
+    suffix = path.suffix.lower()
+    if suffix in IMAGE_SUFFIXES:
+        backends = [("tesseract-ocr", _read_image_with_tesseract)]
+        minimum_text_length = 3
+    elif suffix == ".docx":
         backends = [
             ("xml", _read_with_xml),
             ("docling", _read_with_docling),
             ("unstructured", _read_with_unstructured),
             ("mammoth", _read_with_mammoth),
         ]
+        minimum_text_length = 100
     else:
         backends = [
             ("docling", _read_with_docling),
             ("unstructured", _read_with_unstructured),
             ("xml", _read_with_xml),
         ]
+        minimum_text_length = 100
 
     for name, reader in backends:
         try:
             text = reader(path)
             text = normalize_ingested_text(text)
-            if len(text.strip()) > 100:
+            if len(text.strip()) >= minimum_text_length:
                 result = IngestedDocument(text=text, backend=name, warnings=warnings)
                 _write_cache(path, result)
                 return result
@@ -55,6 +63,31 @@ def ingest_document(path: str | Path) -> IngestedDocument:
             warnings.append(f"{name}: {type(exc).__name__}: {exc}")
 
     raise RuntimeError("No ingestion backend could parse document: " + "; ".join(warnings))
+
+
+def _read_image_with_tesseract(path: Path) -> str:
+    """Extract Russian and English text from a raster image using local OCR."""
+    import pytesseract
+    from PIL import Image, ImageOps
+
+    languages = os.getenv("RAG_OCR_LANGUAGES", "rus+eng").strip() or "rus+eng"
+    page_segmentation = os.getenv("RAG_OCR_PSM", "3").strip() or "3"
+    with Image.open(path) as source:
+        image = ImageOps.exif_transpose(source)
+        grayscale = ImageOps.grayscale(image)
+        prepared = ImageOps.autocontrast(grayscale)
+        text = pytesseract.image_to_string(
+            prepared,
+            lang=languages,
+            config=f"--oem 1 --psm {page_segmentation}",
+        )
+        if len(text.strip()) < 3 and page_segmentation != "11":
+            text = pytesseract.image_to_string(
+                prepared,
+                lang=languages,
+                config="--oem 1 --psm 11",
+            )
+    return text
 
 
 def normalize_ingested_text(text: str) -> str:

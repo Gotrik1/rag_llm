@@ -269,6 +269,25 @@ class AsgiFoundationTests(unittest.TestCase):
         self.assertEqual(create_document.call_args.args[1], "chat-1")
         self.assertEqual(submit.await_args.args[1]["document_id"], "document-1")
 
+    def test_image_upload_is_accepted_and_queued_for_chat(self):
+        queued = {"id": "job-image", "kind": "ingestion", "status": "queued", "progress": 0}
+        document = {"id": "document-image"}
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("asgi_app.UPLOAD_DIR", Path(directory)), \
+             patch("asgi_app.create_document", return_value=document) as create_document, \
+             patch("asgi_app.update_document", return_value=document), \
+             patch.object(__import__("asgi_app").jobs, "submit", AsyncMock(return_value=queued)):
+            response = self.client.post(
+                "/api/upload",
+                data={"chat_id": "chat-1"},
+                files={"files": ("scheme.png", b"fake-png", "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(create_document.call_args.args[0], None)
+        self.assertEqual(create_document.call_args.args[1], "chat-1")
+        self.assertEqual(response.json()["files"][0]["job_id"], "job-image")
+
     def test_project_document_registry_is_exposed(self):
         items = [{"id": "document-1", "file_name": "manual.pdf", "status": "ready"}]
         with patch("asgi_app.list_documents", return_value=items) as list_documents:

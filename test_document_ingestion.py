@@ -12,6 +12,20 @@ import docx_parser
 
 
 class DocumentIngestionTests(unittest.TestCase):
+    def test_image_uses_local_ocr_and_accepts_short_meaningful_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "scheme.png"
+            source.write_bytes(b"test-image")
+
+            with patch.object(document_ingestion, "CACHE_DIR", root / "cache"), \
+                 patch.object(document_ingestion, "_read_image_with_tesseract", return_value="ИВ0 = 42") as ocr:
+                result = document_ingestion.ingest_document(source)
+
+            self.assertEqual(result.backend, "tesseract-ocr")
+            self.assertEqual(result.text, "ИВ0 = 42")
+            ocr.assert_called_once_with(source)
+
     def test_docx_preserves_sections_tables_and_omml_fraction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

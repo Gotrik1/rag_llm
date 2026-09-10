@@ -69,7 +69,9 @@ class RegisterRequest(LoginRequest):
     display_name: str = Field(default="", max_length=80)
 
 
-ALLOWED_UPLOAD_SUFFIXES = {".docx", ".pdf", ".md", ".txt"}
+DOCUMENT_UPLOAD_SUFFIXES = {".docx", ".pdf", ".md", ".txt"}
+IMAGE_UPLOAD_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
+ALLOWED_UPLOAD_SUFFIXES = DOCUMENT_UPLOAD_SUFFIXES | IMAGE_UPLOAD_SUFFIXES
 MAX_UPLOAD_BYTES = int(os.getenv("RAG_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 MAX_UPLOAD_FILES = int(os.getenv("RAG_MAX_UPLOAD_FILES", "20"))
 GENERATION_WAIT_SECONDS = float(os.getenv("RAG_GENERATION_WAIT_SECONDS", "900"))

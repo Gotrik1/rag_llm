@@ -180,10 +180,12 @@ describe("persisted generation state", () => {
   it("keeps shared and project documents in separate visible groups", () => {
     const grouped = splitDocumentsByScope([
       { id: "shared", file_name: "Общий регламент.pdf", status: "ready", scope: "global" },
-      { id: "private", file_name: "Проектный расчёт.docx", status: "ready", scope: "project" }
+      { id: "private", file_name: "Проектный расчёт.docx", status: "ready", scope: "project", project_id: "project-1" },
+      { id: "chat", file_name: "Схема.png", status: "ready", scope: "project", chat_id: "chat-1" }
     ]);
 
     expect(grouped.global.map((document) => document.id)).toEqual(["shared"]);
     expect(grouped.project.map((document) => document.id)).toEqual(["private"]);
+    expect(grouped.chat.map((document) => document.id)).toEqual(["chat"]);
   });
 });

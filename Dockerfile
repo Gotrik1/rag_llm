@@ -27,6 +27,9 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
         libgomp1 \
         libmagic1 \
         postgresql-client \
+        tesseract-ocr \
+        tesseract-ocr-eng \
+        tesseract-ocr-rus \
         tini \
     && rm -rf /var/lib/apt/lists/*
 

@@ -28,6 +28,7 @@ import {
   Files,
   Folder,
   FolderInput,
+  Image as ImageIcon,
   LockKeyhole,
   LogOut,
   Maximize2,
@@ -54,6 +55,7 @@ import { createPortal } from "react-dom";
 import { clearCsrfToken, deleteJson, getJson, patchJson, postFormData, postJson, setCsrfToken } from "./api";
 
 type Role = "user" | "assistant";
+type UploadTarget = "project" | "chat";
 
 type ChatEntry = {
   id: string;
@@ -144,6 +146,8 @@ type DocumentRecord = {
   newer_document_id?: string | null;
   newer_file_name?: string | null;
   scope: "global" | "project";
+  project_id?: string | null;
+  chat_id?: string | null;
 };
 
 type ModelsResponse = {
@@ -502,10 +506,12 @@ function useMathTypeset(html?: string) {
 export function splitDocumentsByScope(documents: DocumentRecord[]): {
   global: DocumentRecord[];
   project: DocumentRecord[];
+  chat: DocumentRecord[];
 } {
   return {
     global: documents.filter((document) => document.scope === "global"),
-    project: documents.filter((document) => document.scope !== "global")
+    project: documents.filter((document) => document.scope !== "global" && !document.chat_id),
+    chat: documents.filter((document) => document.scope !== "global" && Boolean(document.chat_id))
   };
 }
 
@@ -671,6 +677,8 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
   const [workspaceSettings, setWorkspaceSettings] = useState<Record<string, unknown>>({});
   const [workspaceError, setWorkspaceError] = useState("");
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [uploadTarget, setUploadTarget] = useState<UploadTarget>("chat");
+  const [isAttachmentPanelOpen, setIsAttachmentPanelOpen] = useState(false);
   const [uploadResult, setUploadResult] = useState<UploadResponse | null>(null);
   const [uploadError, setUploadError] = useState("");
   const [isUploading, setIsUploading] = useState(false);
@@ -689,6 +697,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
   const activeProject = activeProjectId
     ? projects.find((project) => project.id === activeProjectId) ?? DEFAULT_PROJECT
     : FREE_CHAT_WORKSPACE;
+  const activeChat = chats.find((chat) => chat.id === activeChatId) ?? null;
   const isRunning = Boolean(activeChatId && runningChatIds.includes(activeChatId));
   const hasRunningChats = runningChatIds.length > 0;
   const activeChatHasRunningMessage = messages.some(
@@ -742,15 +751,14 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     setIsLoadingDocuments(true);
     setDocumentsError("");
     try {
-      const path = projectId
-        ? `/api/projects/${projectId}/documents`
-        : `/api/documents?chat_id=${encodeURIComponent(chatId)}`;
-      const [scoped, shared] = await Promise.all([
-        getJson<{ items: DocumentRecord[] }>(path, API_TIMEOUT_MS),
-        getJson<{ items: DocumentRecord[] }>("/api/documents", API_TIMEOUT_MS)
-      ]);
+      const paths = ["/api/documents"];
+      if (projectId) paths.push(`/api/projects/${projectId}/documents`);
+      if (chatId) paths.push(`/api/documents?chat_id=${encodeURIComponent(chatId)}`);
+      const responses = await Promise.all(paths.map((path) => (
+        getJson<{ items: DocumentRecord[] }>(path, API_TIMEOUT_MS)
+      )));
       const merged = new Map<string, DocumentRecord>();
-      [...shared.items, ...scoped.items].forEach((document) => merged.set(document.id, document));
+      responses.flatMap((response) => response.items).forEach((document) => merged.set(document.id, document));
       setDocuments([...merged.values()]);
     } catch (error) {
       setDocumentsError(error instanceof Error ? error.message : "Не удалось загрузить список документов");
@@ -820,6 +828,9 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
   useEffect(() => {
     setUploadResult(null);
     setUploadError("");
+    setSelectedFiles([]);
+    setIsAttachmentPanelOpen(false);
+    setUploadTarget(activeProjectId ? "project" : "chat");
   }, [activeChatId, activeProjectId]);
 
   useEffect(() => {
@@ -1145,8 +1156,19 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     if (!selectedFiles.length || isUploading) return;
     const form = new FormData();
     selectedFiles.forEach((file) => form.append("files", file));
-    if (activeProjectId) form.append("project_id", activeProjectId);
-    if (activeChatId) form.append("chat_id", activeChatId);
+    if (uploadTarget === "project") {
+      if (!activeProjectId) {
+        setUploadError("Сначала откройте проект или выберите загрузку только в чат.");
+        return;
+      }
+      form.append("project_id", activeProjectId);
+    } else {
+      if (!activeChatId) {
+        setUploadError("Сначала откройте чат.");
+        return;
+      }
+      form.append("chat_id", activeChatId);
+    }
 
     setIsUploading(true);
     setUploadError("");
@@ -1169,7 +1191,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     } finally {
       setIsUploading(false);
     }
-  }, [activeChatId, activeProjectId, isUploading, loadDocuments, selectedFiles]);
+  }, [activeChatId, activeProjectId, isUploading, loadDocuments, selectedFiles, uploadTarget]);
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
@@ -1224,7 +1246,21 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
         </aside>
 
         <section className="chat-surface">
-          <Thread />
+          <Thread
+            activeChatTitle={activeChat?.title || "Текущий чат"}
+            activeProject={activeProject}
+            documents={documents}
+            error={uploadError}
+            isAttachmentPanelOpen={isAttachmentPanelOpen}
+            isUploading={isUploading}
+            onAttachmentPanelChange={setIsAttachmentPanelOpen}
+            onFilesChange={setSelectedFiles}
+            onTargetChange={setUploadTarget}
+            onUpload={() => void uploadFiles()}
+            result={uploadResult}
+            selectedFiles={selectedFiles}
+            target={uploadTarget}
+          />
         </section>
 
         <EvidencePanel
@@ -1257,9 +1293,11 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
           onTabChange={setActiveTab}
           onThemeChange={setTheme}
           selectedFiles={selectedFiles}
+          uploadTarget={uploadTarget}
           uploadResult={uploadResult}
           onFilesChange={setSelectedFiles}
-          onUpload={uploadFiles}
+          onUpload={() => void uploadFiles()}
+          onUploadTargetChange={setUploadTarget}
         />
       </main>
     </AssistantRuntimeProvider>
@@ -1412,11 +1450,11 @@ function NavigationSidebar({
           target="_blank"
           title={`${document.file_name}. ${documentUploadedLabel(document.created_at)}. ${documentVersionLabel(document)}`}
         >
-          <FileText size={15} />
+          {/\.(?:png|jpe?g|webp|tiff?|bmp)$/i.test(document.file_name) ? <ImageIcon size={15} /> : <FileText size={15} />}
           <span className="nav-document-copy">
             <span className="nav-document-name">{document.file_name}</span>
             <span className="nav-document-meta">
-              {documentUploadedLabel(document.created_at)} · {documentVersionLabel(document)}
+              {documentUploadedLabel(document.created_at)} · {document.chat_id ? "только этот чат" : documentVersionLabel(document)}
             </span>
           </span>
           <span className={`nav-document-status ${document.status}`}>
@@ -1519,12 +1557,20 @@ function NavigationSidebar({
         {renderDocuments(groupedDocuments.global, "Общая библиотека пока пуста.")}
       </section>
 
-      <section className="nav-section documents-section" aria-label={activeProjectId ? "Документы проекта" : "Документы чата"}>
+      {activeProjectId ? <section className="nav-section documents-section" aria-label="Документы проекта">
         <div className="nav-section-header">
-          <div className="nav-section-title">{activeProjectId ? "Документы проекта" : "Документы чата"}</div>
-          <span className="nav-count" title="Количество приватных документов">{groupedDocuments.project.length}</span>
+          <div className="nav-section-title">Документы проекта</div>
+          <span className="nav-count" title="Количество документов проекта">{groupedDocuments.project.length}</span>
         </div>
-        {renderDocuments(groupedDocuments.project, "Приватных документов пока нет. Загрузить их можно в панели справа.")}
+        {renderDocuments(groupedDocuments.project, "Документов проекта пока нет. Добавьте их через + возле поля вопроса.")}
+      </section> : null}
+
+      <section className="nav-section documents-section" aria-label="Документы чата">
+        <div className="nav-section-header">
+          <div className="nav-section-title">Документы чата</div>
+          <span className="nav-count" title="Количество документов текущего чата">{groupedDocuments.chat.length}</span>
+        </div>
+        {renderDocuments(groupedDocuments.chat, "В этом чате пока нет файлов. Нажмите + возле поля вопроса.")}
       </section>
 
       {freeChats.length ? (
@@ -1902,6 +1948,7 @@ function ModelSelector({
 }
 
 function KnowledgeLoader({
+  canUploadToProject,
   error,
   documents,
   documentsError,
@@ -1909,9 +1956,12 @@ function KnowledgeLoader({
   isUploading,
   result,
   selectedFiles,
+  target,
   onFilesChange,
+  onTargetChange,
   onUpload
 }: {
+  canUploadToProject: boolean;
   error: string;
   documents: DocumentRecord[];
   documentsError: string;
@@ -1919,7 +1969,9 @@ function KnowledgeLoader({
   isUploading: boolean;
   result: UploadResponse | null;
   selectedFiles: File[];
+  target: UploadTarget;
   onFilesChange: (files: File[]) => void;
+  onTargetChange: (target: UploadTarget) => void;
   onUpload: () => void;
 }) {
   const inputId = "knowledge-file-input";
@@ -1931,13 +1983,20 @@ function KnowledgeLoader({
         <Database size={15} />
         <span>База знаний</span>
       </div>
-      <p className="loader-scope-note">Новые файлы будут доступны только в текущем проекте или чате.</p>
+      <p className="loader-scope-note">Сначала выберите, где RAG должен использовать файл.</p>
+      <label className="upload-target-field">
+        <span>Добавить в</span>
+        <select value={target} onChange={(event) => onTargetChange(event.target.value as UploadTarget)}>
+          <option value="chat">Только в текущий чат</option>
+          <option disabled={!canUploadToProject} value="project">Во все чаты текущего проекта</option>
+        </select>
+      </label>
       <label className="file-picker" htmlFor={inputId}>
         <UploadCloud size={17} />
-        <span>{selectedFiles.length ? `Выбрано: ${selectedFiles.length}` : "Выбрать файлы"}</span>
+        <span>{selectedFiles.length ? `Выбрано: ${selectedFiles.length}` : "Выбрать документы или изображения"}</span>
       </label>
       <input
-        accept=".docx,.pdf,.md,.txt"
+        accept=".docx,.pdf,.md,.txt,.png,.jpg,.jpeg,.webp,.tif,.tiff,.bmp,image/png,image/jpeg,image/webp,image/tiff,image/bmp"
         className="file-input"
         id={inputId}
         multiple
@@ -1964,7 +2023,7 @@ function KnowledgeLoader({
         type="button"
       >
         <UploadCloud size={15} />
-        {isUploading ? "Загрузка..." : "Загрузить"}
+        {isUploading ? "Распознаём и индексируем…" : target === "project" ? "Загрузить в проект" : "Загрузить в чат"}
       </button>
 
       {feedback ? (
@@ -1990,7 +2049,7 @@ function KnowledgeLoader({
         <span>
           {isLoadingDocuments
             ? "Обновляем список документов…"
-            : `${splitDocumentsByScope(documents).project.length} приватных · ${splitDocumentsByScope(documents).global.length} общих`}
+            : `${splitDocumentsByScope(documents).project.length} в проекте · ${splitDocumentsByScope(documents).chat.length} в чате · ${splitDocumentsByScope(documents).global.length} общих`}
         </span>
       </div>
       {documentsError ? (
@@ -2000,7 +2059,35 @@ function KnowledgeLoader({
   );
 }
 
-function Thread() {
+function Thread({
+  activeChatTitle,
+  activeProject,
+  documents,
+  error,
+  isAttachmentPanelOpen,
+  isUploading,
+  onAttachmentPanelChange,
+  onFilesChange,
+  onTargetChange,
+  onUpload,
+  result,
+  selectedFiles,
+  target
+}: {
+  activeChatTitle: string;
+  activeProject: Project;
+  documents: DocumentRecord[];
+  error: string;
+  isAttachmentPanelOpen: boolean;
+  isUploading: boolean;
+  onAttachmentPanelChange: (open: boolean) => void;
+  onFilesChange: (files: File[]) => void;
+  onTargetChange: (target: UploadTarget) => void;
+  onUpload: () => void;
+  result: UploadResponse | null;
+  selectedFiles: File[];
+  target: UploadTarget;
+}) {
   return (
     <ThreadPrimitive.Root className="thread-root">
       <ThreadPrimitive.Viewport className="thread-viewport">
@@ -2021,7 +2108,31 @@ function Thread() {
 
       </ThreadPrimitive.Viewport>
       <ThreadPrimitive.ViewportFooter className="thread-footer">
-        <Composer />
+        <div className="composer-stack">
+          {isAttachmentPanelOpen ? (
+            <AttachmentPanel
+              activeChatTitle={activeChatTitle}
+              activeProject={activeProject}
+              documents={documents}
+              error={error}
+              isUploading={isUploading}
+              onClose={() => onAttachmentPanelChange(false)}
+              onFilesChange={onFilesChange}
+              onTargetChange={onTargetChange}
+              onUpload={onUpload}
+              result={result}
+              selectedFiles={selectedFiles}
+              target={target}
+            />
+          ) : null}
+          <Composer
+            attachmentPanelOpen={isAttachmentPanelOpen}
+            onAttach={() => {
+              onTargetChange("chat");
+              onAttachmentPanelChange(!isAttachmentPanelOpen);
+            }}
+          />
+        </div>
       </ThreadPrimitive.ViewportFooter>
     </ThreadPrimitive.Root>
   );
@@ -2208,12 +2319,22 @@ function HtmlBlock({ className, html }: { className?: string; html: string }) {
   );
 }
 
-function Composer() {
+function Composer({ attachmentPanelOpen, onAttach }: { attachmentPanelOpen: boolean; onAttach: () => void }) {
   return (
     <ComposerPrimitive.Root className="composer">
+      <button
+        aria-expanded={attachmentPanelOpen}
+        aria-label="Добавить документ или изображение"
+        className="attach-button"
+        onClick={onAttach}
+        title="Добавить документ или изображение"
+        type="button"
+      >
+        <Plus size={20} />
+      </button>
       <ComposerPrimitive.Input
         className="composer-input"
-        placeholder="Например: 2.1.4 Учет оперативных ценопринимающих заявок"
+        placeholder="Введите вопрос"
         submitMode="enter"
       />
       <ComposerPrimitive.Send className="send-button" title="Отправить" aria-label="Отправить">
@@ -2253,9 +2374,11 @@ function EvidencePanel({
   isLoadingDocuments,
   isUploading,
   selectedFiles,
+  uploadTarget,
   uploadResult,
   onFilesChange,
-  onUpload
+  onUpload,
+  onUploadTargetChange
 }: {
   activeTab: PanelTab;
   activeProject: Project;
@@ -2286,9 +2409,11 @@ function EvidencePanel({
   isLoadingDocuments: boolean;
   isUploading: boolean;
   selectedFiles: File[];
+  uploadTarget: UploadTarget;
   uploadResult: UploadResponse | null;
   onFilesChange: (files: File[]) => void;
   onUpload: () => void;
+  onUploadTargetChange: (target: UploadTarget) => void;
 }) {
   const [isThemeModalOpen, setIsThemeModalOpen] = useState(false);
 
@@ -2389,6 +2514,7 @@ function EvidencePanel({
             />
           ) : null}
           <KnowledgeLoader
+            canUploadToProject={Boolean(activeProject.id)}
             documents={documents}
             documentsError={documentsError}
             error={error}
@@ -2396,7 +2522,9 @@ function EvidencePanel({
             isUploading={isUploading}
             result={uploadResult}
             selectedFiles={selectedFiles}
+            target={uploadTarget}
             onFilesChange={onFilesChange}
+            onTargetChange={onUploadTargetChange}
             onUpload={onUpload}
           />
         </div>
@@ -2544,6 +2672,142 @@ export function normalizeSourceCitations(markdown: string, sources: ApiSource[] 
       const label = `Источник: ${displayName} — ${locator}`;
       return source?.url ? `[${label}](${source.url})` : `[${label}]`;
     }
+  );
+}
+
+function AttachmentPanel({
+  activeChatTitle,
+  activeProject,
+  documents,
+  error,
+  isUploading,
+  onClose,
+  onFilesChange,
+  onTargetChange,
+  onUpload,
+  result,
+  selectedFiles,
+  target
+}: {
+  activeChatTitle: string;
+  activeProject: Project;
+  documents: DocumentRecord[];
+  error: string;
+  isUploading: boolean;
+  onClose: () => void;
+  onFilesChange: (files: File[]) => void;
+  onTargetChange: (target: UploadTarget) => void;
+  onUpload: () => void;
+  result: UploadResponse | null;
+  selectedFiles: File[];
+  target: UploadTarget;
+}) {
+  const feedback = uploadFeedback(result, documents);
+  const addFiles = (incoming: File[]) => {
+    const unique = new Map(selectedFiles.map((file) => [`${file.name}:${file.size}:${file.lastModified}`, file]));
+    incoming.forEach((file) => unique.set(`${file.name}:${file.size}:${file.lastModified}`, file));
+    onFilesChange([...unique.values()]);
+  };
+  const uploadLabel = target === "project" ? "Загрузить в проект" : "Загрузить в чат";
+
+  return (
+    <section className="attachment-panel" aria-label="Добавление файлов в базу знаний">
+      <div className="attachment-heading">
+        <div>
+          <h2>Добавить в контекст</h2>
+          <p>Выберите, где RAG будет использовать эти файлы.</p>
+        </div>
+        <button aria-label="Закрыть панель добавления" className="icon-button" onClick={onClose} title="Закрыть" type="button">
+          <X size={17} />
+        </button>
+      </div>
+
+      <div className="attachment-targets" role="radiogroup" aria-label="Где использовать файлы">
+        <button
+          aria-checked={target === "chat"}
+          className={target === "chat" ? "active" : ""}
+          onClick={() => onTargetChange("chat")}
+          role="radio"
+          type="button"
+        >
+          <Files size={17} />
+          <span><strong>Только в этом чате</strong><small>{activeChatTitle}</small></span>
+        </button>
+        <button
+          aria-checked={target === "project"}
+          className={target === "project" ? "active" : ""}
+          disabled={!activeProject.id}
+          onClick={() => onTargetChange("project")}
+          role="radio"
+          type="button"
+        >
+          <Folder size={17} />
+          <span><strong>Во всём проекте</strong><small>{activeProject.id ? activeProject.name : "Сначала откройте проект"}</small></span>
+        </button>
+      </div>
+
+      <div className="attachment-kinds">
+        <label htmlFor="attachment-document-input">
+          <FileText size={18} />
+          <span><strong>Документ</strong><small>DOCX, PDF, MD или TXT</small></span>
+        </label>
+        <input
+          accept=".docx,.pdf,.md,.txt"
+          className="file-input"
+          id="attachment-document-input"
+          multiple
+          onChange={(event) => {
+            addFiles(Array.from(event.currentTarget.files ?? []));
+            event.currentTarget.value = "";
+          }}
+          type="file"
+        />
+        <label htmlFor="attachment-image-input">
+          <ImageIcon size={18} />
+          <span><strong>Изображение</strong><small>PNG, JPG, WebP, TIFF или BMP</small></span>
+        </label>
+        <input
+          accept=".png,.jpg,.jpeg,.webp,.tif,.tiff,.bmp,image/png,image/jpeg,image/webp,image/tiff,image/bmp"
+          className="file-input"
+          id="attachment-image-input"
+          multiple
+          onChange={(event) => {
+            addFiles(Array.from(event.currentTarget.files ?? []));
+            event.currentTarget.value = "";
+          }}
+          type="file"
+        />
+      </div>
+
+      <p className="attachment-ocr-note">Текст на изображениях распознаётся локально на русском и английском.</p>
+      {selectedFiles.length ? (
+        <div className="attachment-files" aria-label="Выбранные файлы">
+          {selectedFiles.map((file, index) => (
+            <div key={`${file.name}-${file.size}-${file.lastModified}`}>
+              {/\.(?:png|jpe?g|webp|tiff?|bmp)$/i.test(file.name) ? <ImageIcon size={15} /> : <FileText size={15} />}
+              <span>{file.name}</span>
+              <button
+                aria-label={`Убрать ${file.name}`}
+                onClick={() => onFilesChange(selectedFiles.filter((_, fileIndex) => fileIndex !== index))}
+                title="Убрать файл"
+                type="button"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      <div className="attachment-actions">
+        <button className="attachment-upload" disabled={!selectedFiles.length || isUploading} onClick={onUpload} type="button">
+          <UploadCloud size={16} />
+          {isUploading ? "Распознаём и индексируем…" : uploadLabel}
+        </button>
+      </div>
+      {feedback ? <div className={`upload-status ${feedback.state}`} aria-live="polite">{feedback.message}</div> : null}
+      {error ? <div className="upload-status error" role="alert">{error}</div> : null}
+    </section>
   );
 }
 

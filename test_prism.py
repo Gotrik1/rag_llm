@@ -24,6 +24,7 @@ from rag_agent import (
     matching_explicit_sources,
     parse_query_understanding,
     price_category_number,
+    prioritize_scoped_results,
     refine_prism_query,
     rerank_context_results,
     sanitize_grounded_answer,
@@ -67,6 +68,28 @@ class PrismQueryTests(unittest.TestCase):
 
         self.assertTrue(results)
         self.assertTrue(all(item["file"] == "project_pp442.md" for item in results))
+
+    def test_relevant_project_evidence_gets_bounded_top_k_quota(self):
+        shared = [
+            {"file": f"shared-{index}.docx", "score": 10 - index, "matched_queries": []}
+            for index in range(6)
+        ]
+        project = [
+            {
+                "file": f"project-{index}.md",
+                "score": 1 - index / 10,
+                "matched_queries": ["private-scope-lexical"],
+            }
+            for index in range(4)
+        ]
+
+        prioritized = prioritize_scoped_results([*shared, *project], top_k=10)
+
+        self.assertEqual(
+            [item["file"] for item in prioritized[:3]],
+            ["project-0.md", "project-1.md", "project-2.md"],
+        )
+        self.assertIn("shared-0.docx", [item["file"] for item in prioritized[:4]])
 
     def test_plain_legal_markdown_is_split_into_point_locators(self):
         documents = build_section_documents(

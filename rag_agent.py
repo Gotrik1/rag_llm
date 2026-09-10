@@ -2065,6 +2065,20 @@ def rerank_context_results(results: list[dict], question: str) -> list[dict]:
     return sorted(ranked, key=lambda x: x["score"], reverse=True)
 
 
+def prioritize_scoped_results(ranked: list[dict], top_k: int) -> list[dict]:
+    """Reserve a small evidence quota for lexically relevant private documents."""
+    scoped = [
+        item for item in ranked
+        if "private-scope-lexical" in item.get("matched_queries", [])
+    ]
+    if not scoped:
+        return ranked
+    quota = min(3, max(1, top_k // 3))
+    prioritized = scoped[:quota]
+    prioritized_ids = {id(item) for item in prioritized}
+    return [*prioritized, *(item for item in ranked if id(item) not in prioritized_ids)]
+
+
 def sanitize_grounded_answer(answer: str, question: str, allowed_calculations: list[str]) -> str:
     if contains_prompt_injection(answer):
         return refusal_answer()
@@ -3341,6 +3355,12 @@ class RAGAgent:
             and not contains_prompt_injection(str(item.get("text", "")))
         ]
         ranked = rerank_context_results(results, question)
+        if priority_sources and not explicit_sources:
+            # Vector/BM25 scores are backend-specific and can be much larger
+            # than lexical seed scores.  Reserve only a bounded top-k quota so
+            # a genuinely matching chat/project document cannot be crowded out
+            # by a large shared document, while global evidence still remains.
+            ranked = prioritize_scoped_results(ranked, top_k)
         diversified = diversify_context_results(ranked, question, top_k)
         selected = select_prism_evidence(diversified, spec, top_k)
         concept_selected = [

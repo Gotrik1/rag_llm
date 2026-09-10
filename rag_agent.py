@@ -870,6 +870,49 @@ def human_source_reference(item: dict) -> str:
     )
 
 
+def generate_image_transcription_answer(question: str, context: list[dict]) -> str:
+    """Answer explicit OCR/transcription requests without an unnecessary LLM hop."""
+    normalized = question.casefold()
+    if not (
+        re.search(r"\bчто\s+(?:написано|изображено)\b", normalized)
+        or re.search(r"\b(?:выпиши|перепиши|процитируй|распознай|прочитай|транскриб\w*)\b", normalized)
+    ):
+        return ""
+
+    image = next(
+        (
+            item
+            for item in context
+            if Path(user_facing_source_name(item.get("file", ""))).suffix.casefold()
+            in {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".gif"}
+        ),
+        None,
+    )
+    if image is None:
+        return ""
+
+    lines = []
+    for raw_line in str(image.get("text", "")).splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if len(re.sub(r"[^0-9A-Za-zА-Яа-яЁё]+", "", line)) >= 2:
+            lines.append(line)
+    if not lines:
+        return ""
+
+    reference = human_source_reference(image)
+    first_line_only = bool(re.search(
+        r"\b(?:перв\w*\s+строк\w*|верхн\w*\s+карточк\w*|пользовательск\w*\s+сообщен\w*)\b",
+        normalized,
+    ))
+    if first_line_only:
+        value = lines[0].replace("«", "‹").replace("»", "›")
+        return f"Первая распознанная строка: «{value}». [Источник: {reference}]"
+
+    excerpt = "\n".join(lines[:30])[:2000].rstrip()
+    quoted = "\n".join(f"> {line}" for line in excerpt.splitlines())
+    return f"Распознанный текст:\n\n{quoted}\n\n[Источник: {reference}]"
+
+
 def generate_extractive_value_answer(
     question: str,
     context: list[dict],
@@ -1951,6 +1994,9 @@ class RAGAgent:
     ) -> str:
         self._generation_state.from_cache = False
         spec = spec or refine_prism_query(question)
+        transcription = generate_image_transcription_answer(question, context)
+        if transcription:
+            return transcription
         if spec.answer_mode == "formulas_only":
             return generate_formula_only_answer(evidence_question or question, context, calculations, spec)
         extractive = generate_extractive_value_answer(question, context, calculations)

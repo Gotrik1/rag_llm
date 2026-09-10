@@ -1,5 +1,7 @@
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from rag_agent import (
     RAGAgent,
@@ -10,6 +12,7 @@ from rag_agent import (
     format_formula_for_katex,
     generate_formula_only_answer,
     generate_extractive_value_answer,
+    generate_image_transcription_answer,
     refine_prism_query,
     rerank_context_results,
     sanitize_grounded_answer,
@@ -213,6 +216,45 @@ class PrismQueryTests(unittest.TestCase):
 
         self.assertIn("[Источник: manual.md — раздел «Формула контрольного расхода»]", answer)
         self.assertNotIn("извлечённый контекст", answer)
+
+    def test_image_first_line_transcription_is_extractive_and_cited(self):
+        answer = generate_image_transcription_answer(
+            "Что написано в первой строке прикрепленного PNG?",
+            [
+                {"file": "manual.md", "text": "unrelated"},
+                {
+                    "file": "5328308087e64394a23ae5023fe91513_capture.png",
+                    "text": "дай формулу ИВ0\n\n©\n\nОтветил: Python flow",
+                    "section_path": "",
+                },
+            ],
+        )
+
+        self.assertIn("Первая распознанная строка: «дай формулу ИВ0»", answer)
+        self.assertIn("[Источник: capture.png — документ целиком]", answer)
+        self.assertNotIn("unrelated", answer)
+
+    def test_regular_document_question_does_not_trigger_image_transcription(self):
+        answer = generate_image_transcription_answer(
+            "Как рассчитывается ИВ0?",
+            [{"file": "capture.png", "text": "дай формулу ИВ0"}],
+        )
+
+        self.assertEqual(answer, "")
+
+    def test_image_transcription_bypasses_llm_generation(self):
+        agent = object.__new__(RAGAgent)
+        agent._generation_state = SimpleNamespace(from_cache=None)
+        agent.llm = Mock()
+
+        answer = agent._generate_grounded_answer(
+            "Выпиши пользовательское сообщение из верхней карточки PNG.",
+            [{"file": "capture.png", "text": "дай формулу ИВ0", "section_path": ""}],
+            [],
+        )
+
+        self.assertIn("дай формулу ИВ0", answer)
+        agent.llm.complete.assert_not_called()
 
     def test_ivo_worded_difference_is_rendered_as_explicit_formula(self):
         question = "Что такое ИВ0? Как рассчитывается? А по какой формуле?"

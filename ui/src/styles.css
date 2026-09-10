@@ -2679,7 +2679,12 @@ sub {
   }
 
   .attachment-panel {
-    max-height: calc(100vh - 140px);
+    position: fixed;
+    top: 12px;
+    right: 12px;
+    bottom: 86px;
+    left: 12px;
+    max-height: none;
     padding: 14px;
   }
 

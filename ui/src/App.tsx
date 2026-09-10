@@ -2480,15 +2480,28 @@ export function normalizeMarkdown(markdown: string): string {
     .trim();
 
   let insideCodeFence = false;
+  let insideDisplayMath = false;
   return normalized.split("\n").map((line) => {
     if (/^\s*```/.test(line)) {
       insideCodeFence = !insideCodeFence;
       return line;
     }
     if (insideCodeFence) return line;
+    if (/^\s*\$\$\s*$/.test(line)) {
+      insideDisplayMath = !insideDisplayMath;
+      return line;
+    }
     const tableSafeLine = line.includes("|")
       ? line.replace(/(\S)\s+•\s*/g, "$1<br />• ")
       : line;
+    if (insideDisplayMath) {
+      // A valid display block already supplies the delimiters. Do not let the
+      // legacy raw-LaTeX normalizer add inline dollars to its body, and unwrap
+      // an extra pair copied by the model inside the block.
+      return tableSafeLine
+        .replace(/^(\s*)\${1,2}\s*/, "$1")
+        .replace(/\s*\${1,2}(\s*)$/, "$1");
+    }
     // Qwen can copy an already-delimited formula from the retrieval prompt and
     // wrap it in another pair of dollar delimiters (for example
     // `$$$$S = V \\times C$$$$`). remark-math treats the outer pair as the

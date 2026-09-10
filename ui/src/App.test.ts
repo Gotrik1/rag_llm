@@ -32,6 +32,20 @@ describe("persisted generation state", () => {
     );
   });
 
+  it("does not add inline delimiters inside a valid display math block", () => {
+    const markdown = ["$$", String.raw`\text{Ц}_{\text{ПУНЦ}} = \text{Ц}_{\text{ЭЭ}}`, "$$"].join("\n");
+
+    expect(normalizeMarkdown(markdown)).toBe(markdown);
+  });
+
+  it("unwraps an extra formula delimiter pair inside a display math block", () => {
+    const markdown = ["$$", String.raw`$$S_{\text{э6цк}} = V_{\text{ЭЭ}} \times \text{Ц}_{\text{ПУНЦ}}$$`, "$$"].join("\n");
+
+    expect(normalizeMarkdown(markdown)).toBe(
+      ["$$", String.raw`S_{\text{э6цк}} = V_{\text{ЭЭ}} \times \text{Ц}_{\text{ПУНЦ}}`, "$$"].join("\n")
+    );
+  });
+
   it("leaves nested delimiter examples inside fenced code unchanged", () => {
     const markdown = ["```latex", String.raw`$$$$S = V \times C$$$$`, "```"].join("\n");
 

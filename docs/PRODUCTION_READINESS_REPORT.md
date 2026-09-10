@@ -1,6 +1,6 @@
 # Production readiness report
 
-Date: 2026-09-10. Canonical branch: `dev`. Active application release: `8cff19c34`.
+Date: 2026-09-10. Canonical branch: `dev`. Active application release: `4c94a3a0b`.
 
 The platform is publicly available without VPN at
 `https://5.35.120.112:8443/`. The former browser Basic Auth challenge has been
@@ -16,7 +16,7 @@ keeps an authenticated session in a secure HttpOnly cookie.
 | CSRF protection | every authenticated state-changing API request requires a session-bound HMAC token | unit tests and live missing-token rejection (`403`) |
 | Per-user isolation | projects, chats, messages, workspace settings and private documents are scoped to the authenticated owner | PostgreSQL integration tests and two-user live API acceptance |
 | Shared library | all six documents that existed before account migration are global and readable/retrievable by every authenticated user | migration check, DB invariant and two-user acceptance |
-| Scoped uploads | the `+` panel accepts documents and images and makes the destination explicit: only the current chat or every chat in the current project; another user receives `404` for the owning project/chat/document | storage/API contracts and desktop/mobile browser acceptance |
+| Scoped uploads | each entry point has one fixed destination: the question-field `+` uploads only to the current chat, `Память и документы` in the project menu uploads only to that project, and the right technical panel uploads only to the global library | storage/API contracts, UI tests and production browser acceptance |
 | Knowledge scope | each project selects `project_only` or `project_and_global`; retrieval exclusions enforce the choice before vector search | unit/integration tests and live UI/API toggle |
 | Persistent conversations | chat history and assistant terminal state live in PostgreSQL; a generation task keeps its owner scope after page refresh/disconnect | restart/restore and background-generation contracts |
 | Concurrent chats | answers remain attached to their original `chat_id`; different projects and chats do not share context | integration tests and production multi-chat acceptance |
@@ -26,18 +26,18 @@ keeps an authenticated session in a secure HttpOnly cookie.
 | Query understanding | an LLM planning pass plus deterministic validation interprets misspellings and compound intent before retrieval while preserving identifiers such as `1 ЦК`, `6ЦК` and section numbers | planner regression tests and live malformed-query acceptance |
 | Multi-document evidence | price-category calculation questions retrieve definition, calculation, parameters and transmission rules across sources; a deterministic coverage gate adds a missing relevant transmission citation but never an unrelated document | 39 focused PRISM tests, full release suite and live 1/6 ЦК acceptance |
 | Positive occurrence lists | “where is X mentioned” returns only documents with a confirmed direct occurrence and never pads the answer with documents where the term is absent | occurrence/diversification tests and live `1ЦК` acceptance |
-| Document registry | UI shows separate `Общие документы`, `Документы проекта` and `Документы чата`, original filename, upload time, status, detected version and freshness statement | browser acceptance and deterministic inventory answer |
+| Document registry | common and current-chat files remain visible in navigation; the project menu opens a dedicated registry with project memory, source scope, original filename, upload time, status, detected version and freshness statement | browser acceptance and deterministic inventory answer |
 | Image OCR | PNG, JPEG, WebP, TIFF and BMP are processed locally by Tesseract with Russian and English language packs; the original image remains the cited source | real release-image OCR acceptance and ingestion tests |
 | Extractive image answers | explicit transcription requests are answered directly from OCR evidence, including first-line/card requests, without losing the recognized text in a generative round trip | focused PRISM tests and live PNG acceptance |
 | Human sources | answer citations and the `Sources` panel link to the original document and show a human locator; internal chunk IDs/scores are not user-facing | source-contract tests and live production answer |
 | Formulas | Markdown/KaTeX renders validated LaTeX; formula payloads contain equations and variable definitions | formula tests and live `ИВ0` acceptance |
-| Technical panel | `Evidence`, `Sources` and `Debug` show metadata for the selected answer and restore it with the chat | UI tests and live tab-by-tab acceptance |
+| Technical panel | `Evidence`, `Sources` and `Debug` show metadata for the selected answer; `Система` exposes the global upload control only to administrators and never accepts project/chat files | UI tests, release-image authorization test and live non-admin acceptance |
 | Deletion lifecycle | deleting a document immediately removes it from the visible registry, then a serialized worker removes the source file, Qdrant nodes and BM25/docstore nodes and clears answer cache | queue/API/unit tests and full live delete audit |
 | Prompt-injection resistance | uploaded text is treated as evidence, never as a replacement for system/user instructions | policy and injection tests |
 
 ## Automated verification
 
-- Full release-image Python suite: `158` tests, `156 passed`, `2 skipped`;
+- Full release-image Python suite: `159` tests, `157 passed`, `2 skipped`;
   PostgreSQL integration ran against an isolated temporary database and passed.
 - Most recent branch-aware baseline before the final upload/OCR delta: `55.7%`
   across `4,694` statements and `1,624` branches. The current release adds
@@ -46,8 +46,8 @@ keeps an authenticated session in a secure HttpOnly cookie.
   `90.5%`, persistence `85.0%`, generation worker `80.3%`, document ingestion
   `77.9%`, scoped DB store `75.7%`, cache `69.5%`, ASGI layer `63.6%`, DOCX
   parser `62.2%`, web layer `54.0%`, and core RAG agent `42.8%`.
-- UI Vitest: `24/24 passed`.
-- UI production build: successful, `2,522` modules transformed.
+- UI Vitest: `25/25 passed`.
+- UI production build: successful, `2,551` modules transformed.
 - Focused local backend gate for authentication, scoping, gateway, jobs and
   cache: `42 passed`.
 - Full production image health gates: `compileall`, dependency consistency,
@@ -62,15 +62,17 @@ the percentage.
 
 | Check | Result |
 | --- | --- |
-| Release/rollback | `current` -> `/opt/rag_llm/releases/8cff19c34`; `rollback` -> `/opt/rag_llm/releases/b00d294488` |
-| Artifact | `29,128,550` bytes; SHA-256 `9BB9B542FC5B0228CC410D7A21CF0D9541D2B175C3E20779A701BD9D2893A5EA` |
-| Images | app `sha256:f68b55d2ca80...`; proxy `sha256:3e00227870e9...`; bridge `sha256:42edd40b424c...` |
-| Database safety | PostgreSQL backup `/opt/rag_llm/shared/backups/rag-pre-8cff19c34-20260910T100753Z.dump` is present (`712,926` bytes, SHA-256 `d7bbe1d379ec627300ec6418955b102dd62c67b2a72c596b02c05684a7d5d282`) and passed restore-list validation at deployment |
+| Release/rollback | `current` -> `/opt/rag_llm/releases/4c94a3a0b`; `rollback` -> `/opt/rag_llm/releases/8cff19c34` |
+| Artifact | `29,135,267` bytes; SHA-256 `117EB40950BA8D84F80087CEDBFC728A529D1A62AF5AC999040BCEAF2CBA9A8C` |
+| Images | app `sha256:92f6b0d6b11f...`; proxy `sha256:8cd6b1baf495...`; bridge `sha256:42edd40b424c...` |
+| Database safety | PostgreSQL backup `/opt/rag_llm/shared/backups/rag-pre-4c94a3a0b-20260910T110822Z.dump` is present (`787,455` bytes, SHA-256 `052691f115594976bce387af3192278ab6cbe908eebeb9747cf2dfce9fba5991`) and passed restore-list validation at deployment |
 | Runtime | 19 Compose services running; application, proxy, TLS proxy, LLM bridge, vLLM, PostgreSQL, Redis and Qdrant report healthy where health checks are defined |
 | Health | `/healthz` -> `{"status":"ok"}`; `/readyz` -> `{"status":"ready"}` |
 | Public access | root returns `200` without VPN/Basic Auth; anonymous `/api/me` returns JSON `401` without `WWW-Authenticate` |
 | Registration/session UI | registration created a workspace and user card; repeated reloads preserved the session; explicit logout showed the application login page; re-login restored the same chat without a Basic Auth prompt |
-| Attachment UI | mobile and desktop views show the `+` action, explicit chat/project scope, separate document/image selectors, selected filenames and the correct submit label; the obsolete example placeholder is removed |
+| Upload entry points | the `+` panel contains only `Добавить в текущий чат` and `Загрузить в чат`; the project menu contains `Память и документы`, a project-only registry and `Загрузить в проект`; the non-admin technical panel contains no file picker and reports six available common documents |
+| Scope enforcement | project and chat QA files independently reached `Готов`; a second chat retained the project file but showed zero chat files, and returning to the first chat restored only its chat file; a direct non-admin global upload returned `403` |
+| Project state | memory text and `Только документы проекта` were saved through the project panel and remained selected after a full browser reload |
 | Mobile acceptance | at `390x844`, authenticated reload preserved the workspace, the `+` attachment action remained available and document width equalled viewport width (`390 px`), with no horizontal overflow |
 | OCR runtime | release image contains Tesseract language packs `rus`, `eng` and `osd`; the supplied PNG was parsed through the real ingestion path and the final answer reproduced `дай формулу ИВ0` exactly with a clickable original-image source |
 | Two-user isolation | foreign project read, foreign chat read and foreign project update returned `404`; both users independently retained their own default workspace |
@@ -87,8 +89,8 @@ the percentage.
 | Formula DOM | the final browser answer contained `28` KaTeX nodes, `0` `.katex-error` elements, no raw legacy `S_sub(` notation and no visible raw `\\mathrm`; source download completed from the `Sources` panel |
 | Context budget | the representative formula answer used about `1,847` context tokens and `1,970` total estimated tokens instead of injecting the complete document |
 | Document deletion | both live DELETE requests returned `202`; both worker jobs completed at `100%`; both source files are absent; BM25 has `0` matching entries and a full Qdrant scroll over `13,229` points found `0` remnants |
-| Cleanup and preservation | all three QA accounts (`QA c67 A`, `QA c67 B`, `QA Intent 45d`) were deactivated and every live QA session was revoked; active QA documents are `0`. Three real active users, four owned projects, four owned chats, six shared documents and two legitimate private documents were preserved |
-| User documentation | the 11-page DOCX and Markdown guide describe registration, project/global scope, chat/project uploads, OCR limits, queues, sources, formulas and troubleshooting; every rendered page passed visual inspection |
+| Cleanup and preservation | all four QA accounts (`QA c67 A`, `QA c67 B`, `QA Intent 45d`, `QA Scope 4c94`) are disabled and every live QA session is revoked; active QA documents/projects/chats are `0`. Four active users, five owned projects, five owned chats, six shared documents and two legitimate private documents were preserved |
+| User documentation | the 12-page DOCX and Markdown guide describe the three fixed upload entry points, registration, project/global scope, OCR limits, queues, sources, formulas and troubleshooting; every rendered page passed visual inspection |
 
 The representative semantic cases meet the project threshold of at least 9/10.
 This is a release acceptance result, not a mathematical guarantee for every
@@ -108,7 +110,7 @@ the `rollback` symlink. Operational/user documentation is also copied to
 Self-service local authentication is appropriate for the requested public IP
 deployment, but production operations still need a deliberate account policy:
 email verification/recovery, administrator provisioning, optional invitation-
-only registration and eventually corporate OIDC/MFA. The three disabled QA user
+only registration and eventually corporate OIDC/MFA. The four disabled QA user
 rows and their tombstoned document registry rows remain for auditability; hard
 deletion requires separate explicit authorization. Coverage should next be
 raised in provider failures, local-auth database error paths, worker failures,

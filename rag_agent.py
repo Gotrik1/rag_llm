@@ -68,7 +68,7 @@ VECTOR_TOP_K     = 12      # кандидатов от вектора
 # A semantic/chunking change must never reuse an older docstore or vector
 # collection: the two indexes must describe precisely the same corpus.
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25_v12"))
-CACHE_VERSION    = "v27-contextual-formula-answers"
+CACHE_VERSION    = "v28-katex-formula-delimiters"
 MAX_OUTPUT_TOKENS = 4056
 
 PROMPT_INJECTION_MARKERS = (
@@ -747,8 +747,8 @@ def format_formula_for_display(formula: str) -> str:
     return value.strip()
 
 
-def format_formula_for_katex(formula: str) -> str:
-    """Return valid inline KaTeX for a legacy formula when possible."""
+def format_formula_for_katex(formula: str, *, display: bool = False) -> str:
+    """Return valid KaTeX for a legacy formula when possible."""
     value = clean_formula_artifacts(formula).replace("$", "")
     value = value.replace("\\_", "_").replace("\\ ", " ").replace("\\.", ".")
     # Every legacy ``\\mathrm`` payload here is a flat Word run.  Rendering it
@@ -757,7 +757,8 @@ def format_formula_for_katex(formula: str) -> str:
     value = re.sub(r"\\mathrm\{([^{}]*)\}", lambda match: f"\\text{{{match.group(1)}}}", value)
     value = value.replace("МIN", r"\min").replace("МAX", r"\max")
     value = re.sub(r"\s*\.\s*$", "", value).strip()
-    return f"${value}$"
+    delimiter = "$$" if display else "$"
+    return f"{delimiter}{value}{delimiter}"
 
 
 def _split_evidence_sentences(text: str) -> list[str]:
@@ -1344,8 +1345,12 @@ def generate_formula_only_answer(question: str, context: list[dict], calculation
         # in-memory context fixture has no metadata (for example CLI/tests).
         if calculations:
             target = f"п. {', '.join(spec.target_sections)}" if spec.target_sections else "извлечённый контекст"
+            rendered = [
+                format_formula_for_katex(item, display=True) if "=" in item else f"- {clean_formula_artifacts(item)}"
+                for item in calculations[:1]
+            ]
             return clean_formula_artifacts(
-                f"**Ориентир в источнике:** {target}.\n\n" + "\n".join(f"- {item}" for item in calculations[:1])
+                f"**Ориентир в источнике:** {target}.\n\n" + "\n\n".join(rendered)
             )
         return "Недостаточно подтверждённых данных: для формулы не найден конкретный пункт Регламента."
 
@@ -1355,7 +1360,7 @@ def generate_formula_only_answer(question: str, context: list[dict], calculation
 
     source = human_source_reference(confirmed)
     rendered = [
-        format_formula_for_katex(item) if "=" in item else clean_formula_artifacts(item)
+        format_formula_for_katex(item, display=True) if "=" in item else clean_formula_artifacts(item)
         for item in confirmed_calculations[:1]
     ]
     return clean_formula_artifacts(

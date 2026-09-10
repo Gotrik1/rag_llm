@@ -179,6 +179,18 @@ class PrismQueryTests(unittest.TestCase):
         self.assertIn("ИВ1: величина определяется как разность объемов.", answer)
         self.assertNotIn("Краткий вывод", answer)
 
+    def test_formula_fallback_wraps_legacy_latex_for_display_katex(self):
+        formula = r"\mathrm{ИВ0} = V_{\mathrm{УДГ}} - V_{\mathrm{план.ДГ}}"
+        answer = generate_formula_only_answer(
+            "дай формулу ИВ0",
+            [],
+            [formula],
+            refine_prism_query("дай формулу ИВ0"),
+        )
+
+        self.assertIn(r"$$\text{ИВ0} = V_{\text{УДГ}} - V_{\text{план.ДГ}}$$", answer)
+        self.assertNotIn(r"- \mathrm", answer)
+
     def test_ivo_worded_difference_is_rendered_as_explicit_formula(self):
         question = "Что такое ИВ0? Как рассчитывается? А по какой формуле?"
         rule = (

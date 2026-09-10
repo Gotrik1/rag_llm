@@ -2076,7 +2076,22 @@ function MarkdownAnswer({ markdown, sources = [] }: { markdown: string; sources?
   );
 }
 
-function normalizeMarkdown(markdown: string): string {
+const legacyLatexCommand = /\\(?:mathrm|text|frac|sqrt|sum|prod|min|max|Delta|cdot|times)\b/;
+
+function normalizeLegacyLatexLine(line: string): string {
+  if (line.includes("$") || !line.includes("=") || !legacyLatexCommand.test(line)) return line;
+  const match = line.match(/^(\s*(?:[-*+]\s+)?)(.+)$/);
+  if (!match) return line;
+  const formula = match[2]
+    .replace(/\\mathrm\{([^{}]*)\}/g, (_whole, label: string) => `\\text{${label}}`)
+    .replace(/\\_/g, "_")
+    .replace(/\\ /g, " ")
+    .replace(/\\\./g, ".")
+    .trim();
+  return `${match[1]}$${formula}$`;
+}
+
+export function normalizeMarkdown(markdown: string): string {
   const normalized = markdown
     .replace(/\\?<(?:\/)?br\s*\/?>|&lt;\/?br\s*\/?&gt;/gi, (tag, offset, source) => {
       const lineStart = source.lastIndexOf("\n", offset) + 1;
@@ -2088,11 +2103,18 @@ function normalizeMarkdown(markdown: string): string {
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 
-  return normalized.split("\n").map((line) => (
-    line.includes("|")
+  let insideCodeFence = false;
+  return normalized.split("\n").map((line) => {
+    if (/^\s*```/.test(line)) {
+      insideCodeFence = !insideCodeFence;
+      return line;
+    }
+    if (insideCodeFence) return line;
+    const tableSafeLine = line.includes("|")
       ? line.replace(/(\S)\s+•\s*/g, "$1<br />• ")
-      : line
-  )).join("\n");
+      : line;
+    return normalizeLegacyLatexLine(tableSafeLine);
+  }).join("\n");
 }
 
 function tableToTsv(table: HTMLTableElement | null): string {

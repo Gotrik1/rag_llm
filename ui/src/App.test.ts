@@ -1,9 +1,21 @@
 import { describe, expect, it } from "vitest";
 
-import { documentUploadedLabel, documentVersionLabel, generationResponseIsTerminal, hasRunningAssistantMessage, normalizeSourceCitations, panelStateFromMessageRecords, resultFromMessageRecord, sourceLocatorLabel, splitDocumentsByScope, uploadFeedback, visibleNavigationChats } from "./App";
+import { documentUploadedLabel, documentVersionLabel, generationResponseIsTerminal, hasRunningAssistantMessage, normalizeMarkdown, normalizeSourceCitations, panelStateFromMessageRecords, resultFromMessageRecord, sourceLocatorLabel, splitDocumentsByScope, uploadFeedback, visibleNavigationChats } from "./App";
 
 
 describe("persisted generation state", () => {
+  it("renders a persisted legacy LaTeX equation instead of exposing commands", () => {
+    const markdown = String.raw`- \mathrm{ИВ0} = V_{\mathrm{УДГ}} - V_{\mathrm{план.ДГ}}`;
+
+    expect(normalizeMarkdown(markdown)).toBe(String.raw`- $\text{ИВ0} = V_{\text{УДГ}} - V_{\text{план.ДГ}}$`);
+  });
+
+  it("does not rewrite raw LaTeX examples inside fenced code", () => {
+    const markdown = ["```", String.raw`\mathrm{ИВ0} = V_{\mathrm{УДГ}}`, "```"].join("\n");
+
+    expect(normalizeMarkdown(markdown)).toBe(markdown);
+  });
+
   it("shows upload time and conservative version status", () => {
     expect(documentUploadedLabel()).toBe("Время загрузки неизвестно");
     expect(documentVersionLabel({ version_label: null, version_status: "unknown" })).toBe("Версия не указана");

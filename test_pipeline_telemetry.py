@@ -54,7 +54,7 @@ class FakeHistogram:
 
 class HitCache:
     def get(self, _key: str):
-        return {"answer": "cached answer", "sources": []}
+        return {"answer": "cached answer"}
 
 
 class PipelineTelemetryTests(unittest.TestCase):
@@ -63,13 +63,21 @@ class PipelineTelemetryTests(unittest.TestCase):
         histogram = FakeHistogram()
         agent = object.__new__(rag_agent.RAGAgent)
         agent.response_cache = HitCache()
+        agent._generation_state = SimpleNamespace(from_cache=False)
+        agent.llm_model = "test-model"
 
         with patch.object(rag_agent, "tracer", return_value=telemetry_tracer), patch.object(
             rag_agent, "PIPELINE_SECONDS", histogram
         ):
-            answer, sources, hit = agent.ask("SECRET QUESTION")
+            answer = agent._generate_grounded_answer(
+                "SECRET QUESTION",
+                [{"file": "global.md", "text": "safe evidence", "section_path": "1"}],
+                [],
+                cache_enabled=True,
+            )
 
-        self.assertEqual((answer, sources, hit), ("cached answer", [], True))
+        self.assertEqual(answer, "cached answer")
+        self.assertTrue(agent.last_generation_from_cache)
         self.assertEqual(telemetry_tracer.spans[0].name, "rag.cache.lookup")
         self.assertTrue(telemetry_tracer.spans[0].attributes["rag.cache.hit"])
         self.assertIn("cache.hit", [labels["stage"] for labels, _ in histogram.observations])

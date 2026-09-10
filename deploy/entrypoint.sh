@@ -26,6 +26,8 @@ POSTGRES_DB="${POSTGRES_DB:-rag}"
 POSTGRES_USER="${POSTGRES_USER:-rag}"
 REDIS_HOST="${REDIS_HOST:-redis}"
 REDIS_PORT="${REDIS_PORT:-6379}"
+RESPONSE_CACHE_HOST="${RESPONSE_CACHE_HOST:-${REDIS_HOST}}"
+RESPONSE_CACHE_PORT="${RESPONSE_CACHE_PORT:-6379}"
 
 encoded_postgres_password="$(python -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["POSTGRES_PASSWORD"], safe=""))')"
 encoded_redis_password="$(python -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["REDIS_PASSWORD"], safe=""))')"
@@ -34,7 +36,7 @@ export RAG_DATABASE_URL="${RAG_DATABASE_URL:-postgresql+psycopg://${POSTGRES_USE
 export DATABASE_URL="${DATABASE_URL:-${plain_database_url}}"
 export RAG_REDIS_URL="${RAG_REDIS_URL:-redis://:${encoded_redis_password}@${REDIS_HOST}:${REDIS_PORT}/0}"
 export REDIS_URL="${REDIS_URL:-${RAG_REDIS_URL}}"
-export RESPONSE_CACHE_URL="${RESPONSE_CACHE_URL:-${RAG_REDIS_URL}}"
+export RESPONSE_CACHE_URL="${RESPONSE_CACHE_URL:-redis://:${encoded_redis_password}@${RESPONSE_CACHE_HOST}:${RESPONSE_CACHE_PORT}/0}"
 
 case "${1:-api}" in
     api)

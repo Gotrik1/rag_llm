@@ -9,20 +9,30 @@ class FakeAgent:
     def __init__(self):
         self.calls = []
 
-    def ask(self, question, prompt, prompt_id, retrieval_query=None, excluded_sources=None):
+    def ask(
+        self,
+        question,
+        prompt,
+        prompt_id,
+        retrieval_query=None,
+        excluded_sources=None,
+        shared_cache_sources=None,
+        shared_system_prompt=None,
+    ):
         self.calls.append(("ask", question))
         if retrieval_query is not None:
             self.calls.append(("retrieval_query", retrieval_query))
         if excluded_sources:
             self.calls.append(("excluded_sources", excluded_sources))
+        self.calls.append(("shared_cache", shared_cache_sources, shared_system_prompt))
         return "python answer", [{"file": "python.docx", "section": "1", "score": 1, "text_preview": "evidence"}], False
 
     def retrieve_context(self, question, top_k, spec=None, excluded_sources=None):
         self.calls.append(("retrieve", question))
         return [context_item("python")]
 
-    def _generate_grounded_answer(self, question, context, calculations, spec, prompt):
-        self.calls.append(("generate", context))
+    def _generate_grounded_answer(self, question, context, calculations, spec, prompt, cache_enabled=False):
+        self.calls.append(("generate", context, cache_enabled, prompt))
         return "hybrid answer"
 
     def clear_cache(self):
@@ -44,6 +54,7 @@ class FlowModeTests(unittest.TestCase):
              patch.object(web_ui, "get_profile", return_value={"prompt": "test", "id": "test"}), \
              patch.object(web_ui, "get_workspace", return_value={"active_chat_id": "active-chat"}), \
              patch.object(web_ui, "get_project_conversation", return_value={"project_name": "test", "memory": {}, "messages": []}), \
+             patch.object(web_ui, "shared_global_document_sources", return_value={"python.docx", "rust.docx"}), \
              patch.object(web_ui, "validate_retrieval", return_value=[]), \
              patch.object(web_ui, "extract_formula_lines", return_value=[]), \
             patch.object(web_ui, "llm_label", return_value={"provider": "ollama", "model": "test", "label": "Ollama · test"}):
@@ -114,6 +125,8 @@ class FlowModeTests(unittest.TestCase):
         generated_context = agent.calls[1][1]
         self.assertEqual(generated_context[0]["file"], "python.docx")
         self.assertTrue(any(item["file"] == "rust.docx" for item in generated_context))
+        self.assertTrue(agent.calls[1][2])
+        self.assertEqual(agent.calls[1][3], "test")
 
     def test_fusion_prefers_current_python_index(self):
         python_items = [context_item(f"python-{index}") for index in range(10)]
@@ -160,6 +173,38 @@ class FlowModeTests(unittest.TestCase):
     def test_standalone_retrieval_question_is_not_expanded(self):
         question = "Объясни порядок расчета ИВ0 по шагам"
         self.assertEqual(web_ui.contextualize_retrieval_question(question, {"messages": []}, "chat-1"), question)
+
+    def test_short_question_with_explicit_price_category_is_not_a_follow_up(self):
+        question = "Как рассчитывается 1 ЦК?"
+        scope = {"messages": [
+            {"chat_id": "chat-1", "role": "user", "content": "Что такое ИВ0?"},
+        ]}
+        self.assertEqual(web_ui.contextualize_retrieval_question(question, scope, "chat-1"), question)
+
+    def test_shared_sources_exclude_private_and_ambiguous_names(self):
+        documents = [
+            {"source_path": "C:/uploads/global.pdf", "file_name": "Регламент.pdf", "owner_subject": None, "status": "ready"},
+            {"source_path": "C:/uploads/private.pdf", "file_name": "Личный.pdf", "owner_subject": "user-1", "status": "ready"},
+            {"source_path": "C:/global/shared.pdf", "file_name": "Одинаковый.pdf", "owner_subject": None, "status": "ready"},
+            {"source_path": "C:/private/other.pdf", "file_name": "Одинаковый.pdf", "owner_subject": "user-2", "status": "ready"},
+            {"source_path": "C:/uploads/deleted.pdf", "owner_subject": None, "status": "deleting", "deleted_at": "2026-09-10"},
+        ]
+        with patch.object(web_ui, "list_all_documents_for_retrieval", return_value=documents):
+            sources = web_ui.shared_global_document_sources()
+        self.assertIn("global.pdf", sources)
+        self.assertIn("регламент.pdf", sources)
+        self.assertNotIn("private.pdf", sources)
+        self.assertNotIn("личный.pdf", sources)
+        self.assertNotIn("одинаковый.pdf", sources)
+        self.assertNotIn("deleted.pdf", sources)
+
+    def test_context_is_shared_only_when_every_chunk_is_global(self):
+        self.assertTrue(web_ui.context_is_shared_global(
+            [{"file": "C:/uploads/global.pdf"}], {"global.pdf"}
+        ))
+        self.assertFalse(web_ui.context_is_shared_global(
+            [{"file": "global.pdf"}, {"file": "private.pdf"}], {"global.pdf"}
+        ))
 
     def test_project_scope_excludes_documents_from_other_projects_and_chats(self):
         documents = [

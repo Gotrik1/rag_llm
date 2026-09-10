@@ -14,6 +14,9 @@ x-app-environment: &app-environment
   POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
   REDIS_HOST: redis
   REDIS_PORT: "6379"
+  RESPONSE_CACHE_HOST: response-cache
+  RESPONSE_CACHE_PORT: "6379"
+  RESPONSE_CACHE_TTL_SECONDS: ${RESPONSE_CACHE_TTL_SECONDS:-604800}
   REDIS_PASSWORD_FILE: /run/secrets/redis_password
   RAG_SECRET_KEY_FILE: /run/secrets/app_secret_key
   QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
@@ -126,6 +129,27 @@ services:
       - no-new-privileges:true
     logging: *common-logging
 
+  response-cache:
+    image: redis:8.8.0-alpine
+    command:
+      - /bin/sh
+      - -ec
+      - exec redis-server --save "" --appendonly no --requirepass "$$(cat /run/secrets/redis_password)" --maxmemory "${RESPONSE_CACHE_MAXMEMORY:-256mb}" --maxmemory-policy allkeys-lru
+    secrets:
+      - redis_password
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$(cat /run/secrets/redis_password)\" ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *common-logging
+
   qdrant:
     image: qdrant/qdrant:v1.17.1
     environment:
@@ -197,6 +221,8 @@ services:
       migrate:
         condition: service_completed_successfully
       redis:
+        condition: service_healthy
+      response-cache:
         condition: service_healthy
       qdrant:
         condition: service_healthy
@@ -271,6 +297,8 @@ services:
       migrate:
         condition: service_completed_successfully
       redis:
+        condition: service_healthy
+      response-cache:
         condition: service_healthy
       qdrant:
         condition: service_healthy

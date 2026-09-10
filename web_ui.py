@@ -237,6 +237,13 @@ def project_context_prompt(scope: dict) -> str:
 def contextualize_retrieval_question(question: str, scope: dict, chat_id: str) -> str:
     """Resolve short referential follow-ups using the previous user turn in this chat."""
     normalized = re.sub(r"\s+", " ", question.strip().lower())
+    explicit_subject = bool(
+        re.search(r"\b\d+\s*[а-яёa-z]{1,5}\b", normalized)
+        or re.search(r"\b[А-ЯЁA-Z]{2,}\d*\b", question)
+        or re.search(r"[«\"'][^»\"']{2,}[»\"']", question)
+    )
+    if explicit_subject:
+        return question
     follow_up = len(normalized) <= 140 and bool(re.match(
         r"^(?:а\s+|и\s+|но\s+)?(?:по\s+)?(?:како(?:й|е|я|ие)|как|где|когда|почему|зачем|сколько|"
         r"что\s+(?:с|насч[её]т)|это|он|она|они|его|е[её]|их)\b",
@@ -397,6 +404,36 @@ def excluded_document_sources(scope: dict, chat_id: str) -> set[str]:
     return excluded
 
 
+def shared_global_document_sources() -> set[str]:
+    """Return unambiguous source aliases backed only by active global documents."""
+    try:
+        records = list_all_documents_for_retrieval()
+    except Exception:
+        return set()
+    ownership_by_source: dict[str, set[str]] = {}
+    for record in records:
+        if record.get("deleted_at") or str(record.get("status") or "") != "ready":
+            continue
+        ownership = "private" if str(record.get("owner_subject") or "") else "global"
+        for field in ("source_path", "file_name"):
+            value = str(record.get(field) or "").strip()
+            if value:
+                ownership_by_source.setdefault(Path(value).name.casefold(), set()).add(ownership)
+    return {
+        source for source, ownership in ownership_by_source.items()
+        if ownership == {"global"}
+    }
+
+
+def context_is_shared_global(context: list[dict], shared_sources: set[str]) -> bool:
+    """Cache only when every selected chunk has an unambiguous global owner."""
+    normalized_sources = {Path(str(source)).name.casefold() for source in shared_sources}
+    return bool(context) and all(
+        Path(str(item.get("file", ""))).name.casefold() in normalized_sources
+        for item in context
+    )
+
+
 def filter_scoped_context(items: list[dict], excluded_sources: set[str]) -> list[dict]:
     if not excluded_sources:
         return items
@@ -535,19 +572,33 @@ def filter_rust_context(question: str, items: list[dict]) -> list[dict]:
     return filtered
 
 
-def rust_generate(question: str, context: list[dict], project_context: str = "") -> tuple[str, bool]:
+def rust_generate(
+    question: str,
+    context: list[dict],
+    project_context: str = "",
+    *,
+    cache_enabled: bool = False,
+) -> tuple[str, bool]:
     with _pipeline_span(
         "rust.generate",
         flow="rust",
         attributes={"rag.context.count": len(context)},
     ) as span:
-        answer, from_cache = _rust_generate(question, context, project_context)
+        answer, from_cache = _rust_generate(
+            question, context, project_context, cache_enabled=cache_enabled
+        )
         span.set_attribute("rag.cache.hit", from_cache)
         span.set_attribute("rag.response.chars", len(answer))
         return answer, from_cache
 
 
-def _rust_generate(question: str, context: list[dict], project_context: str = "") -> tuple[str, bool]:
+def _rust_generate(
+    question: str,
+    context: list[dict],
+    project_context: str = "",
+    *,
+    cache_enabled: bool = False,
+) -> tuple[str, bool]:
     context_text = "\n\n---\n\n".join(
         f"[Источник: {item.get('file', '?')}, Раздел: {item.get('section_path', '')}]\n{item.get('text', '')}"
         for item in context
@@ -560,7 +611,7 @@ def _rust_generate(question: str, context: list[dict], project_context: str = ""
         f"{CACHE_VERSION}\nrust-generation\n{model}\n{question}\n{context_text}".encode("utf-8")
     ).hexdigest()
     response_cache = get_agent().response_cache
-    cached = response_cache.get(cache_key)
+    cached = response_cache.get(cache_key) if cache_enabled else None
     if isinstance(cached, dict) and isinstance(cached.get("answer"), str):
         return str(cached["answer"]), True
     request = json.dumps(
@@ -572,7 +623,8 @@ def _rust_generate(question: str, context: list[dict], project_context: str = ""
     if not isinstance(payload, dict) or not str(payload.get("answer", "")).strip():
         raise RuntimeError("Rust flow не вернул ответ")
     answer = str(payload["answer"]).strip()
-    response_cache.set(cache_key, {"answer": answer})
+    if cache_enabled:
+        response_cache.set(cache_key, {"answer": answer})
     return answer, False
 
 
@@ -1304,6 +1356,7 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
         excluded_sources = excluded_document_sources(scope, chat_id)
+        shared_sources = shared_global_document_sources()
 
         mode = load_flow_mode()
         agent = get_agent()
@@ -1312,7 +1365,11 @@ class Handler(BaseHTTPRequestHandler):
         profile = get_profile(load_system_prompt_id(), GROUNDED_SYSTEM_PROMPT)
         scoped_prompt = f"{profile['prompt']}\n\n{project_context_prompt(scope)}"
         if mode == "python":
-            ask_options = {"retrieval_query": retrieval_question}
+            ask_options = {
+                "retrieval_query": retrieval_question,
+                "shared_cache_sources": shared_sources,
+                "shared_system_prompt": profile["prompt"],
+            }
             if excluded_sources:
                 ask_options["excluded_sources"] = excluded_sources
             answer, sources, from_cache = agent.ask(question, scoped_prompt, profile["id"], **ask_options)
@@ -1327,7 +1384,16 @@ class Handler(BaseHTTPRequestHandler):
                 filter_rust_context(retrieval_question, rust_context(retrieval_question)), excluded_sources
             )
             context = fuse_contexts(python_items, rust_items, TOP_K)
-            rust_result = rust_generate(question, context, project_context_prompt(scope))
+            cache_enabled = (
+                retrieval_question == question
+                and context_is_shared_global(context, shared_sources)
+            )
+            rust_result = rust_generate(
+                question,
+                context,
+                "" if cache_enabled else project_context_prompt(scope),
+                cache_enabled=cache_enabled,
+            )
             if isinstance(rust_result, tuple):
                 answer, from_cache = rust_result
             else:  # Keeps the callable easy to mock in contract tests.
@@ -1346,7 +1412,18 @@ class Handler(BaseHTTPRequestHandler):
             context = fuse_contexts(python_items, rust_items, TOP_K)
             spec = refine_prism_query(question)
             calculations = extract_formula_lines(context, question)
-            answer = agent._generate_grounded_answer(question, context, calculations, spec, scoped_prompt)
+            cache_enabled = (
+                retrieval_question == question
+                and context_is_shared_global(context, shared_sources)
+            )
+            answer = agent._generate_grounded_answer(
+                question,
+                context,
+                calculations,
+                spec,
+                profile["prompt"] if cache_enabled else scoped_prompt,
+                cache_enabled=cache_enabled,
+            )
             from_cache = bool(getattr(agent, "last_generation_from_cache", False))
             sources = [{"file": item["file"], "section": item.get("section_path", ""), "score": item["score"], "text_preview": item["text"][:120]} for item in context]
         sources = enrich_source_links(sources)

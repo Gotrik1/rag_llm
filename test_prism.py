@@ -139,6 +139,70 @@ class PrismQueryTests(unittest.TestCase):
         self.assertEqual(answer, "Ответ")
         self.assertEqual(sources[0]["file"], "method.docx")
         self.assertFalse(from_cache)
+        self.assertFalse(agent._generate_grounded_answer.call_args.kwargs["cache_enabled"])
+
+    def test_ask_enables_cross_user_cache_only_for_global_context(self):
+        agent = object.__new__(RAGAgent)
+        agent.response_cache = Mock()
+        agent._refresh_docstore_if_changed = Mock()
+        agent._all_nodes = [object()]
+        agent.understand_query = Mock(return_value=QueryUnderstanding(
+            "Как рассчитывается 1 ЦК?",
+            ("calculation",),
+            ("1 ЦК расчет стоимости",),
+        ))
+        agent.retrieve_context = Mock(return_value=[{
+            "file": "global-method.docx",
+            "section_path": "1 ЦК",
+            "score": 1.0,
+            "text": "Стоимость рассчитывается по правилам документа.",
+        }])
+        agent._generate_grounded_answer = Mock(return_value="Ответ")
+
+        answer, _sources, from_cache = RAGAgent.ask(
+            agent,
+            "Как рассчитывается 1 ЦК?",
+            "project prompt",
+            shared_cache_sources={"global-method.docx"},
+            shared_system_prompt="global prompt",
+        )
+
+        self.assertEqual(answer, "Ответ")
+        self.assertFalse(from_cache)
+        call = agent._generate_grounded_answer.call_args
+        self.assertEqual(call.args[4], "global prompt")
+        self.assertTrue(call.kwargs["cache_enabled"])
+
+    def test_ask_disables_shared_cache_for_contextual_question(self):
+        agent = object.__new__(RAGAgent)
+        agent.response_cache = Mock()
+        agent._refresh_docstore_if_changed = Mock()
+        agent._all_nodes = [object()]
+        agent.understand_query = Mock(return_value=QueryUnderstanding(
+            "Что такое ИВ0 и по какой формуле он рассчитывается?",
+            ("definition", "calculation"),
+            ("ИВ0 формула",),
+        ))
+        agent.retrieve_context = Mock(return_value=[{
+            "file": "global-method.docx",
+            "section_path": "ИВ0",
+            "score": 1.0,
+            "text": "Формула ИВ0.",
+        }])
+        agent._generate_grounded_answer = Mock(return_value="Ответ")
+
+        RAGAgent.ask(
+            agent,
+            "А по какой формуле?",
+            "project prompt",
+            retrieval_query="Предыдущий вопрос: Что такое ИВ0?\nУточняющий вопрос: А по какой формуле?",
+            shared_cache_sources={"global-method.docx"},
+            shared_system_prompt="global prompt",
+        )
+
+        call = agent._generate_grounded_answer.call_args
+        self.assertEqual(call.args[4], "project prompt")
+        self.assertFalse(call.kwargs["cache_enabled"])
 
     def test_direct_retrieval_understands_query_before_search(self):
         agent = object.__new__(RAGAgent)

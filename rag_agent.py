@@ -2418,27 +2418,21 @@ class RAGAgent:
         prompt_id: str = "rag-grounded",
         retrieval_query: str | None = None,
         excluded_sources: set[str] | None = None,
+        shared_cache_sources: set[str] | None = None,
+        shared_system_prompt: str | None = None,
     ) -> tuple[str, list[dict], bool]:
         """
         Возвращает (answer, sources, from_cache).
         sources — список dict с ключами file, section, score.
         """
+        # Answer caching is intentionally retrieval-first.  A pre-retrieval
+        # cache key cannot prove that an answer was based only on globally
+        # shared evidence and used to fragment by user/project exclusions.
+        del prompt_id  # Kept in the public signature for backwards compatibility.
+        if not hasattr(self, "_generation_state"):
+            self._generation_state = threading.local()
+        self._generation_state.from_cache = False
         search_question = (retrieval_query or question).strip()
-        scope_key = "\n".join(sorted(source.casefold() for source in (excluded_sources or set())))
-        qhash = _question_hash(
-            f"{prompt_id}\n{system_prompt or GROUNDED_SYSTEM_PROMPT}\n{question}\n{search_question}\n{scope_key}"
-        )
-
-        with _pipeline_span("cache.lookup") as span:
-            cached = self.response_cache.get(qhash)
-            span.set_attribute("rag.cache.hit", bool(cached))
-        if cached:
-            answer = cached.get("answer")
-            sources = cached.get("sources")
-            if isinstance(answer, str) and isinstance(sources, list):
-                with _pipeline_span("cache.hit"):
-                    pass
-                return answer, sources, True
 
         self._refresh_docstore_if_changed()
         if not self._all_nodes:
@@ -2474,13 +2468,27 @@ class RAGAgent:
             else ""
         )
         if not answer:
+            shared_sources = {
+                Path(str(source)).name.casefold()
+                for source in (shared_cache_sources or set())
+            }
+            context_is_shared = bool(context) and all(
+                Path(str(item.get("file", ""))).name.casefold() in shared_sources
+                for item in context
+            )
+            cache_enabled = (
+                context_is_shared
+                and search_question == question.strip()
+                and shared_system_prompt is not None
+            )
             answer = self._generate_grounded_answer(
                 question,
                 context,
                 calculations,
                 spec,
-                system_prompt,
+                shared_system_prompt if cache_enabled else system_prompt,
                 evidence_question=understood_question,
+                cache_enabled=cache_enabled,
             )
 
         sources = [{
@@ -2490,13 +2498,7 @@ class RAGAgent:
             "text_preview": item["text"][:120],
         } for item in context]
 
-        cached_sources = [
-            {key: source[key] for key in ("file", "section", "score") if key in source}
-            for source in sources
-        ]
-        self.response_cache.set(qhash, {"answer": answer, "sources": cached_sources})
-
-        return answer, sources, False
+        return answer, sources, bool(self.last_generation_from_cache)
 
     def _generate_grounded_answer(
         self,
@@ -2506,6 +2508,7 @@ class RAGAgent:
         spec: PrismQuery | None = None,
         system_prompt: str | None = None,
         evidence_question: str | None = None,
+        cache_enabled: bool = False,
     ) -> str:
         self._generation_state.from_cache = False
         spec = spec or refine_prism_query(question)
@@ -2557,9 +2560,15 @@ class RAGAgent:
 ОТВЕТ:
 """
         generation_key = _question_hash(f"generation\n{self.llm_model}\n{prompt}")
-        cached = self.response_cache.get(generation_key)
+        cached = None
+        if cache_enabled:
+            with _pipeline_span("cache.lookup") as span:
+                cached = self.response_cache.get(generation_key)
+                span.set_attribute("rag.cache.hit", bool(cached))
         if isinstance(cached, dict) and isinstance(cached.get("answer"), str):
             self._generation_state.from_cache = True
+            with _pipeline_span("cache.hit"):
+                pass
             return str(cached["answer"])
         with _pipeline_span(
             "llm.generate",
@@ -2575,7 +2584,8 @@ class RAGAgent:
             if not answer:
                 raise RuntimeError("LLM returned an empty answer")
             span.set_attribute("rag.response.chars", len(answer))
-        self.response_cache.set(generation_key, {"answer": answer})
+        if cache_enabled:
+            self.response_cache.set(generation_key, {"answer": answer})
         return answer
 
     def debug_retrieval(self, question: str, top_k: int = 10):

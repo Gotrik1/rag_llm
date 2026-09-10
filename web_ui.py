@@ -1149,10 +1149,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, 500)
 
     def handle_models(self) -> None:
-        models = ollama_models()
         saved = load_provider_config()
         selected = _agent.llm_model if _agent is not None else (saved.get("model") if saved.get("provider") == "ollama" else LLM_MODEL)
-        self.send_json({"models": models, "selected": selected})
+        try:
+            models = ollama_models()
+            available = True
+        except RuntimeError as exc:
+            # Model discovery is auxiliary UI data.  During CPU-heavy OCR or
+            # embedding the single bridge worker can briefly miss its timeout;
+            # keep the already configured model usable instead of turning a
+            # transient discovery delay into an application-wide 500.
+            models = [selected] if selected else []
+            available = False
+            error = str(exc)
+        payload = {"models": models, "selected": selected, "available": available}
+        if not available:
+            payload["warning"] = error
+        self.send_json(payload)
 
     def handle_model_select(self, body: dict) -> None:
         model = str(body.get("model", "")).strip()

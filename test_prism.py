@@ -126,6 +126,13 @@ class PrismQueryTests(unittest.TestCase):
 
         self.assertEqual(spec.answer_mode, "grounded_answer")
 
+    def test_formula_with_variables_and_substitution_keeps_grounded_answer_mode(self):
+        spec = refine_prism_query(
+            "Приведи формулу расхода, расшифруй переменные и рассчитай при P=12, η=0,8, H=3."
+        )
+
+        self.assertEqual(spec.answer_mode, "grounded_answer")
+
     def test_short_markdown_equation_is_kept(self):
         formulas = extract_formula_lines_from_texts(
             ["For the example:\n\n$$\nI = \\frac{U}{R}\n$$"],
@@ -190,6 +197,22 @@ class PrismQueryTests(unittest.TestCase):
 
         self.assertIn(r"$$\text{ИВ0} = V_{\text{УДГ}} - V_{\text{план.ДГ}}$$", answer)
         self.assertNotIn(r"- \mathrm", answer)
+
+    def test_formula_fallback_uses_matching_document_locator(self):
+        formula = r"Q = \frac{P}{\eta H}"
+        answer = generate_formula_only_answer(
+            "дай формулу расхода",
+            [{
+                "file": "manual.md",
+                "section_path": "Формула контрольного расхода",
+                "text": f"Контрольный расход: {formula}",
+            }],
+            [formula],
+            refine_prism_query("дай формулу расхода"),
+        )
+
+        self.assertIn("[Источник: manual.md — раздел «Формула контрольного расхода»]", answer)
+        self.assertNotIn("извлечённый контекст", answer)
 
     def test_ivo_worded_difference_is_rendered_as_explicit_formula(self):
         question = "Что такое ИВ0? Как рассчитывается? А по какой формуле?"

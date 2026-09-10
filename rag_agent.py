@@ -250,7 +250,15 @@ def refine_prism_query(question: str) -> PrismQuery:
         for clause in re.split(r"[.!?;]+", normalized)
         if clause.strip()
     )
-    formula_only = asks_for_formulas and not non_formula_fact_request
+    # "Дай формулу" is safely deterministic.  Once the user also requests
+    # variables, units, substitution or a numerical result, the whole turn
+    # must reach grounded generation; otherwise formula-only mode silently
+    # discards those requested facets.
+    expanded_formula_request = bool(re.search(
+        r"\b(?:расшифр\w*|обознач\w*|переменн\w*|единиц\w*|подстав\w*|рассчита\w*|вычисл\w*|пример\w*)\b",
+        normalized,
+    ))
+    formula_only = asks_for_formulas and not (non_formula_fact_request or expanded_formula_request)
     intent = "formula_extraction" if formula_only else detect_query_intent(question)
     answer_mode = "formulas_only" if formula_only else "grounded_answer"
 
@@ -1339,6 +1347,18 @@ def generate_formula_only_answer(question: str, context: list[dict], calculation
             )),
             None,
         )
+    if confirmed is None and calculations and context:
+        normalized_calculations = [clean_formula_artifacts(item).casefold() for item in calculations[:3]]
+        confirmed = next(
+            (
+                item for item in context
+                if any(
+                    calculation and calculation in clean_formula_artifacts(str(item.get("text", ""))).casefold()
+                    for calculation in normalized_calculations
+                )
+            ),
+            None,
+        )
     if confirmed is None:
         # The caller may already have extracted a calculation from an explicit
         # section query.  It remains deterministic evidence, even when the
@@ -1354,7 +1374,7 @@ def generate_formula_only_answer(question: str, context: list[dict], calculation
             )
         return "Недостаточно подтверждённых данных: для формулы не найден конкретный пункт Регламента."
 
-    confirmed_calculations = extract_formula_lines_from_texts([str(confirmed.get("text", ""))], question)
+    confirmed_calculations = extract_formula_lines_from_texts([str(confirmed.get("text", ""))], question) or calculations
     if not confirmed_calculations:
         return "Недостаточно подтверждённых данных: в найденном пункте нет извлечённой формулы или расчётного правила."
 

@@ -1,6 +1,8 @@
 # Production readiness report
 
-Date: 2026-09-10. Canonical branch: `dev`. Active application release: `4c94a3a0b`.
+Date: 2026-09-10. Canonical branch: `dev`. Active source/frontend release:
+`5a3ec1cce`; backend application image remains `4c94a3a0b` because the latest
+change is an isolated UI math-rendering hotfix.
 
 The platform is publicly available without VPN at
 `https://5.35.120.112:8443/`. The former browser Basic Auth challenge has been
@@ -30,7 +32,7 @@ keeps an authenticated session in a secure HttpOnly cookie.
 | Image OCR | PNG, JPEG, WebP, TIFF and BMP are processed locally by Tesseract with Russian and English language packs; the original image remains the cited source | real release-image OCR acceptance and ingestion tests |
 | Extractive image answers | explicit transcription requests are answered directly from OCR evidence, including first-line/card requests, without losing the recognized text in a generative round trip | focused PRISM tests and live PNG acceptance |
 | Human sources | answer citations and the `Sources` panel link to the original document and show a human locator; internal chunk IDs/scores are not user-facing | source-contract tests and live production answer |
-| Formulas | Markdown/KaTeX renders validated LaTeX; formula payloads contain equations and variable definitions | formula tests and live `ИВ0` acceptance |
+| Formulas | Markdown/KaTeX renders validated LaTeX, including persisted display blocks with duplicated inner delimiters; formula payloads contain equations and variable definitions | formula tests plus live `ИВ0`, `1 ЦК` and malformed `6 ЦК` acceptance |
 | Technical panel | `Evidence`, `Sources` and `Debug` show metadata for the selected answer; `Система` exposes the global upload control only to administrators and never accepts project/chat files | UI tests, release-image authorization test and live non-admin acceptance |
 | Deletion lifecycle | deleting a document immediately removes it from the visible registry, then a serialized worker removes the source file, Qdrant nodes and BM25/docstore nodes and clears answer cache | queue/API/unit tests and full live delete audit |
 | Prompt-injection resistance | uploaded text is treated as evidence, never as a replacement for system/user instructions | policy and injection tests |
@@ -46,7 +48,7 @@ keeps an authenticated session in a secure HttpOnly cookie.
   `90.5%`, persistence `85.0%`, generation worker `80.3%`, document ingestion
   `77.9%`, scoped DB store `75.7%`, cache `69.5%`, ASGI layer `63.6%`, DOCX
   parser `62.2%`, web layer `54.0%`, and core RAG agent `42.8%`.
-- UI Vitest: `25/25 passed`.
+- UI Vitest: `29/29 passed`.
 - UI production build: successful, `2,551` modules transformed.
 - Focused local backend gate for authentication, scoping, gateway, jobs and
   cache: `42 passed`.
@@ -62,9 +64,9 @@ the percentage.
 
 | Check | Result |
 | --- | --- |
-| Release/rollback | `current` -> `/opt/rag_llm/releases/4c94a3a0b`; `rollback` -> `/opt/rag_llm/releases/8cff19c34` |
-| Artifact | `29,135,267` bytes; SHA-256 `117EB40950BA8D84F80087CEDBFC728A529D1A62AF5AC999040BCEAF2CBA9A8C` |
-| Images | app `sha256:92f6b0d6b11f...`; proxy `sha256:8cd6b1baf495...`; bridge `sha256:42edd40b424c...` |
+| Release/rollback | `current` -> `/opt/rag_llm/releases/5a3ec1cce`; `rollback` -> `/opt/rag_llm/releases/9266aa271` |
+| Artifact | `29,136,131` bytes; SHA-256 `E600A6FED9CEA4F7620D3199E5FC6E0A8AA74F20B835CBB7BC0D201D4B0FB37C` |
+| Images | app remains `sha256:92f6b0d6b11f...`; proxy `sha256:38bcec7b45b5...`; bridge remains `sha256:42edd40b424c...` |
 | Database safety | PostgreSQL backup `/opt/rag_llm/shared/backups/rag-pre-4c94a3a0b-20260910T110822Z.dump` is present (`787,455` bytes, SHA-256 `052691f115594976bce387af3192278ab6cbe908eebeb9747cf2dfce9fba5991`) and passed restore-list validation at deployment |
 | Runtime | 19 Compose services running; application, proxy, TLS proxy, LLM bridge, vLLM, PostgreSQL, Redis and Qdrant report healthy where health checks are defined |
 | Health | `/healthz` -> `{"status":"ok"}`; `/readyz` -> `{"status":"ready"}` |
@@ -83,13 +85,13 @@ the percentage.
 | Inventory answer | returned all six document names, links, timestamps, processing states and explicit version/freshness caveats without spending LLM context tokens |
 | Technical panel | `Evidence` showed latency/usage and validation; `Sources` showed clickable document cards with dates/versions; `Debug` remains available for diagnostic metadata |
 | Formula/source answer | current release returned the requested project formula, all variable definitions and the correct substitution `12 / (0.8 x 3) = 5 m3/h`; KaTeX rendered math nodes and the answer linked `qa_project_c67.md` with its human section locator |
-| Malformed 6 ЦК question | `что такое 6ЦК и ак она рассчитывается` was interpreted as definition plus calculation; the answer contained three calculation components, two cited documents and eight rendered KaTeX nodes without raw `S_sub`/`\\mathrm` text |
-| Multi-source 1 ЦК answer | `Как рассчитывается 1 ЦК?` returned the 1 ЦК formula and parameters from section 5.1 plus the one-rate transmission rule from `Методика расчета стоимости на передачу в.1.docx`; `Sources` contained both clickable original documents and their human section locators |
+| Malformed 6 ЦК question | `что такое 6ЦК и ак она рассчитывается` was interpreted as definition plus calculation; the persisted answer contains three calculation components, two cited documents, `14` rendered KaTeX nodes and `0` `.katex-error` elements after a production reload |
+| Multi-source 1 ЦК answer | `Как рассчитывается 1 ЦК?` returned the 1 ЦК formula and parameters from section 5.1 plus the one-rate transmission rule from `Методика расчета стоимости на передачу в.1.docx`; both original documents are clickable, with human locators, and the answer contains `17` KaTeX nodes with `0` errors |
 | Positive document list | `В каких документах фигурирует 1ЦК?` returned only the directly matching methodology and did not mention `r12.docx` or any other negative candidate |
 | Formula DOM | the final browser answer contained `28` KaTeX nodes, `0` `.katex-error` elements, no raw legacy `S_sub(` notation and no visible raw `\\mathrm`; source download completed from the `Sources` panel |
 | Context budget | the representative formula answer used about `1,847` context tokens and `1,970` total estimated tokens instead of injecting the complete document |
 | Document deletion | both live DELETE requests returned `202`; both worker jobs completed at `100%`; both source files are absent; BM25 has `0` matching entries and a full Qdrant scroll over `13,229` points found `0` remnants |
-| Cleanup and preservation | all four QA accounts (`QA c67 A`, `QA c67 B`, `QA Intent 45d`, `QA Scope 4c94`) are disabled and every live QA session is revoked; active QA documents/projects/chats are `0`. Four active users, five owned projects, five owned chats, six shared documents and two legitimate private documents were preserved |
+| Cleanup and preservation | the four earlier QA accounts (`QA c67 A`, `QA c67 B`, `QA Intent 45d`, `QA Scope 4c94`) and the final `QA MultiDoc 4c94` account are disabled and every live QA session is revoked; active QA documents/projects/chats are `0`. Legitimate users, shared documents and private project data were preserved |
 | User documentation | the 12-page DOCX and Markdown guide describe the three fixed upload entry points, registration, project/global scope, OCR limits, queues, sources, formulas and troubleshooting; every rendered page passed visual inspection |
 
 The representative semantic cases meet the project threshold of at least 9/10.
@@ -110,7 +112,7 @@ the `rollback` symlink. Operational/user documentation is also copied to
 Self-service local authentication is appropriate for the requested public IP
 deployment, but production operations still need a deliberate account policy:
 email verification/recovery, administrator provisioning, optional invitation-
-only registration and eventually corporate OIDC/MFA. The four disabled QA user
+only registration and eventually corporate OIDC/MFA. The five disabled QA user
 rows and their tombstoned document registry rows remain for auditability; hard
 deletion requires separate explicit authorization. Coverage should next be
 raised in provider failures, local-auth database error paths, worker failures,

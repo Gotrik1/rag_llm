@@ -13,6 +13,7 @@ from rag_agent import (
     deterministic_query_understanding,
     diversify_context_results,
     extract_formula_lines_from_texts,
+    ensure_price_category_source_coverage,
     formula_sibling_results,
     format_formula_for_display,
     format_formula_for_katex,
@@ -238,6 +239,45 @@ class PrismQueryTests(unittest.TestCase):
         self.assertIn("positive.docx", answer)
         self.assertNotIn("negative.docx", answer)
         self.assertNotIn("не указана", answer)
+
+    def test_price_category_answer_cites_relevant_second_document(self):
+        answer = ensure_price_category_source_coverage(
+            "Стоимость 1 ЦК определяется по формуле. "
+            "[Источник: categories.docx — раздел «5.1 Порядок определения стоимости 1 ЦК»]",
+            "Как рассчитывается 1 ЦК?",
+            [
+                {
+                    "file": "categories.docx",
+                    "section_path": "5.1 Порядок определения стоимости 1 ЦК",
+                    "text": "Стоимость 1 ЦК определяется по формуле.",
+                    "matched_queries": ["price-category-exact:1"],
+                },
+                {
+                    "file": "transfer.docx",
+                    "section_path": "ПОРЯДОК ОПРЕДЕЛЕНИЯ СТОИМОСТИ",
+                    "text": "Стоимость услуг по передаче определяется по одноставочному тарифу.",
+                    "matched_queries": ["price-category-related:1"],
+                },
+            ],
+        )
+
+        self.assertIn("Связанный расчёт услуг по передаче", answer)
+        self.assertIn("[Источник: transfer.docx —", answer)
+        self.assertEqual(answer.count("[Источник: categories.docx —"), 1)
+
+    def test_price_category_source_coverage_never_adds_unrelated_document(self):
+        answer = ensure_price_category_source_coverage(
+            "Стоимость 1 ЦК описана в методике.",
+            "Как рассчитывается 1 ЦК?",
+            [{
+                "file": "unrelated.docx",
+                "section_path": "Тарифы",
+                "text": "Для другого расчета применяется одноставочный тариф.",
+                "matched_queries": ["semantic:tariff"],
+            }],
+        )
+
+        self.assertEqual(answer, "Стоимость 1 ЦК описана в методике.")
 
     def test_calculation_question_extracts_docx_math_payloads(self):
         formulas = extract_formula_lines_from_texts(

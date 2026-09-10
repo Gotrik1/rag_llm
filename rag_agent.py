@@ -68,7 +68,7 @@ VECTOR_TOP_K     = 12      # кандидатов от вектора
 # A semantic/chunking change must never reuse an older docstore or vector
 # collection: the two indexes must describe precisely the same corpus.
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25_v12"))
-CACHE_VERSION    = "v30-price-category-evidence"
+CACHE_VERSION    = "v31-price-category-source-coverage"
 QUERY_UNDERSTANDING_VERSION = "v1"
 MAX_OUTPUT_TOKENS = 4056
 
@@ -1179,6 +1179,43 @@ def human_source_reference(item: dict) -> str:
         f"{user_facing_source_name(item.get('file', ''))} — "
         f"{source_locator(item.get('section_path', item.get('section', '')), item.get('page_number'))}"
     )
+
+
+def ensure_price_category_source_coverage(answer: str, question: str, context: list[dict]) -> str:
+    """Add a cited transmission rule when the model omits a relevant second source."""
+    category = price_category_number(question)
+    if not category or not asks_for_calculation(question):
+        return answer
+
+    normalized_answer = answer.casefold()
+    expected_rate = "одноставоч" if category == "1" else "двухставоч" if category == "6" else ""
+    if not expected_rate:
+        return answer
+
+    for item in context:
+        source = user_facing_source_name(item.get("file", "?"))
+        if source.casefold() in normalized_answer:
+            continue
+        haystack = (
+            f"{item.get('section_path', '')}\n{item.get('section_title', '')}\n{item.get('text', '')}"
+        ).lower().replace("ё", "е")
+        matched_queries = {str(value) for value in item.get("matched_queries", [])}
+        is_related = f"price-category-related:{category}" in matched_queries
+        if not (
+            expected_rate in haystack
+            and "передач" in haystack
+            and (is_related or contains_price_category(haystack, category))
+        ):
+            continue
+
+        rate_name = "одноставочному" if category == "1" else "двухставочному"
+        appendix = (
+            "### Связанный расчёт услуг по передаче\n\n"
+            f"Для {category} ЦК стоимость услуг по передаче рассчитывается по "
+            f"{rate_name} тарифу. [Источник: {human_source_reference(item)}]"
+        )
+        return f"{answer.rstrip()}\n\n{appendix}"
+    return answer
 
 
 def generate_document_occurrence_answer(question: str, context: list[dict]) -> str:
@@ -2534,6 +2571,7 @@ class RAGAgent:
         ) as span:
             response = self.llm.complete(prompt)
             answer = sanitize_grounded_answer(str(response).strip(), question, calculations)
+            answer = ensure_price_category_source_coverage(answer, evidence_question or question, context)
             if not answer:
                 raise RuntimeError("LLM returned an empty answer")
             span.set_attribute("rag.response.chars", len(answer))

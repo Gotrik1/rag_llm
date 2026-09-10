@@ -1,6 +1,6 @@
 # Production readiness report
 
-Date: 2026-09-10. Canonical branch: `dev`. Active application release: `e11caa570`.
+Date: 2026-09-10. Canonical branch: `dev`. Active application release: `a2ea8782c`.
 
 The platform is publicly available without VPN at
 `https://5.35.120.112:8443/`. The former browser Basic Auth challenge has been
@@ -25,16 +25,17 @@ keeps an authenticated session in a secure HttpOnly cookie.
 | Bounded RAG context | retrieval, reranking and neighbor expansion select a bounded evidence set; complete documents are not copied into the system prompt | PRISM/prompt-injection tests and live token telemetry |
 | Document registry | UI shows separate `Общие документы`, `Документы проекта` and `Документы чата`, original filename, upload time, status, detected version and freshness statement | browser acceptance and deterministic inventory answer |
 | Image OCR | PNG, JPEG, WebP, TIFF and BMP are processed locally by Tesseract with Russian and English language packs; the original image remains the cited source | real release-image OCR acceptance and ingestion tests |
+| Extractive image answers | explicit transcription requests are answered directly from OCR evidence, including first-line/card requests, without losing the recognized text in a generative round trip | focused PRISM tests and live PNG acceptance |
 | Human sources | answer citations and the `Sources` panel link to the original document and show a human locator; internal chunk IDs/scores are not user-facing | source-contract tests and live production answer |
 | Formulas | Markdown/KaTeX renders validated LaTeX; formula payloads contain equations and variable definitions | formula tests and live `ИВ0` acceptance |
 | Technical panel | `Evidence`, `Sources` and `Debug` show metadata for the selected answer and restore it with the chat | UI tests and live tab-by-tab acceptance |
+| Deletion lifecycle | deleting a document immediately removes it from the visible registry, then a serialized worker removes the source file, Qdrant nodes and BM25/docstore nodes and clears answer cache | queue/API/unit tests and full live delete audit |
 | Prompt-injection resistance | uploaded text is treated as evidence, never as a replacement for system/user instructions | policy and injection tests |
 
 ## Automated verification
 
-- Full release-image Python suite: `129` tests, `127 passed`, `2 skipped`, one
-  upstream Starlette/httpx deprecation warning; isolated temporary PostgreSQL
-  database and role were removed after the run.
+- Full release-image Python suite: `143` tests, `141 passed`, `2 skipped`;
+  PostgreSQL integration ran against an isolated temporary database and passed.
 - Most recent branch-aware baseline before the final upload/OCR delta: `55.7%`
   across `4,694` statements and `1,624` branches. The current release adds
   targeted upload and OCR tests, but a new whole-repository coverage percentage
@@ -58,25 +59,28 @@ the percentage.
 
 | Check | Result |
 | --- | --- |
-| Release/rollback | `current` -> `/opt/rag_llm/releases/e11caa570`; `rollback` -> `/opt/rag_llm/releases/6b6f8da3a` |
-| Artifact | `29,108,834` bytes; SHA-256 `5F2FD8D07AC468F157E4065AEF33DC1FE2E442A153301C4BBE74132FC0DC4D4C` |
-| Database safety | PostgreSQL backup `/opt/rag_llm/shared/backups/rag-pre-e11caa570-20260910T054519Z.dump` passed `pg_restore --list` validation |
+| Release/rollback | `current` -> `/opt/rag_llm/releases/a2ea8782c`; `rollback` -> `/opt/rag_llm/releases/a6aa7564c` |
+| Artifact | `29,116,069` bytes; SHA-256 `64204E7F896FDE496B605C53B547556B6F4F632A794540E2C9EF48B366E86C87` |
+| Images | app `sha256:a3b1757de26d...`; proxy `sha256:6c8b46782156...`; bridge `sha256:42edd40b424c...` |
+| Database safety | PostgreSQL backup `/opt/rag_llm/shared/backups/rag-pre-a2ea8782c-20260910T075619Z.dump` is present (`485,729` bytes); it passed restore-list validation at deployment |
 | Runtime | 19 Compose services running; application, proxy, TLS proxy, LLM bridge, vLLM, PostgreSQL, Redis and Qdrant report healthy where health checks are defined |
 | Health | `/healthz` -> `{"status":"ok"}`; `/readyz` -> `{"status":"ready"}` |
 | Public access | root returns `200` without VPN/Basic Auth; anonymous `/api/me` returns JSON `401` without `WWW-Authenticate` |
-| Registration UI | registration created a workspace and user card; reload restored the same session without another login |
+| Registration/session UI | registration created a workspace and user card; repeated reloads preserved the session; explicit logout showed the application login page; re-login restored the same chat without a Basic Auth prompt |
 | Attachment UI | mobile and desktop views show the `+` action, explicit chat/project scope, separate document/image selectors, selected filenames and the correct submit label; the obsolete example placeholder is removed |
-| OCR runtime | release image contains Tesseract language packs `rus`, `eng` and `osd`; a generated image was parsed through the real ingestion path with backend `tesseract-ocr` |
+| Mobile acceptance | at `390x844`, authenticated reload preserved the workspace, the `+` attachment action remained available and document width equalled viewport width (`390 px`), with no horizontal overflow |
+| OCR runtime | release image contains Tesseract language packs `rus`, `eng` and `osd`; the supplied PNG was parsed through the real ingestion path and the final answer reproduced `дай формулу ИВ0` exactly with a clickable original-image source |
 | Two-user isolation | foreign project read, foreign chat read and foreign project update returned `404`; both users independently retained their own default workspace |
 | CSRF | authenticated mutation without `X-CSRF-Token` returned `403`; the same workflow with the session token succeeded |
 | Shared corpus | both independent users saw the same six global documents and downloaded the same original source; no private documents leaked |
 | Knowledge modes | `project_and_global` returned six common documents; after switching to `project_only`, a project with no private files returned an empty corpus; the selection persisted in UI/API |
-| Multiple chats | two chats were created and listed under one project with distinct identifiers |
+| Multiple chats | two chats in one project retained distinct histories; two independent browser profiles generated answers concurrently and each result remained attached to its original chat |
 | Inventory answer | returned all six document names, links, timestamps, processing states and explicit version/freshness caveats without spending LLM context tokens |
 | Technical panel | `Evidence` showed latency/usage and validation; `Sources` showed clickable document cards with dates/versions; `Debug` remains available for diagnostic metadata |
-| Formula/source answer | current release answered `ИВ0` in `7.324 s`, returned one formula and one clickable `r12.docx` source with a human section locator |
-| Context budget | live `ИВ0` answer used about `2,895` context tokens and `3,118` total estimated tokens instead of the complete document |
-| Cleanup and preservation | temporary QA data was removed; two legitimate registered users, four projects, 31 chats, six active global documents and zero private documents were preserved across activation |
+| Formula/source answer | current release returned the requested project formula, all variable definitions and the correct substitution `12 / (0.8 x 3) = 5 m3/h`; KaTeX rendered math nodes and the answer linked `qa_project_c67.md` with its human section locator |
+| Context budget | the representative formula answer used about `1,847` context tokens and `1,970` total estimated tokens instead of injecting the complete document |
+| Document deletion | both live DELETE requests returned `202`; both worker jobs completed at `100%`; both source files are absent; BM25 has `0` matching entries and a full Qdrant scroll over `13,229` points found `0` remnants |
+| Cleanup and preservation | the two QA accounts were deactivated and all three live QA sessions revoked; active QA documents are `0`. Three real active users, four owned projects, four owned chats, six shared documents and two legitimate private documents were preserved |
 | User documentation | the 11-page DOCX and Markdown guide describe registration, project/global scope, chat/project uploads, OCR limits, queues, sources, formulas and troubleshooting; every rendered page passed visual inspection |
 
 The representative semantic cases meet the project threshold of at least 9/10.
@@ -97,7 +101,9 @@ the `rollback` symlink. Operational/user documentation is also copied to
 Self-service local authentication is appropriate for the requested public IP
 deployment, but production operations still need a deliberate account policy:
 email verification/recovery, administrator provisioning, optional invitation-
-only registration and eventually corporate OIDC/MFA. Coverage should next be
+only registration and eventually corporate OIDC/MFA. The two disabled QA user
+rows and their tombstoned document registry rows remain for auditability; hard
+deletion requires separate explicit authorization. Coverage should next be
 raised in provider failures, local-auth database error paths, worker failures,
 `rag_agent.py` and the legacy web adapter. Qdrant client/server minor versions
 should be aligned at the next maintenance window. Image ingestion currently

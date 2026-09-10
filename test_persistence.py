@@ -1,4 +1,8 @@
+import concurrent.futures
+import tempfile
+import threading
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from policy import PolicyProvider
@@ -33,6 +37,29 @@ class PersistenceTests(unittest.TestCase):
         principal = self.store.enrich_principal(Principal("employee", provider="oidc"))
         self.assertIn("rag-user", principal.roles)
         self.assertIn("rag.access", principal.permissions)
+
+    def test_concurrent_first_requests_create_one_principal_without_unique_conflicts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "principal-race.db"
+            store = Persistence(f"sqlite+pysqlite:///{database.as_posix()}")
+            Base.metadata.create_all(store.engine)
+            barrier = threading.Barrier(4)
+
+            def enrich() -> Principal:
+                barrier.wait(timeout=5)
+                return store.enrich_principal(Principal("new-tester", provider="local"))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                enriched = list(executor.map(lambda _: enrich(), range(4)))
+
+            self.assertEqual([item.subject for item in enriched], ["new-tester"] * 4)
+            with store.engine.connect() as connection:
+                count = connection.exec_driver_sql(
+                    "SELECT count(*) FROM principals WHERE subject = ?",
+                    ("new-tester",),
+                ).scalar_one()
+            self.assertEqual(count, 1)
+            store.engine.dispose()
 
     def test_persisted_abac_policy_evaluates_attributes(self):
         self.store.upsert_policy({

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import threading
@@ -11,6 +12,8 @@ from http.server import ThreadingHTTPServer
 from urllib.request import Request, urlopen
 
 import db_store
+from persistence import Base, Persistence
+from security import Principal
 from web_ui import Handler
 
 
@@ -384,3 +387,28 @@ class WorkspacePersistenceIntegrationTests(unittest.TestCase):
                 with db_store.db().cursor() as cursor:
                     cursor.execute("DELETE FROM documents WHERE id = %s", (document_id,))
                 db_store.db().commit()
+
+    def test_concurrent_first_requests_create_one_postgresql_principal(self) -> None:
+        store = Persistence(os.environ["DATABASE_URL"])
+        Base.metadata.create_all(store.engine)
+        subject = f"local:principal-race-{uuid.uuid4().hex}"
+        barrier = threading.Barrier(8)
+        try:
+            def enrich() -> Principal:
+                barrier.wait(timeout=10)
+                return store.enrich_principal(Principal(subject, provider="local"))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                enriched = list(executor.map(lambda _: enrich(), range(8)))
+
+            self.assertEqual([item.subject for item in enriched], [subject] * 8)
+            with store.engine.connect() as connection:
+                count = connection.exec_driver_sql(
+                    "SELECT count(*) FROM principals WHERE subject = %s",
+                    (subject,),
+                ).scalar_one()
+            self.assertEqual(count, 1)
+        finally:
+            with store.engine.begin() as connection:
+                connection.exec_driver_sql("DELETE FROM principals WHERE subject = %s", (subject,))
+            store.engine.dispose()

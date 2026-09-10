@@ -6,10 +6,13 @@ import time
 import uuid
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, Float, ForeignKey, Integer, String, Text, create_engine, delete, select
+from sqlalchemy import JSON, Boolean, Float, ForeignKey, Integer, String, Text, create_engine, delete, insert, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
-from security import Principal, SUPERADMIN
+from security import AuthorizationError, Principal, SUPERADMIN
 
 
 def sqlalchemy_database_url(url: str) -> str:
@@ -140,8 +143,31 @@ class Persistence:
         with Session(self.engine) as session:
             row = session.scalar(select(PrincipalRow).where(PrincipalRow.subject == principal.subject, PrincipalRow.active.is_(True)))
             if row is None:
-                row = PrincipalRow(id=uuid.uuid4().hex, subject=principal.subject, provider=principal.provider, attributes=dict(principal.attributes))
-                session.add(row); session.commit(); session.refresh(row)
+                values = {
+                    "id": uuid.uuid4().hex,
+                    "subject": principal.subject,
+                    "provider": principal.provider,
+                    "attributes": dict(principal.attributes),
+                    "active": True,
+                }
+                dialect = session.bind.dialect.name if session.bind is not None else ""
+                if dialect == "postgresql":
+                    statement = postgresql_insert(PrincipalRow).values(**values).on_conflict_do_nothing(index_elements=[PrincipalRow.subject])
+                elif dialect == "sqlite":
+                    statement = sqlite_insert(PrincipalRow).values(**values).on_conflict_do_nothing(index_elements=[PrincipalRow.subject])
+                else:
+                    statement = insert(PrincipalRow).values(**values)
+                try:
+                    session.execute(statement)
+                    session.commit()
+                except IntegrityError:
+                    # A dialect without native conflict handling may still race
+                    # between the initial read and insert. The winning request
+                    # already persisted the principal, so retry the read.
+                    session.rollback()
+                row = session.scalar(select(PrincipalRow).where(PrincipalRow.subject == principal.subject, PrincipalRow.active.is_(True)))
+                if row is None:
+                    raise AuthorizationError("principal is inactive")
             roles = set(session.scalars(select(RoleRow.name).join(PrincipalRoleRow, PrincipalRoleRow.role_id == RoleRow.id).where(PrincipalRoleRow.principal_id == row.id)))
             permissions = set(session.scalars(select(PermissionRow.name).join(RolePermissionRow, RolePermissionRow.permission_id == PermissionRow.id).join(PrincipalRoleRow, PrincipalRoleRow.role_id == RolePermissionRow.role_id).where(PrincipalRoleRow.principal_id == row.id)))
             return Principal(principal.subject, frozenset(roles) | principal.roles, frozenset(permissions) | principal.permissions, {**row.attributes, **principal.attributes}, principal.provider)

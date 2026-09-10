@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { documentUploadedLabel, documentVersionLabel, generationResponseIsTerminal, hasRunningAssistantMessage, normalizeMarkdown, normalizeSourceCitations, panelStateFromMessageRecords, resultFromMessageRecord, sourceLocatorLabel, splitDocumentsByScope, uploadFeedback, visibleNavigationChats } from "./App";
+import { documentUploadedLabel, documentVersionLabel, generationResponseIsTerminal, hasRunningAssistantMessage, normalizeMarkdown, normalizeSourceCitations, panelStateFromMessageRecords, resultFromMessageRecord, sourceLocatorLabel, splitDocumentsByScope, uploadFeedback, uploadScopeFields, visibleNavigationChats } from "./App";
 
 
 describe("persisted generation state", () => {
@@ -195,5 +195,13 @@ describe("persisted generation state", () => {
     expect(grouped.global.map((document) => document.id)).toEqual(["shared"]);
     expect(grouped.project.map((document) => document.id)).toEqual(["private"]);
     expect(grouped.chat.map((document) => document.id)).toEqual(["chat"]);
+  });
+
+  it("maps each upload entry point to exactly one knowledge scope", () => {
+    expect(uploadScopeFields("global", "project-1", "chat-1")).toEqual({});
+    expect(uploadScopeFields("project", "project-1", "chat-1")).toEqual({ project_id: "project-1" });
+    expect(uploadScopeFields("chat", "project-1", "chat-1")).toEqual({ chat_id: "chat-1" });
+    expect(() => uploadScopeFields("project", "", "chat-1")).toThrow("Сначала откройте проект");
+    expect(() => uploadScopeFields("chat", "project-1", "")).toThrow("Сначала откройте чат");
   });
 });

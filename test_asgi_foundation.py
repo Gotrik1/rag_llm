@@ -270,6 +270,26 @@ class AsgiFoundationTests(unittest.TestCase):
         self.assertEqual(create_document.call_args.args[1], "chat-1")
         self.assertEqual(submit.await_args.args[1]["document_id"], "document-1")
 
+    def test_global_upload_requires_admin_and_has_no_project_or_chat_scope(self):
+        queued = {"id": "job-global", "kind": "ingestion", "status": "queued", "progress": 0}
+        document = {"id": "document-global"}
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("asgi_app.UPLOAD_DIR", Path(directory)), \
+             patch("asgi_app.require_admin") as require_admin, \
+             patch("asgi_app.create_document", return_value=document) as create_document, \
+             patch("asgi_app.update_document", return_value=document), \
+             patch.object(__import__("asgi_app").jobs, "submit", AsyncMock(return_value=queued)):
+            response = self.client.post(
+                "/api/upload",
+                files={"files": ("shared.md", b"# Shared", "text/markdown")},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        require_admin.assert_called_once()
+        self.assertEqual(require_admin.call_args.args[1], "/api/upload")
+        self.assertEqual(create_document.call_args.args[0], None)
+        self.assertEqual(create_document.call_args.args[1], None)
+
     def test_image_upload_is_accepted_and_queued_for_chat(self):
         queued = {"id": "job-image", "kind": "ingestion", "status": "queued", "progress": 0}
         document = {"id": "document-image"}

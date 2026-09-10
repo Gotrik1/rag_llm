@@ -55,7 +55,7 @@ import { createPortal } from "react-dom";
 import { clearCsrfToken, deleteJson, getJson, patchJson, postFormData, postJson, setCsrfToken } from "./api";
 
 type Role = "user" | "assistant";
-type UploadTarget = "project" | "chat";
+type UploadTarget = "global" | "project" | "chat";
 
 type ChatEntry = {
   id: string;
@@ -245,20 +245,6 @@ type ChatSummary = {
   projectId: string | null;
   title: string;
   messages: ChatEntry[];
-};
-
-const DEFAULT_PROJECT: Project = {
-  id: "regulations",
-  name: "Регламенты",
-  memory: "Точный поиск по пунктам регламентов. Формулы и источники показывать явно.",
-  knowledgeScope: "project_and_global"
-};
-
-const FREE_CHAT_WORKSPACE: Project = {
-  id: "",
-  name: "Свободный чат",
-  memory: "Контекст ограничен текущим чатом.",
-  knowledgeScope: "project_and_global"
 };
 
 const THEME_KEY = "rag-assistant-theme";
@@ -515,6 +501,20 @@ export function splitDocumentsByScope(documents: DocumentRecord[]): {
   };
 }
 
+export function uploadScopeFields(
+  target: UploadTarget,
+  activeProjectId: string,
+  activeChatId: string
+): { project_id?: string; chat_id?: string } {
+  if (target === "global") return {};
+  if (target === "project") {
+    if (!activeProjectId) throw new Error("Сначала откройте проект.");
+    return { project_id: activeProjectId };
+  }
+  if (!activeChatId) throw new Error("Сначала откройте чат.");
+  return { chat_id: activeChatId };
+}
+
 export function App() {
   const [session, setSession] = useState<SessionResponse | null>(null);
   const [sessionError, setSessionError] = useState("");
@@ -673,6 +673,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
   const [activeProjectId, setActiveProjectId] = useState("");
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [activeChatId, setActiveChatId] = useState("");
+  const [managedProjectId, setManagedProjectId] = useState<string | null>(null);
   const activeChatIdRef = useRef("");
   const [workspaceSettings, setWorkspaceSettings] = useState<Record<string, unknown>>({});
   const [workspaceError, setWorkspaceError] = useState("");
@@ -695,9 +696,9 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
   const [theme, setTheme] = useState<AppTheme>(() => window.localStorage.getItem(THEME_KEY) === "portal" ? "portal" : "default");
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => readStored(SIDEBAR_COLLAPSED_KEY, false));
 
-  const activeProject = activeProjectId
-    ? projects.find((project) => project.id === activeProjectId) ?? DEFAULT_PROJECT
-    : FREE_CHAT_WORKSPACE;
+  const managedProject = managedProjectId
+    ? projects.find((project) => project.id === managedProjectId) ?? null
+    : null;
   const activeChat = chats.find((chat) => chat.id === activeChatId) ?? null;
   const isRunning = Boolean(activeChatId && runningChatIds.includes(activeChatId));
   const hasRunningChats = runningChatIds.length > 0;
@@ -831,8 +832,15 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     setUploadError("");
     setSelectedFiles([]);
     setIsAttachmentPanelOpen(false);
-    setUploadTarget(activeProjectId ? "project" : "chat");
+    setUploadTarget("chat");
   }, [activeChatId, activeProjectId]);
+
+  const setFilesForUploadTarget = useCallback((target: UploadTarget, files: File[]) => {
+    setUploadTarget(target);
+    setSelectedFiles(files);
+    setUploadResult(null);
+    setUploadError("");
+  }, []);
 
   useEffect(() => {
     if (!activeChatId || !activeChatHasRunningMessage) return;
@@ -902,6 +910,11 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     await createChat(projectId);
   }, [chats, createChat, openChat]);
 
+  const manageProject = useCallback(async (projectId: string) => {
+    await selectProject(projectId);
+    setManagedProjectId(projectId);
+  }, [selectProject]);
+
   const createProject = useCallback(async () => {
     try {
       const record = await postJson<ProjectRecord>("/api/projects", {
@@ -915,37 +928,37 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     }
   }, [createChat]);
 
-  const updateProjectMemory = useCallback(async (memory: string) => {
-    if (!activeProjectId) return;
+  const updateProjectMemory = useCallback(async (projectId: string, memory: string): Promise<boolean> => {
     const previous = projects;
-    setProjects((current) => current.map((project) => project.id === activeProjectId ? { ...project, memory } : project));
+    setProjects((current) => current.map((project) => project.id === projectId ? { ...project, memory } : project));
     try {
-      await patchJson<ProjectRecord>(`/api/projects/${activeProjectId}`, { memory: { text: memory } }, API_TIMEOUT_MS);
+      await patchJson<ProjectRecord>(`/api/projects/${projectId}`, { memory: { text: memory } }, API_TIMEOUT_MS);
+      return true;
     } catch (error) {
       setProjects(previous);
       setWorkspaceError(error instanceof Error ? error.message : "Не удалось сохранить память проекта");
+      return false;
     }
-  }, [activeProjectId, projects]);
+  }, [projects]);
 
-  const updateProjectKnowledgeScope = useCallback(async (knowledgeScope: KnowledgeScope) => {
-    if (!activeProjectId) return;
+  const updateProjectKnowledgeScope = useCallback(async (projectId: string, knowledgeScope: KnowledgeScope) => {
     const previous = projects;
-    setProjects((current) => current.map((project) => project.id === activeProjectId
+    setProjects((current) => current.map((project) => project.id === projectId
       ? { ...project, knowledgeScope }
       : project));
     try {
       const record = await patchJson<ProjectRecord>(
-        `/api/projects/${activeProjectId}`,
+        `/api/projects/${projectId}`,
         { knowledge_scope: knowledgeScope },
         API_TIMEOUT_MS
       );
-      setProjects((current) => current.map((project) => project.id === activeProjectId ? projectFromRecord(record) : project));
-      await loadDocuments(activeProjectId, activeChatId);
+      setProjects((current) => current.map((project) => project.id === projectId ? projectFromRecord(record) : project));
+      await loadDocuments(projectId, activeChatId);
     } catch (error) {
       setProjects(previous);
       setWorkspaceError(error instanceof Error ? error.message : "Не удалось изменить область знаний проекта");
     }
-  }, [activeChatId, activeProjectId, loadDocuments, projects]);
+  }, [activeChatId, loadDocuments, projects]);
 
   const renameProject = useCallback(async (projectId: string, name: string) => {
     const project = projects.find((item) => item.id === projectId);
@@ -994,6 +1007,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
       await deleteJson<{ deleted: boolean }>(`/api/projects/${projectId}`, API_TIMEOUT_MS);
       setProjects((current) => current.filter((item) => item.id !== projectId));
       setChats((current) => current.map((item) => item.projectId === projectId ? { ...item, projectId: null } : item));
+      setManagedProjectId((current) => current === projectId ? null : current);
       if (activeProjectId === projectId) {
         setActiveProjectId("");
         await syncWorkspace(null, activeChatId);
@@ -1172,22 +1186,16 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     }
   }, [isDebugging, isRunning, lastQuestion]);
 
-  const uploadFiles = useCallback(async () => {
-    if (!selectedFiles.length || isUploading) return;
+  const uploadFiles = useCallback(async (target: UploadTarget) => {
+    if (target !== uploadTarget || !selectedFiles.length || isUploading) return;
     const form = new FormData();
     selectedFiles.forEach((file) => form.append("files", file));
-    if (uploadTarget === "project") {
-      if (!activeProjectId) {
-        setUploadError("Сначала откройте проект или выберите загрузку только в чат.");
-        return;
-      }
-      form.append("project_id", activeProjectId);
-    } else {
-      if (!activeChatId) {
-        setUploadError("Сначала откройте чат.");
-        return;
-      }
-      form.append("chat_id", activeChatId);
+    try {
+      const fields = uploadScopeFields(target, activeProjectId, activeChatId);
+      Object.entries(fields).forEach(([key, value]) => form.append(key, value));
+    } catch (error) {
+      setUploadError(error instanceof Error ? error.message : "Не удалось определить область загрузки.");
+      return;
     }
 
     setIsUploading(true);
@@ -1253,6 +1261,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
             onProjectChatCreate={(projectId) => void createChat(projectId)}
             onProjectCreate={() => void createProject()}
             onProjectDelete={(projectId) => void deleteProject(projectId)}
+            onProjectManage={(projectId) => void manageProject(projectId)}
             onProjectPin={(projectId) => void updatePinnedItems("project", projectId)}
             onProjectRename={(projectId, name) => void renameProject(projectId, name)}
             canDeleteGlobalDocuments={user.is_admin}
@@ -1271,25 +1280,25 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
         <section className="chat-surface">
           <Thread
             activeChatTitle={activeChat?.title || "Текущий чат"}
-            activeProject={activeProject}
             documents={documents}
-            error={uploadError}
+            error={uploadTarget === "chat" ? uploadError : ""}
             isAttachmentPanelOpen={isAttachmentPanelOpen}
-            isUploading={isUploading}
-            onAttachmentPanelChange={setIsAttachmentPanelOpen}
-            onFilesChange={setSelectedFiles}
-            onTargetChange={setUploadTarget}
-            onUpload={() => void uploadFiles()}
-            result={uploadResult}
-            selectedFiles={selectedFiles}
-            target={uploadTarget}
+            isUploading={isUploading && uploadTarget === "chat"}
+            onAttachmentPanelChange={(open) => {
+              if (open) setFilesForUploadTarget("chat", []);
+              setIsAttachmentPanelOpen(open);
+            }}
+            onFilesChange={(files) => setFilesForUploadTarget("chat", files)}
+            onUpload={() => void uploadFiles("chat")}
+            result={uploadTarget === "chat" ? uploadResult : null}
+            selectedFiles={uploadTarget === "chat" ? selectedFiles : []}
           />
         </section>
 
         <EvidencePanel
           activeTab={activeTab}
-          activeProject={activeProject}
           activeProvider={activeProvider}
+          canManageGlobalDocuments={user.is_admin}
           theme={theme}
           debugError={debugError}
           debugResult={debugResult}
@@ -1304,24 +1313,40 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
           selectedModel={selectedModel}
           onChangeModel={changeModel}
           onDebug={runDebug}
-          error={uploadError}
+          error={uploadTarget === "global" ? uploadError : ""}
           documents={documents}
           documentsError={documentsError}
           isLoadingDocuments={isLoadingDocuments}
-          isUploading={isUploading}
+          isUploading={isUploading && uploadTarget === "global"}
           onProviderSettingsChange={setActiveProvider}
-          onProjectMemoryChange={(memory) => void updateProjectMemory(memory)}
-          onProjectKnowledgeScopeChange={(scope) => void updateProjectKnowledgeScope(scope)}
           onRefreshModels={loadModels}
           onTabChange={setActiveTab}
           onThemeChange={setTheme}
-          selectedFiles={selectedFiles}
-          uploadTarget={uploadTarget}
-          uploadResult={uploadResult}
-          onFilesChange={setSelectedFiles}
-          onUpload={() => void uploadFiles()}
-          onUploadTargetChange={setUploadTarget}
+          selectedFiles={uploadTarget === "global" ? selectedFiles : []}
+          uploadResult={uploadTarget === "global" ? uploadResult : null}
+          onFilesChange={(files) => setFilesForUploadTarget("global", files)}
+          onUpload={() => void uploadFiles("global")}
         />
+        {managedProject ? (
+          <ProjectWorkspacePanel
+            deletingDocumentIds={deletingDocumentIds}
+            documents={documents}
+            documentsError={documentsError}
+            error={uploadTarget === "project" ? uploadError : ""}
+            isLoadingDocuments={isLoadingDocuments}
+            isUploading={isUploading && uploadTarget === "project"}
+            onClose={() => setManagedProjectId(null)}
+            onDocumentDelete={(document) => void deleteDocument(document)}
+            onFilesChange={(files) => setFilesForUploadTarget("project", files)}
+            onKnowledgeScopeChange={(scope) => void updateProjectKnowledgeScope(managedProject.id, scope)}
+            onMemorySave={(memory) => updateProjectMemory(managedProject.id, memory)}
+            onUpload={() => void uploadFiles("project")}
+            project={managedProject}
+            result={uploadTarget === "project" ? uploadResult : null}
+            selectedFiles={uploadTarget === "project" ? selectedFiles : []}
+            theme={theme}
+          />
+        ) : null}
       </main>
     </AssistantRuntimeProvider>
   );
@@ -1348,6 +1373,7 @@ function NavigationSidebar({
   onProjectChatCreate,
   onProjectCreate,
   onProjectDelete,
+  onProjectManage,
   onProjectPin,
   onProjectRename,
   canDeleteGlobalDocuments
@@ -1372,6 +1398,7 @@ function NavigationSidebar({
   onProjectChatCreate: (projectId: string) => void;
   onProjectCreate: () => void;
   onProjectDelete: (projectId: string) => void;
+  onProjectManage: (projectId: string) => void;
   onProjectPin: (projectId: string) => void;
   onProjectRename: (projectId: string, name: string) => void;
   canDeleteGlobalDocuments: boolean;
@@ -1526,6 +1553,7 @@ function NavigationSidebar({
               onCreateChat={() => onProjectChatCreate(project.id)}
               onOpen={() => onProjectChange(project.id)}
               onDelete={() => onProjectDelete(project.id)}
+              onManageProject={() => onProjectManage(project.id)}
               onPin={() => onProjectPin(project.id)}
               onRename={() => setEditing({ kind: "project", id: project.id, value: project.name })}
               pinned
@@ -1564,6 +1592,7 @@ function NavigationSidebar({
                 label={project.name}
                 onCreateChat={() => onProjectChatCreate(project.id)}
                 onDelete={() => onProjectDelete(project.id)}
+                onManageProject={() => onProjectManage(project.id)}
                 onOpen={() => {
                   setExpandedProjectIds((current) => current.includes(project.id)
                     ? current.filter((id) => id !== project.id)
@@ -1604,7 +1633,7 @@ function NavigationSidebar({
           <div className="nav-section-title">Документы проекта</div>
           <span className="nav-count" title="Количество документов проекта">{groupedDocuments.project.length}</span>
         </div>
-        {renderDocuments(groupedDocuments.project, "Документов проекта пока нет. Добавьте их через + возле поля вопроса.")}
+        {renderDocuments(groupedDocuments.project, "Документов проекта пока нет. Добавьте их через меню проекта.")}
       </section> : null}
 
       <section className="nav-section documents-section" aria-label="Документы чата">
@@ -1636,6 +1665,7 @@ function NavigationItem({
   onEditCancel,
   onEditChange,
   onEditSave,
+  onManageProject,
   onMove,
   onOpen,
   onPin,
@@ -1654,6 +1684,7 @@ function NavigationItem({
   onEditCancel?: () => void;
   onEditChange?: (value: string) => void;
   onEditSave?: () => void;
+  onManageProject?: () => void;
   onMove?: () => void;
   onOpen: () => void;
   onPin?: () => void;
@@ -1664,7 +1695,7 @@ function NavigationItem({
 }) {
   const [menuAnchor, setMenuAnchor] = useState<{ top: number; left: number } | null>(null);
   const closeMenuTimer = useRef<number | null>(null);
-  const hasActionMenu = Boolean(onCreateChat || onMove || onPin || onRename || onDelete);
+  const hasActionMenu = Boolean(onCreateChat || onManageProject || onMove || onPin || onRename || onDelete);
 
   const cancelCloseActionMenu = () => {
     if (closeMenuTimer.current !== null) {
@@ -1712,7 +1743,8 @@ function NavigationItem({
         role="menu"
         style={{ left: menuAnchor.left, top: menuAnchor.top }}
       >
-        <button className="nav-menu-action" onClick={onOpen} type="button"><Settings2 size={14} /><span>Редактировать</span></button>
+        {onManageProject ? <button className="nav-menu-action" onClick={onManageProject} type="button"><Database size={14} /><span>Память и документы</span></button> : null}
+        <button className="nav-menu-action" onClick={onOpen} type="button"><Settings2 size={14} /><span>{chat ? "Открыть чат" : "Открыть проект"}</span></button>
         {onCreateChat ? <button className="nav-menu-action" onClick={onCreateChat} type="button"><Plus size={14} /><span>Новый чат</span></button> : null}
         {onMove ? <button className="nav-menu-action" onClick={onMove} type="button"><FolderInput size={14} /><span>Перенести в проект</span></button> : null}
         {onPin ? <button className="nav-menu-action" onClick={onPin} type="button"><Pin size={14} /><span>{pinned ? "Открепить" : "Закрепить"}</span></button> : null}
@@ -1726,6 +1758,8 @@ function NavigationItem({
   return (
     <div
       className="nav-row"
+      onBlur={(event) => closeActionMenu(event.relatedTarget)}
+      onFocus={(event) => hasActionMenu && openActionMenu(event.currentTarget)}
       onMouseEnter={(event) => hasActionMenu && openActionMenu(event.currentTarget)}
       onMouseLeave={(event) => closeActionMenu(event.relatedTarget)}
     >
@@ -1990,7 +2024,6 @@ function ModelSelector({
 }
 
 function KnowledgeLoader({
-  canUploadToProject,
   error,
   documents,
   documentsError,
@@ -2000,10 +2033,8 @@ function KnowledgeLoader({
   selectedFiles,
   target,
   onFilesChange,
-  onTargetChange,
   onUpload
 }: {
-  canUploadToProject: boolean;
   error: string;
   documents: DocumentRecord[];
   documentsError: string;
@@ -2011,28 +2042,27 @@ function KnowledgeLoader({
   isUploading: boolean;
   result: UploadResponse | null;
   selectedFiles: File[];
-  target: UploadTarget;
+  target: "global" | "project";
   onFilesChange: (files: File[]) => void;
-  onTargetChange: (target: UploadTarget) => void;
   onUpload: () => void;
 }) {
-  const inputId = "knowledge-file-input";
+  const inputId = `${target}-knowledge-file-input`;
   const feedback = uploadFeedback(result, documents);
+  const groupedDocuments = splitDocumentsByScope(documents);
+  const isGlobal = target === "global";
+  const title = isGlobal ? "Общая база знаний" : "Загрузить в проект";
+  const scopeNote = isGlobal
+    ? "Эти файлы будут доступны всем пользователям во всех проектах."
+    : "Эти файлы будут доступны во всех чатах текущего проекта.";
+  const documentCount = isGlobal ? groupedDocuments.global.length : groupedDocuments.project.length;
 
   return (
-    <section className="knowledge-loader" aria-label="Загрузка в базу знаний">
+    <section className="knowledge-loader" aria-label={title}>
       <div className="loader-title">
         <Database size={15} />
-        <span>База знаний</span>
+        <span>{title}</span>
       </div>
-      <p className="loader-scope-note">Сначала выберите, где RAG должен использовать файл.</p>
-      <label className="upload-target-field">
-        <span>Добавить в</span>
-        <select value={target} onChange={(event) => onTargetChange(event.target.value as UploadTarget)}>
-          <option value="chat">Только в текущий чат</option>
-          <option disabled={!canUploadToProject} value="project">Во все чаты текущего проекта</option>
-        </select>
-      </label>
+      <p className="loader-scope-note">{scopeNote}</p>
       <label className="file-picker" htmlFor={inputId}>
         <UploadCloud size={17} />
         <span>{selectedFiles.length ? `Выбрано: ${selectedFiles.length}` : "Выбрать документы или изображения"}</span>
@@ -2065,7 +2095,7 @@ function KnowledgeLoader({
         type="button"
       >
         <UploadCloud size={15} />
-        {isUploading ? "Распознаём и индексируем…" : target === "project" ? "Загрузить в проект" : "Загрузить в чат"}
+        {isUploading ? "Распознаём и индексируем…" : isGlobal ? "Загрузить в общую базу" : "Загрузить в проект"}
       </button>
 
       {feedback ? (
@@ -2091,7 +2121,7 @@ function KnowledgeLoader({
         <span>
           {isLoadingDocuments
             ? "Обновляем список документов…"
-            : `${splitDocumentsByScope(documents).project.length} в проекте · ${splitDocumentsByScope(documents).chat.length} в чате · ${splitDocumentsByScope(documents).global.length} общих`}
+            : `${documentCount} ${isGlobal ? "общих документов" : "документов проекта"}`}
         </span>
       </div>
       {documentsError ? (
@@ -2101,34 +2131,209 @@ function KnowledgeLoader({
   );
 }
 
+function ProjectWorkspacePanel({
+  project,
+  documents,
+  documentsError,
+  error,
+  isLoadingDocuments,
+  isUploading,
+  deletingDocumentIds,
+  result,
+  selectedFiles,
+  theme,
+  onClose,
+  onDocumentDelete,
+  onFilesChange,
+  onKnowledgeScopeChange,
+  onMemorySave,
+  onUpload
+}: {
+  project: Project;
+  documents: DocumentRecord[];
+  documentsError: string;
+  error: string;
+  isLoadingDocuments: boolean;
+  isUploading: boolean;
+  deletingDocumentIds: string[];
+  result: UploadResponse | null;
+  selectedFiles: File[];
+  theme: AppTheme;
+  onClose: () => void;
+  onDocumentDelete: (document: DocumentRecord) => void;
+  onFilesChange: (files: File[]) => void;
+  onKnowledgeScopeChange: (scope: KnowledgeScope) => void;
+  onMemorySave: (memory: string) => Promise<boolean>;
+  onUpload: () => void;
+}) {
+  const [memoryDraft, setMemoryDraft] = useState(project.memory);
+  const [memoryState, setMemoryState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const projectDocuments = splitDocumentsByScope(documents).project.filter((document) => document.project_id === project.id);
+
+  useEffect(() => {
+    setMemoryDraft(project.memory);
+    setMemoryState("idle");
+  }, [project.id, project.memory]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  const saveMemory = async () => {
+    setMemoryState("saving");
+    const saved = await onMemorySave(memoryDraft.trim());
+    setMemoryState(saved ? "saved" : "error");
+  };
+
+  return createPortal(
+    <div className={`project-workspace-backdrop theme-${theme}`} onMouseDown={onClose} role="presentation">
+      <section
+        aria-labelledby="project-workspace-title"
+        aria-modal="true"
+        className="project-workspace-panel"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+      >
+        <div className="project-workspace-heading">
+          <div>
+            <h2 id="project-workspace-title">Память и документы проекта</h2>
+            <p>{project.name}</p>
+          </div>
+          <button aria-label="Закрыть память проекта" className="icon-button" onClick={onClose} title="Закрыть" type="button">
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="project-workspace-grid">
+          <div className="project-memory-column">
+            <section className="project-memory-editor">
+              <div className="project-workspace-section-title"><Folder size={15} /><span>Память проекта</span></div>
+              <p>Краткий постоянный контекст, который добавляется к вопросам во всех чатах проекта.</p>
+              <label htmlFor="project-memory-text">Контекст проекта</label>
+              <textarea
+                id="project-memory-text"
+                onChange={(event) => {
+                  setMemoryDraft(event.target.value);
+                  setMemoryState("idle");
+                }}
+                value={memoryDraft}
+              />
+              <div className="project-memory-actions">
+                <span aria-live="polite">
+                  {memoryState === "saving" ? "Сохраняем…" : memoryState === "saved" ? "Сохранено" : memoryState === "error" ? "Не удалось сохранить" : ""}
+                </span>
+                <button disabled={memoryDraft === project.memory || memoryState === "saving"} onClick={() => void saveMemory()} type="button">
+                  <Save size={15} />
+                  Сохранить память
+                </button>
+              </div>
+            </section>
+
+            <section className="project-scope-editor">
+              <div className="project-workspace-section-title"><Database size={15} /><span>Источники ответов</span></div>
+              <label htmlFor="project-knowledge-scope">Использовать</label>
+              <select
+                id="project-knowledge-scope"
+                onChange={(event) => onKnowledgeScopeChange(event.target.value as KnowledgeScope)}
+                value={project.knowledgeScope}
+              >
+                <option value="project_and_global">Документы проекта и общие</option>
+                <option value="project_only">Только документы проекта</option>
+              </select>
+              <p>
+                {project.knowledgeScope === "project_only"
+                  ? "Общая база отключена для этого проекта."
+                  : "RAG ищет одновременно в документах проекта и общей базе."}
+              </p>
+            </section>
+          </div>
+
+          <div className="project-documents-column">
+            <section className="project-document-registry" aria-label="Документы проекта">
+              <div className="project-document-registry-heading">
+                <div className="project-workspace-section-title"><Files size={15} /><span>Документы проекта</span></div>
+                <span>{projectDocuments.length}</span>
+              </div>
+              {isLoadingDocuments ? <p className="project-document-empty">Обновляем список документов…</p> : null}
+              {documentsError ? <p className="project-document-empty error-copy">{documentsError}</p> : null}
+              {!isLoadingDocuments && !documentsError && !projectDocuments.length ? (
+                <p className="project-document-empty">В проекте пока нет документов.</p>
+              ) : null}
+              {projectDocuments.length ? (
+                <div className="project-document-list">
+                  {projectDocuments.map((document) => (
+                    <div className="project-document-row" key={document.id}>
+                      <a href={`/api/documents/${document.id}/content`} rel="noreferrer" target="_blank">
+                        {/\.(?:png|jpe?g|webp|tiff?|bmp)$/i.test(document.file_name) ? <ImageIcon size={16} /> : <FileText size={16} />}
+                        <span>
+                          <strong>{document.file_name}</strong>
+                          <small>{documentUploadedLabel(document.created_at)} · {documentVersionLabel(document)}</small>
+                        </span>
+                        <em className={`nav-document-status ${document.status}`}>
+                          {document.status === "ready" ? "Готов" : document.status === "processing" ? `${document.processing_state?.progress ?? 0}%` : document.status}
+                        </em>
+                      </a>
+                      <button
+                        aria-label={`Удалить документ ${document.file_name}`}
+                        disabled={deletingDocumentIds.includes(document.id)}
+                        onClick={() => onDocumentDelete(document)}
+                        title="Удалить документ проекта"
+                        type="button"
+                      >
+                        {deletingDocumentIds.includes(document.id) ? <RefreshCw className="spin" size={15} /> : <Trash2 size={15} />}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </section>
+
+            <KnowledgeLoader
+              documents={documents}
+              documentsError={documentsError}
+              error={error}
+              isLoadingDocuments={isLoadingDocuments}
+              isUploading={isUploading}
+              onFilesChange={onFilesChange}
+              onUpload={onUpload}
+              result={result}
+              selectedFiles={selectedFiles}
+              target="project"
+            />
+          </div>
+        </div>
+      </section>
+    </div>,
+    document.body
+  );
+}
+
 function Thread({
   activeChatTitle,
-  activeProject,
   documents,
   error,
   isAttachmentPanelOpen,
   isUploading,
   onAttachmentPanelChange,
   onFilesChange,
-  onTargetChange,
   onUpload,
   result,
-  selectedFiles,
-  target
+  selectedFiles
 }: {
   activeChatTitle: string;
-  activeProject: Project;
   documents: DocumentRecord[];
   error: string;
   isAttachmentPanelOpen: boolean;
   isUploading: boolean;
   onAttachmentPanelChange: (open: boolean) => void;
   onFilesChange: (files: File[]) => void;
-  onTargetChange: (target: UploadTarget) => void;
   onUpload: () => void;
   result: UploadResponse | null;
   selectedFiles: File[];
-  target: UploadTarget;
 }) {
   return (
     <ThreadPrimitive.Root className="thread-root">
@@ -2154,23 +2359,19 @@ function Thread({
           {isAttachmentPanelOpen ? (
             <AttachmentPanel
               activeChatTitle={activeChatTitle}
-              activeProject={activeProject}
               documents={documents}
               error={error}
               isUploading={isUploading}
               onClose={() => onAttachmentPanelChange(false)}
               onFilesChange={onFilesChange}
-              onTargetChange={onTargetChange}
               onUpload={onUpload}
               result={result}
               selectedFiles={selectedFiles}
-              target={target}
             />
           ) : null}
           <Composer
             attachmentPanelOpen={isAttachmentPanelOpen}
             onAttach={() => {
-              onTargetChange("chat");
               onAttachmentPanelChange(!isAttachmentPanelOpen);
             }}
           />
@@ -2410,8 +2611,8 @@ function Composer({ attachmentPanelOpen, onAttach }: { attachmentPanelOpen: bool
 
 function EvidencePanel({
   activeTab,
-  activeProject,
   activeProvider,
+  canManageGlobalDocuments,
   theme,
   debugError,
   debugResult,
@@ -2427,8 +2628,6 @@ function EvidencePanel({
   onChangeModel,
   onDebug,
   onProviderSettingsChange,
-  onProjectKnowledgeScopeChange,
-  onProjectMemoryChange,
   onRefreshModels,
   onTabChange,
   onThemeChange,
@@ -2438,15 +2637,13 @@ function EvidencePanel({
   isLoadingDocuments,
   isUploading,
   selectedFiles,
-  uploadTarget,
   uploadResult,
   onFilesChange,
-  onUpload,
-  onUploadTargetChange
+  onUpload
 }: {
   activeTab: PanelTab;
-  activeProject: Project;
   activeProvider: ProviderName;
+  canManageGlobalDocuments: boolean;
   theme: AppTheme;
   debugError: string;
   debugResult: DebugResponse | null;
@@ -2462,8 +2659,6 @@ function EvidencePanel({
   onChangeModel: (model: string) => void;
   onDebug: () => void;
   onProviderSettingsChange: (provider: ProviderName) => void;
-  onProjectKnowledgeScopeChange: (scope: KnowledgeScope) => void;
-  onProjectMemoryChange: (memory: string) => void;
   onRefreshModels: () => void;
   onTabChange: (tab: PanelTab) => void;
   onThemeChange: (theme: AppTheme) => void;
@@ -2473,11 +2668,9 @@ function EvidencePanel({
   isLoadingDocuments: boolean;
   isUploading: boolean;
   selectedFiles: File[];
-  uploadTarget: UploadTarget;
   uploadResult: UploadResponse | null;
   onFilesChange: (files: File[]) => void;
   onUpload: () => void;
-  onUploadTargetChange: (target: UploadTarget) => void;
 }) {
   const [isThemeModalOpen, setIsThemeModalOpen] = useState(false);
 
@@ -2535,33 +2728,6 @@ function EvidencePanel({
             <h2>Система</h2>
             <p>Параметры ниже применяются к следующим запросам.</p>
           </div>
-          <section className="project-memory-panel">
-            <div className="project-memory-heading"><Folder size={14} /><span>{activeProject.name}</span></div>
-            <label>
-              <span>Память проекта</span>
-              <textarea value={activeProject.memory} onChange={(event) => onProjectMemoryChange(event.target.value)} />
-            </label>
-          </section>
-          {activeProject.id ? (
-            <section className="knowledge-scope-panel">
-              <div className="project-memory-heading"><Database size={14} /><span>Источники проекта</span></div>
-              <label>
-                <span>Область знаний</span>
-                <select
-                  onChange={(event) => onProjectKnowledgeScopeChange(event.target.value as KnowledgeScope)}
-                  value={activeProject.knowledgeScope}
-                >
-                  <option value="project_and_global">Документы проекта и общие</option>
-                  <option value="project_only">Только документы проекта</option>
-                </select>
-              </label>
-              <p>
-                {activeProject.knowledgeScope === "project_only"
-                  ? "Ответы строятся только по приватным документам этого проекта."
-                  : "Ответы используют приватные документы проекта и общую библиотеку."}
-              </p>
-            </section>
-          ) : null}
           <ProviderSettings models={models} onProviderChange={onProviderSettingsChange} />
           <FlowModeSelector isRunning={isRunning} />
           <SystemPromptSelector isRunning={isRunning} />
@@ -2577,20 +2743,26 @@ function EvidencePanel({
               onRefresh={onRefreshModels}
             />
           ) : null}
-          <KnowledgeLoader
-            canUploadToProject={Boolean(activeProject.id)}
-            documents={documents}
-            documentsError={documentsError}
-            error={error}
-            isLoadingDocuments={isLoadingDocuments}
-            isUploading={isUploading}
-            result={uploadResult}
-            selectedFiles={selectedFiles}
-            target={uploadTarget}
-            onFilesChange={onFilesChange}
-            onTargetChange={onUploadTargetChange}
-            onUpload={onUpload}
-          />
+          {canManageGlobalDocuments ? (
+            <KnowledgeLoader
+              documents={documents}
+              documentsError={documentsError}
+              error={error}
+              isLoadingDocuments={isLoadingDocuments}
+              isUploading={isUploading}
+              result={uploadResult}
+              selectedFiles={selectedFiles}
+              target="global"
+              onFilesChange={onFilesChange}
+              onUpload={onUpload}
+            />
+          ) : (
+            <section className="global-library-note">
+              <div className="loader-title"><Database size={15} /><span>Общая база знаний</span></div>
+              <p>Общие документы доступны для поиска во всех проектах. Загружать и удалять их может только администратор.</p>
+              <strong>{splitDocumentsByScope(documents).global.length} документов доступно</strong>
+            </section>
+          )}
         </div>
       ) : !result ? (
         <div className="panel-empty">Здесь появятся источники последнего ответа.</div>
@@ -2741,30 +2913,24 @@ export function normalizeSourceCitations(markdown: string, sources: ApiSource[] 
 
 function AttachmentPanel({
   activeChatTitle,
-  activeProject,
   documents,
   error,
   isUploading,
   onClose,
   onFilesChange,
-  onTargetChange,
   onUpload,
   result,
-  selectedFiles,
-  target
+  selectedFiles
 }: {
   activeChatTitle: string;
-  activeProject: Project;
   documents: DocumentRecord[];
   error: string;
   isUploading: boolean;
   onClose: () => void;
   onFilesChange: (files: File[]) => void;
-  onTargetChange: (target: UploadTarget) => void;
   onUpload: () => void;
   result: UploadResponse | null;
   selectedFiles: File[];
-  target: UploadTarget;
 }) {
   const feedback = uploadFeedback(result, documents);
   const addFiles = (incoming: File[]) => {
@@ -2772,41 +2938,16 @@ function AttachmentPanel({
     incoming.forEach((file) => unique.set(`${file.name}:${file.size}:${file.lastModified}`, file));
     onFilesChange([...unique.values()]);
   };
-  const uploadLabel = target === "project" ? "Загрузить в проект" : "Загрузить в чат";
 
   return (
-    <section className="attachment-panel" aria-label="Добавление файлов в базу знаний">
+    <section className="attachment-panel" aria-label="Добавление файлов в текущий чат">
       <div className="attachment-heading">
         <div>
-          <h2>Добавить в контекст</h2>
-          <p>Выберите, где RAG будет использовать эти файлы.</p>
+          <h2>Добавить в текущий чат</h2>
+          <p>Файлы будут доступны только в чате «{activeChatTitle}».</p>
         </div>
         <button aria-label="Закрыть панель добавления" className="icon-button" onClick={onClose} title="Закрыть" type="button">
           <X size={17} />
-        </button>
-      </div>
-
-      <div className="attachment-targets" role="radiogroup" aria-label="Где использовать файлы">
-        <button
-          aria-checked={target === "chat"}
-          className={target === "chat" ? "active" : ""}
-          onClick={() => onTargetChange("chat")}
-          role="radio"
-          type="button"
-        >
-          <Files size={17} />
-          <span><strong>Только в этом чате</strong><small>{activeChatTitle}</small></span>
-        </button>
-        <button
-          aria-checked={target === "project"}
-          className={target === "project" ? "active" : ""}
-          disabled={!activeProject.id}
-          onClick={() => onTargetChange("project")}
-          role="radio"
-          type="button"
-        >
-          <Folder size={17} />
-          <span><strong>Во всём проекте</strong><small>{activeProject.id ? activeProject.name : "Сначала откройте проект"}</small></span>
         </button>
       </div>
 
@@ -2866,7 +3007,7 @@ function AttachmentPanel({
       <div className="attachment-actions">
         <button className="attachment-upload" disabled={!selectedFiles.length || isUploading} onClick={onUpload} type="button">
           <UploadCloud size={16} />
-          {isUploading ? "Распознаём и индексируем…" : uploadLabel}
+          {isUploading ? "Распознаём и индексируем…" : "Загрузить в чат"}
         </button>
       </div>
       {feedback ? <div className={`upload-status ${feedback.state}`} aria-live="polite">{feedback.message}</div> : null}

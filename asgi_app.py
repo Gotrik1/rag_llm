@@ -600,6 +600,8 @@ async def upload_documents(
         raise HTTPException(400, f"upload between 1 and {MAX_UPLOAD_FILES} files")
     normalized_project = project_id.strip() or None
     normalized_chat = chat_id.strip() or None
+    if not normalized_project and not normalized_chat:
+        require_admin(principal, "/api/upload")
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     queued: list[dict] = []
     for upload in files:

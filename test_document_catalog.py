@@ -6,11 +6,60 @@ from datetime import datetime, timezone
 from document_catalog import (
     annotate_document_versions,
     build_document_catalog_answer,
+    document_version_fields,
     is_document_catalog_question,
 )
 
 
 class DocumentCatalogTests(unittest.TestCase):
+    def test_persistable_version_fields_are_stable_and_normalized(self):
+        fields = document_version_fields({
+            "file_name": "Методика v1.4.docx",
+            "created_at": "2099-01-01T00:00:00Z",
+            "metadata": {"effective_date": "2026-09-01"},
+        })
+
+        self.assertEqual(fields["document_family"], "методика")
+        self.assertEqual(fields["version_label"], "1.4")
+        self.assertEqual(fields["version_sort_key"], [1, 4, 0, 0])
+        self.assertEqual(fields["effective_on"], "2026-09-01")
+
+    def test_explicit_family_groups_differently_named_revisions(self):
+        annotated = annotate_document_versions([
+            {
+                "id": "1",
+                "file_name": "Методика старая.docx",
+                "metadata": {"document_family": "Методика РРЭ", "version": "1.0"},
+            },
+            {
+                "id": "2",
+                "file_name": "Инструкция новая.docx",
+                "metadata": {"document_family": "Методика РРЭ", "version": "2.0"},
+            },
+        ])
+
+        self.assertEqual(annotated[0]["version_status"], "superseded")
+        self.assertEqual(annotated[0]["newer_document_id"], "2")
+
+    def test_versions_do_not_supersede_documents_in_another_scope(self):
+        annotated = annotate_document_versions([
+            {
+                "id": "global-v1",
+                "file_name": "Методика v1.docx",
+                "owner_subject": None,
+                "project_id": None,
+            },
+            {
+                "id": "project-v2",
+                "file_name": "Методика v2.docx",
+                "owner_subject": "user-1",
+                "project_id": "project-1",
+            },
+        ])
+
+        self.assertEqual(annotated[0]["version_status"], "latest")
+        self.assertEqual(annotated[1]["version_status"], "latest")
+
     def test_catalog_result_is_safe_for_durable_queue_serialization(self):
         document_id = uuid.uuid4()
         result = build_document_catalog_answer(

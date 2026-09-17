@@ -6,6 +6,7 @@ from unittest.mock import Mock
 from rag_agent import (
     QueryUnderstanding,
     RAGAgent,
+    apply_document_version_preference,
     build_section_documents,
     build_targeted_queries,
     contains_price_category,
@@ -13,6 +14,7 @@ from rag_agent import (
     deterministic_query_understanding,
     document_occurrence_item_matches,
     diversify_context_results,
+    extract_chunk_metadata,
     extract_formula_lines_from_texts,
     ensure_price_category_source_coverage,
     formula_sibling_results,
@@ -28,6 +30,7 @@ from rag_agent import (
     parse_query_understanding,
     price_category_number,
     prioritize_scoped_results,
+    relationship_expansion_results,
     refine_prism_query,
     rerank_context_results,
     sanitize_grounded_answer,
@@ -37,6 +40,133 @@ from rag_agent import (
 
 
 class PrismQueryTests(unittest.TestCase):
+    def test_latest_document_revision_gets_soft_preference(self):
+        ranked = [
+            {"file": "old_method_v1.docx", "score": 1.04, "text": "old"},
+            {"file": "new_method_v2.docx", "score": 1.0, "text": "new"},
+        ]
+
+        preferred = apply_document_version_preference(
+            ranked,
+            {
+                "old_method_v1.docx": "superseded",
+                "new_method_v2.docx": "latest",
+            },
+        )
+
+        self.assertEqual(preferred[0]["file"], "new_method_v2.docx")
+        self.assertEqual(preferred[0]["version_status"], "latest")
+
+    def test_explicit_historical_document_is_not_penalized(self):
+        ranked = [
+            {"file": "old_method_v1.docx", "score": 1.04, "text": "old"},
+            {"file": "new_method_v2.docx", "score": 1.0, "text": "new"},
+        ]
+
+        preferred = apply_document_version_preference(
+            ranked,
+            {
+                "old_method_v1.docx": "superseded",
+                "new_method_v2.docx": "latest",
+            },
+            explicit_sources={"old_method_v1.docx"},
+        )
+
+        self.assertEqual(preferred[0]["file"], "old_method_v1.docx")
+        self.assertNotIn("version_adjustment", preferred[0])
+
+    def test_active_exception_is_not_misclassified_as_deleted(self):
+        metadata = extract_chunk_metadata(
+            "[SECTION: Исключения]\nРасчет цены не применяется в особом случае."
+        )
+        self.assertEqual(metadata["status"], "active")
+
+    def test_explicitly_removed_clause_is_deleted(self):
+        metadata = extract_chunk_metadata(
+            "[SECTION: Пункт 10]\nПункт исключен из регламента."
+        )
+        self.assertEqual(metadata["status"], "deleted")
+
+    def test_relationship_expansion_adds_same_section_child_and_exception_sibling(self):
+        nodes = [
+            SimpleNamespace(
+                text="Основное правило расчета цены.",
+                metadata={"file_name": "method.docx", "section_path": "5 > Расчет", "parent_section": "5"},
+            ),
+            SimpleNamespace(
+                text="Формула: S = V * C.",
+                metadata={"file_name": "method.docx", "section_path": "5 > Расчет", "parent_section": "5"},
+            ),
+            SimpleNamespace(
+                text="Исключение: расчет цены не применяется в особом случае.",
+                metadata={"file_name": "method.docx", "section_path": "5 > Исключения", "parent_section": "5"},
+            ),
+            SimpleNamespace(
+                text="Чужой проект.",
+                metadata={"file_name": "private.docx", "section_path": "5 > Расчет", "parent_section": "5"},
+            ),
+        ]
+        ranked = [{
+            "file": "method.docx",
+            "text": "Основное правило расчета цены.",
+            "score": 2.0,
+            "section_path": "5 > Расчет",
+            "parent_section": "5",
+        }]
+
+        expanded = relationship_expansion_results(nodes, ranked, "Как рассчитывается цена?", limit=4)
+
+        self.assertEqual({item["file"] for item in expanded}, {"method.docx"})
+        self.assertTrue(any("S = V" in item["text"] for item in expanded))
+        self.assertTrue(any("Исключение" in item["text"] for item in expanded))
+        self.assertTrue(all(item["matched_queries"][0].startswith("relationship:") for item in expanded))
+
+    def test_relationship_expansion_is_disabled_for_document_occurrence(self):
+        ranked = [{"file": "method.docx", "text": "1 ЦК", "score": 1.0}]
+        self.assertEqual(
+            relationship_expansion_results([], ranked, "В каких документах есть 1 ЦК?"),
+            [],
+        )
+
+    def test_exact_entity_seed_keeps_one_rare_entity_hit_per_source(self):
+        agent = object.__new__(RAGAgent)
+        agent._all_nodes = [
+            SimpleNamespace(
+                text="ПУНЦЭ применяется при определении предельного уровня цены.",
+                metadata={"file_name": "1179.docx", "section_path": "Пункт 1"},
+            ),
+            SimpleNamespace(
+                text="ПУНЦЭ рассчитывается по формуле.",
+                metadata={"file_name": "Методика.docx", "section_path": "Расчет ПУНЦЭ"},
+            ),
+            SimpleNamespace(
+                text="Посторонний текст.",
+                metadata={"file_name": "noise.docx", "section_path": "Общее"},
+            ),
+        ]
+
+        seeds = agent._exact_entity_seed_results("Что такое ПУНЦЭ?")
+
+        self.assertEqual({item["file"] for item in seeds}, {"1179.docx", "Методика.docx"})
+        self.assertTrue(all(item["matched_queries"] == ["entity-exact:ПУНЦЭ"] for item in seeds))
+
+    def test_generic_price_category_seed_scans_all_documents(self):
+        agent = object.__new__(RAGAgent)
+        agent._all_nodes = [
+            SimpleNamespace(
+                text="Устанавливаются шесть ценовых категорий.",
+                metadata={"file_name": "1179.docx", "section_path": "Ценовые категории"},
+            ),
+            SimpleNamespace(
+                text="Параметр ценовая категория выбирается в карточке.",
+                metadata={"file_name": "Методика.docx", "section_path": "Настройка"},
+            ),
+        ]
+
+        seeds = agent._price_category_seed_results("Какие бывают ценовые категории?")
+
+        self.assertEqual({item["file"] for item in seeds}, {"1179.docx", "Методика.docx"})
+
     def test_explicit_regulation_reference_resolves_visible_source_alias(self):
         aliases = {
             "upload-a_2012-05-04-пп442-функционирование-ррэ.md":

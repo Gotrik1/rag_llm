@@ -39,7 +39,7 @@ def _metadata_version(document: dict[str, Any]) -> str:
     metadata = document.get("metadata")
     if not isinstance(metadata, dict):
         return ""
-    for key in ("document_version", "version", "revision", "edition", "effective_date", "document_date"):
+    for key in ("document_version", "version", "revision", "edition"):
         value = str(metadata.get(key) or "").strip()
         if value:
             return value
@@ -53,6 +53,11 @@ def detect_document_version(document: dict[str, Any]) -> dict[str, Any]:
     metadata_value = _metadata_version(document)
     candidates = [(metadata_value, "metadata")] if metadata_value else []
     candidates.append((stem, "file_name"))
+    metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+    for key in ("effective_date", "document_date"):
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            candidates.append((value, "metadata"))
     for value, source in candidates:
         semantic = _SEMVER_RE.search(value)
         if semantic is None and source == "metadata":
@@ -116,14 +121,51 @@ def _document_family(file_name: str, version: dict[str, Any]) -> str:
     return " ".join(stem.split()) or Path(file_name).stem.casefold()
 
 
+def document_version_fields(document: dict[str, Any]) -> dict[str, Any]:
+    """Return stable, persistable version fields without using upload time."""
+    version = detect_document_version(document)
+    metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+    explicit_family = str(metadata.get("document_family") or "").strip().casefold()
+    family = explicit_family or _document_family(str(document.get("file_name") or ""), version)
+    raw_key = tuple(version["version_key"] or ())
+    sort_key = [*raw_key[:4], *([0] * (4 - len(raw_key[:4])))] if raw_key else None
+    effective_on = None
+    effective_value = str(metadata.get("effective_date") or "").strip()
+    if effective_value:
+        try:
+            effective_on = date.fromisoformat(effective_value[:10]).isoformat()
+        except ValueError:
+            effective_on = None
+    return {
+        "document_family": family,
+        "version_label": version["version_label"],
+        "version_kind": version["version_kind"],
+        "version_sort_key": sort_key,
+        "version_source": version["version_source"],
+        "effective_on": effective_on,
+    }
+
+
 def annotate_document_versions(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Add JSON-safe version/family status to document registry records."""
     annotated: list[dict[str, Any]] = []
     private_versions: list[dict[str, Any]] = []
     for document in documents:
         item = dict(document)
-        version = detect_document_version(item)
-        family = _document_family(str(item.get("file_name") or ""), version)
+        persisted = document_version_fields(item)
+        version_key = item.get("version_sort_key") or persisted["version_sort_key"]
+        version = {
+            "version_label": item.get("version_label") or persisted["version_label"],
+            "version_kind": item.get("version_kind") or persisted["version_kind"],
+            "version_key": tuple(version_key) if version_key else None,
+            "version_source": item.get("version_source") or persisted["version_source"],
+            "scope_key": (
+                str(item.get("owner_subject") or ""),
+                str(item.get("project_id") or ""),
+                str(item.get("chat_id") or ""),
+            ),
+        }
+        family = str(item.get("document_family") or persisted["document_family"])
         item.update({
             "document_family": family,
             "version_label": version["version_label"],
@@ -144,6 +186,7 @@ def annotate_document_versions(documents: list[dict[str, Any]]) -> list[dict[str
             for other, other_version in zip(annotated, private_versions)
             if other is not item
             and other["document_family"] == item["document_family"]
+            and other_version["scope_key"] == version["scope_key"]
             and other_version["version_kind"] == version["version_kind"]
             and other_version["version_key"] is not None
             and other_version["version_key"] > version["version_key"]

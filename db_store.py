@@ -148,6 +148,8 @@ def run_migrations() -> None:
             cur.execute(path.read_text(encoding="utf-8"))
             cur.execute("INSERT INTO schema_migrations (version) VALUES (%s)", (path.stem,))
         conn.commit()
+    if any(path.stem == "0005_document_versions" for path in migration_files):
+        _backfill_document_versions(conn)
 
 
 def ensure_default_workspace(default_mode: str, default_provider: str, default_model: str) -> dict:
@@ -528,6 +530,134 @@ def _document_record(row: object) -> dict:
     return record
 
 
+def _document_version_fields(file_name: str, metadata: dict) -> dict:
+    from document_catalog import document_version_fields
+
+    return document_version_fields({"file_name": file_name, "metadata": metadata})
+
+
+def _version_group(record: dict) -> tuple[object, object, object, str, str] | None:
+    family = str(record.get("document_family") or "").strip()
+    kind = str(record.get("version_kind") or "").strip()
+    if not family or not kind or not record.get("version_sort_key"):
+        return None
+    return (
+        record.get("owner_subject"),
+        record.get("project_id"),
+        record.get("chat_id"),
+        family,
+        kind,
+    )
+
+
+def _rebuild_document_version_chain(cur: object, group: tuple[object, object, object, str, str]) -> None:
+    """Re-link one version family after out-of-order upload, edit, or deletion."""
+    owner_subject, project_id, chat_id, family, kind = group
+    cur.execute(
+        """SELECT id, version_sort_key FROM documents
+           WHERE deleted_at IS NULL
+             AND owner_subject IS NOT DISTINCT FROM %s
+             AND project_id IS NOT DISTINCT FROM %s
+             AND chat_id IS NOT DISTINCT FROM %s
+             AND document_family = %s AND version_kind = %s
+             AND version_sort_key IS NOT NULL
+           ORDER BY version_sort_key ASC, created_at ASC, id ASC""",
+        (owner_subject, project_id, chat_id, family, kind),
+    )
+    predecessor_id = None
+    predecessor_key: tuple | None = None
+    previous_version_id = None
+    for version_row in cur.fetchall():
+        current_key = tuple(version_row.get("version_sort_key") or ())
+        if predecessor_key is not None and current_key > predecessor_key:
+            predecessor_id = previous_version_id
+        cur.execute(
+            "UPDATE documents SET supersedes_document_id = %s WHERE id = %s",
+            (predecessor_id, version_row["id"]),
+        )
+        if predecessor_key is None or current_key > predecessor_key:
+            predecessor_key = current_key
+            previous_version_id = version_row["id"]
+
+
+def _backfill_document_versions(conn: object) -> None:
+    """Populate persisted version metadata and a same-scope supersession chain."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT * FROM documents
+               WHERE deleted_at IS NULL AND document_family IS NULL"""
+        )
+        missing = [dict(row) for row in cur.fetchall()]
+    if missing:
+        with conn.cursor() as cur:
+            for document in missing:
+                fields = _document_version_fields(
+                    str(document.get("file_name") or ""),
+                    dict(document.get("metadata") or {}),
+                )
+                cur.execute(
+                    """UPDATE documents
+                       SET document_family = %s, version_label = %s, version_kind = %s,
+                           version_sort_key = %s, version_source = %s, effective_on = %s,
+                           updated_at = now()
+                       WHERE id = %s""",
+                    (
+                        fields["document_family"],
+                        fields["version_label"],
+                        fields["version_kind"],
+                        fields["version_sort_key"],
+                        fields["version_source"],
+                        fields["effective_on"],
+                        document["id"],
+                    ),
+                )
+        conn.commit()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT id, owner_subject, project_id, chat_id, document_family,
+                      version_kind, version_sort_key, created_at
+               FROM documents
+               WHERE deleted_at IS NULL AND document_family IS NOT NULL
+                 AND version_kind IS NOT NULL AND version_sort_key IS NOT NULL"""
+        )
+        versioned = [dict(row) for row in cur.fetchall()]
+    groups: dict[tuple, list[dict]] = {}
+    for document in versioned:
+        group_key = (
+            document.get("owner_subject"),
+            document.get("project_id"),
+            document.get("chat_id"),
+            document.get("document_family"),
+            document.get("version_kind"),
+        )
+        groups.setdefault(group_key, []).append(document)
+    with conn.cursor() as cur:
+        for group in groups.values():
+            ordered = sorted(
+                group,
+                key=lambda item: (
+                    tuple(item.get("version_sort_key") or ()),
+                    item.get("created_at"),
+                    str(item.get("id")),
+                ),
+            )
+            predecessor_id = None
+            predecessor_key: tuple | None = None
+            for document in ordered:
+                current_key = tuple(document.get("version_sort_key") or ())
+                if predecessor_key is not None and current_key > predecessor_key:
+                    predecessor_id = previous_id
+                cur.execute(
+                    "UPDATE documents SET supersedes_document_id = %s WHERE id = %s",
+                    (predecessor_id, document["id"]),
+                )
+                if predecessor_key is None or current_key > predecessor_key:
+                    predecessor_key = current_key
+                    previous_id = document["id"]
+    conn.commit()
+
+
 def create_document(project_id: str | None, chat_id: str | None, payload: dict) -> dict:
     subject = current_subject()
     project_id = project_id or None
@@ -542,25 +672,43 @@ def create_document(project_id: str | None, chat_id: str | None, payload: dict) 
     document_owner = subject if project_id or chat_id else None
     metadata = dict(payload.get("metadata") or {})
     metadata["scope"] = "global" if not document_owner else "project"
+    file_name = str(payload.get("file_name", "")).strip()
+    version = _document_version_fields(file_name, metadata)
     conn = db()
     with conn.cursor() as cur:
         cur.execute(
             """INSERT INTO documents
-               (owner_subject, project_id, chat_id, file_name, source_path, mime_type, status, processing_state, metadata)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+               (owner_subject, project_id, chat_id, file_name, source_path, mime_type,
+                status, processing_state, metadata, document_family, version_label,
+                version_kind, version_sort_key, version_source, effective_on,
+                supersedes_document_id)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+               RETURNING *""",
             (
                 document_owner,
                 project_id,
                 chat_id,
-                str(payload.get("file_name", "")).strip(),
+                file_name,
                 str(payload.get("source_path", "")).strip(),
                 str(payload.get("mime_type", "")).strip(),
                 str(payload.get("status", "queued")).strip() or "queued",
                 json.dumps(payload.get("processing_state") or {}, ensure_ascii=False),
                 json.dumps(metadata, ensure_ascii=False),
+                version["document_family"],
+                version["version_label"],
+                version["version_kind"],
+                version["version_sort_key"],
+                version["version_source"],
+                version["effective_on"],
+                None,
             ),
         )
         row = cur.fetchone()
+        version_group = _version_group(dict(row))
+        if version_group:
+            _rebuild_document_version_chain(cur, version_group)
+            cur.execute("SELECT * FROM documents WHERE id = %s", (row["id"],))
+            row = cur.fetchone()
     conn.commit()
     return _document_record(row)
 
@@ -587,11 +735,49 @@ def update_document(document_id: str, payload: dict) -> dict | None:
         return None
     if current_subject() and not current_can_manage_global_documents() and not document.get("owner_subject"):
         raise PermissionError("shared document update is not permitted for this account")
-    fields, values = _update_values(payload, ("file_name", "source_path", "mime_type", "status"), ("processing_state", "metadata"))
+    effective_payload = dict(payload)
+    if "metadata" in effective_payload:
+        merged_metadata = dict(document.get("metadata") or {})
+        merged_metadata.update(dict(effective_payload.get("metadata") or {}))
+        effective_payload["metadata"] = merged_metadata
+    fields, values = _update_values(
+        effective_payload,
+        ("file_name", "source_path", "mime_type", "status"),
+        ("processing_state", "metadata"),
+    )
+    if "file_name" in effective_payload or "metadata" in effective_payload:
+        file_name = str(effective_payload.get("file_name", document.get("file_name", ""))).strip()
+        metadata = dict(effective_payload.get("metadata") or document.get("metadata") or {})
+        version = _document_version_fields(file_name, metadata)
+        for key in (
+            "document_family",
+            "version_label",
+            "version_kind",
+            "version_sort_key",
+            "version_source",
+            "effective_on",
+        ):
+            fields.append(f"{key} = %s")
+            values.append(version[key])
+        fields.append("supersedes_document_id = %s")
+        values.append(None)
     if not fields:
         return document
+    old_group = _version_group(document)
     updated = _update_entity("documents", document_id, fields, values)
-    return _document_record(updated) if updated else None
+    if not updated:
+        return None
+    new_group = _version_group(updated)
+    groups = {group for group in (old_group, new_group) if group}
+    if groups:
+        conn = db()
+        with conn.cursor() as cur:
+            for group in groups:
+                _rebuild_document_version_chain(cur, group)
+            cur.execute("SELECT * FROM documents WHERE id = %s", (document_id,))
+            updated = dict(cur.fetchone())
+        conn.commit()
+    return _document_record(updated)
 
 
 def tombstone_document(document_id: str) -> dict | None:
@@ -611,6 +797,9 @@ def tombstone_document(document_id: str) -> dict | None:
             (document_id,),
         )
         row = cur.fetchone()
+        version_group = _version_group(document)
+        if version_group:
+            _rebuild_document_version_chain(cur, version_group)
     conn.commit()
     return _document_record(row) if row else None
 

@@ -36,12 +36,26 @@ production gate и не менялась в релизе авторизации;
 ## Формат JSONL-набора
 
 Каждая непустая строка описывает один вопрос. Обязательны `id`, `question` и
-либо `expected_terms`, либо `expect_refusal=true`. Дополнительно используются:
+хотя бы одно проверяемое ожидание: термин, источник, ориентир раздела или
+`expect_refusal=true`. Дополнительно используются:
 
 - `expected_sources` — части имён правильных документов;
+- `expected_locators` — ориентиры разделов или пунктов, которые должны попасть
+  в retrieval-контекст;
 - `expected_formula_terms` — обозначения в формулах/ответе;
 - `forbidden_terms` — известные ложные утверждения;
 - `max_latency_s` — допустимое время ответа.
+- `retrieval_focus` — `auto`, `rre`, `orem` или `both`;
+- `tags` — классы вопроса для срезов отчёта.
+
+Retrieval измеряется отдельно от ответа: source recall показывает полноту
+обязательных документов, locator recall — полноту нужных пунктов, MRR — насколько
+высоко обязательные документы стоят в выдаче. Быстрый baseline без генерации:
+
+```console
+python quality_eval.py evals/production_golden.jsonl --chat-id <uuid> \
+  --retrieval-only --minimum-retrieval-recall 1.0 --output retrieval-report.json
+```
 
 Для слов с изменяемым окончанием в `expected_terms` указывайте устойчивую основу,
 например `теплоёмк`.
@@ -55,11 +69,41 @@ production gate и не менялась в релизе авторизации;
 ```console
 export RAG_EVAL_BASE_URL=https://rag.example.internal:8443
 export RAG_EVAL_CHAT_ID=<uuid тестового чата>
-export RAG_EVAL_TOKEN=<короткоживущий access token или тестовая сессия>
+export RAG_EVAL_TOKEN=<короткоживущий access token>
 python quality_eval.py evals/production.jsonl --minimum 9 --output quality-report.json
 ```
+
+Для локальной авторизации вместо bearer-токена задаются `RAG_EVAL_EMAIL` и
+`RAG_EVAL_PASSWORD`. Пароль считывается только из окружения и не включается в
+отчёт. Для тестового стенда с доверенным самоподписанным сертификатом можно
+явно добавить `--insecure`.
 
 В артефакт оценки включаются SHA приложения, модель, параметры поиска, хеши
 документов, JSON-отчёт и время прогона. Gate повторяется после изменения модели,
 промта, chunking, reranker, парсера, формата источников, правил scope или корпуса.
 Закрытые вопросы, cookie и токены нельзя коммитить или включать в отчёт.
+
+## Эксперимент с cross-encoder reranker
+
+Production-контур сохраняет существующее детерминированное ранжирование, пока
+не задано `RAG_RERANKER_MODE=http`. В HTTP-режиме в приватный `/api/rerank`
+передаётся только ограниченный верхний пул кандидатов. Таймаут, некорректный
+ответ или несовпадение модели автоматически возвращают исходное ранжирование.
+
+Встроенный LLM bridge умеет обслуживать одну настроенную FastEmbed-модель.
+Для честного сравнения поднимается отдельный endpoint на каждую модель, и все
+они получают одни и те же кандидаты:
+
+```powershell
+python evals/compare_rerankers.py evals/production_golden.jsonl `
+  --chat-id $env:RAG_EVAL_CHAT_ID `
+  --reranker 'bge|http://127.0.0.1:11434/api/rerank|BAAI/bge-reranker-base' `
+  --reranker 'qwen|http://127.0.0.1:11435/api/rerank|Qwen/Qwen3-Reranker-0.6B' `
+  --output output/reranker-comparison.json
+```
+
+Отчёт сравнивает source/locator recall, MRR, p50/p95 задержки и число
+fail-open. Модель допускается в production только если улучшает MRR без потери
+recall, не вызывает fail-open и укладывается в измеренный ресурсный бюджет.
+Qwen требует совместимого отдельного endpoint и намеренно не устанавливается в
+основной образ API.

@@ -17,6 +17,10 @@ LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen3.8-27B")
 EMBED_MODEL = os.getenv("FASTEMBED_MODEL", "nomic-ai/nomic-embed-text-v1.5")
 EMBED_CACHE = os.getenv("FASTEMBED_CACHE_PATH", "/data/fastembed")
 REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "900"))
+RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base")
+RERANKER_CACHE = os.getenv("RERANKER_CACHE_PATH", EMBED_CACHE)
+RERANKER_MAX_DOCUMENTS = max(1, int(os.getenv("RERANKER_MAX_DOCUMENTS", "64")))
+RERANKER_TEXT_LIMIT = max(256, int(os.getenv("RERANKER_TEXT_LIMIT", "6000")))
 
 
 def _messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -161,3 +165,28 @@ async def embed(payload: dict[str, Any]) -> dict[str, Any]:
 async def embeddings(payload: dict[str, Any]) -> dict[str, Any]:
     vectors = list(_embedder().embed(_embed_texts(payload.get("prompt"))))
     return {"model": EMBED_MODEL, "embedding": vectors[0].tolist()}
+
+
+@lru_cache(maxsize=1)
+def _reranker():
+    from fastembed.rerank.cross_encoder import TextCrossEncoder
+
+    return TextCrossEncoder(model_name=RERANKER_MODEL, cache_dir=RERANKER_CACHE)
+
+
+@app.post("/api/rerank")
+def rerank(payload: dict[str, Any]) -> dict[str, Any]:
+    query = str(payload.get("query", "")).strip()
+    documents = payload.get("documents")
+    requested_model = str(payload.get("model", RERANKER_MODEL)).strip()
+    if requested_model != RERANKER_MODEL:
+        raise HTTPException(400, "requested reranker model is not configured")
+    if not query:
+        raise HTTPException(422, "query is required")
+    if not isinstance(documents, list) or not documents:
+        raise HTTPException(422, "documents must be a non-empty list")
+    if len(documents) > RERANKER_MAX_DOCUMENTS:
+        raise HTTPException(413, "too many documents for one rerank request")
+    passages = [str(document)[:RERANKER_TEXT_LIMIT] for document in documents]
+    scores = [float(score) for score in _reranker().rerank(query, passages)]
+    return {"model": RERANKER_MODEL, "scores": scores}

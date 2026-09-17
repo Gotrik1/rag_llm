@@ -314,6 +314,34 @@ class FlowModeTests(unittest.TestCase):
         self.assertNotIn(source_id, excluded)
         self.assertEqual(aliases[source_id], "Постановление 1179.docx")
 
+    def test_scope_exposes_visible_document_version_status(self):
+        documents = [
+            {
+                "source_path": "C:/uploads/old_Методика v1.docx",
+                "file_name": "Методика v1.docx",
+                "project_id": None,
+                "chat_id": None,
+                "owner_subject": None,
+                "status": "ready",
+            },
+            {
+                "source_path": "C:/uploads/new_Методика v2.docx",
+                "file_name": "Методика v2.docx",
+                "project_id": None,
+                "chat_id": None,
+                "owner_subject": None,
+                "status": "ready",
+            },
+        ]
+        with patch.object(web_ui, "list_all_documents_for_retrieval", return_value=documents):
+            scope = web_ui.retrieval_document_scope(
+                {"project_id": None, "owner_subject": "user-1", "knowledge_scope": "project_and_global"},
+                "chat-1",
+            )
+
+        self.assertEqual(scope.source_versions["old_методика v1.docx"], "superseded")
+        self.assertEqual(scope.source_versions["new_методика v2.docx"], "latest")
+
     def test_scope_registry_failure_is_fail_closed(self):
         with patch.object(
             web_ui,

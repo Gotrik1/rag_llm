@@ -49,6 +49,7 @@ from document_ingestion import ingest_document
 from domain_routing import apply_domain_routing, route_query
 from llm_providers import ProviderLLM
 from response_cache import ResponseCache
+from reranker import HttpReranker
 from runtime_paths import DATA_DIR
 from opentelemetry.trace import Status, StatusCode
 from telemetry import PIPELINE_SECONDS, tracer
@@ -838,7 +839,7 @@ def extract_chunk_metadata(text: str) -> dict:
     status_scope = f"{section_path}\n{cleaned[:900]}".lower()
 
     status = "deleted" if re.search(
-        r"утратил[аио]?\s+силу|пункт\s+(?:удален|исключен)|исключен[оа]?\s+из\s+регламента|не\s+применяется",
+        r"утратил[аио]?\s+силу|пункт\s+(?:удален|исключен)|исключен[оа]?\s+из\s+регламента",
         status_scope,
     ) else "active"
 
@@ -868,6 +869,141 @@ def extract_chunk_metadata(text: str) -> dict:
         "status": status,
         "chunk_type": chunk_type,
     }
+
+
+def _context_roles(text: str) -> set[str]:
+    normalized = (text or "").casefold().replace("ё", "е")
+    roles: set[str] = set()
+    if re.search(r"\b(?:определени|поняти|термин|означает|понимается|называется)", normalized):
+        roles.add("definition")
+    if re.search(r"\b(?:за исключением|исключени|кроме случаев|не применяется|особ(?:ый|ые) случа)", normalized):
+        roles.add("exception")
+    if re.search(r"\b(?:согласно|в соответствии|предусмотрен|см\.\s*пункт|ссылка)", normalized):
+        roles.add("reference")
+    if "[formula]" in normalized or "=" in normalized or re.search(r"\bформул", normalized):
+        roles.add("formula")
+    if re.search(r"\b(?:порядок|расчет|услови|правил|алгоритм|применя)", normalized):
+        roles.add("rule")
+    return roles or {"context"}
+
+
+def _requested_context_roles(question: str) -> set[str]:
+    normalized = (question or "").casefold().replace("ё", "е")
+    roles = {"reference"}
+    if re.search(r"\b(?:что такое|что означает|определени|поняти)", normalized):
+        roles.add("definition")
+    if re.search(r"\b(?:как|рассчит|формул|порядок|алгоритм)", normalized):
+        roles.update({"definition", "rule", "formula", "exception"})
+    if re.search(r"\b(?:услови|когда|случа|ограничени)", normalized):
+        roles.update({"rule", "exception"})
+    return roles
+
+
+def relationship_expansion_results(
+    all_nodes: list[Any],
+    ranked: list[dict],
+    question: str,
+    limit: int = 12,
+) -> list[dict]:
+    """Expand strong child hits with bounded same-document structural context."""
+    if not all_nodes or not ranked or is_document_occurrence_question(question):
+        return []
+    seed_sources = {
+        Path(str(item.get("file", ""))).name.casefold()
+        for item in ranked[:12]
+        if item.get("file")
+    }
+    if not seed_sources:
+        return []
+
+    candidates_by_source: dict[str, list[dict]] = {source: [] for source in seed_sources}
+    for node in all_nodes:
+        meta = node.metadata or {}
+        source_name = str(meta.get("file_name", meta.get("file_path", "?")))
+        source_key = Path(source_name).name.casefold()
+        if source_key not in candidates_by_source:
+            continue
+        text = node.text or ""
+        chunk_meta = {
+            **extract_chunk_metadata(text),
+            **{
+                key: value for key, value in meta.items()
+                if key in {"section_path", "section_title", "parent_section", "status", "chunk_type"}
+                and value
+            },
+        }
+        if chunk_meta.get("status") == "deleted" or contains_prompt_injection(text):
+            continue
+        candidates_by_source[source_key].append({
+            "file": source_name,
+            "text": text,
+            **chunk_meta,
+        })
+
+    requested_roles = _requested_context_roles(question)
+    lexical_terms = {
+        term for term in section_query_terms(question)
+        if len(term) >= 5 and not term.isdigit()
+    }
+    existing = {
+        hashlib.sha256(
+            f"{Path(str(item.get('file', ''))).name.casefold()}\n{str(item.get('text', ''))[:700]}".encode("utf-8")
+        ).hexdigest()
+        for item in ranked
+    }
+    expanded: list[dict] = []
+    for seed in ranked[:8]:
+        source_key = Path(str(seed.get("file", ""))).name.casefold()
+        seed_path = str(seed.get("section_path", "")).strip()
+        seed_parent = str(seed.get("parent_section", "")).strip()
+        seed_score = float(seed.get("score", 0.0))
+        related: list[tuple[float, str, dict]] = []
+        for candidate in candidates_by_source.get(source_key, []):
+            digest = hashlib.sha256(
+                f"{source_key}\n{candidate['text'][:700]}".encode("utf-8")
+            ).hexdigest()
+            if digest in existing:
+                continue
+            path = str(candidate.get("section_path", "")).strip()
+            parent = str(candidate.get("parent_section", "")).strip()
+            searchable = f"{path}\n{candidate.get('section_title', '')}\n{candidate['text'][:1600]}".casefold()
+            roles = _context_roles(searchable)
+            lexical_matches = sum(contains_term(searchable, term) for term in lexical_terms)
+            relation = ""
+            bonus = 0.0
+            if seed_path and path == seed_path:
+                relation, bonus = "section-child", 0.55
+            elif seed_parent and path == seed_parent:
+                relation, bonus = "parent-section", 0.48
+            elif seed_path and parent == seed_path:
+                relation, bonus = "child-section", 0.45
+            elif (
+                parent == seed_parent
+                and roles & requested_roles
+                and (
+                    lexical_matches
+                    or (seed_parent and roles & {"exception", "reference"})
+                )
+            ):
+                relation, bonus = "related-" + sorted(roles & requested_roles)[0], 0.32
+            if not relation:
+                continue
+            related.append((bonus + min(lexical_matches, 3) * 0.08, relation, candidate))
+        for bonus, relation, candidate in sorted(related, key=lambda item: item[0], reverse=True)[:2]:
+            digest = hashlib.sha256(
+                f"{source_key}\n{candidate['text'][:700]}".encode("utf-8")
+            ).hexdigest()
+            if digest in existing:
+                continue
+            existing.add(digest)
+            expanded.append({
+                **candidate,
+                "score": round(seed_score - 0.20 + bonus, 4),
+                "matched_queries": [f"relationship:{relation}"],
+            })
+            if len(expanded) >= limit:
+                return expanded
+    return expanded
 
 
 def contains_term(value: str, term: str) -> bool:
@@ -2206,6 +2342,34 @@ def prioritize_scoped_results(ranked: list[dict], top_k: int) -> list[dict]:
     return [*prioritized, *(item for item in ranked if id(item) not in prioritized_ids)]
 
 
+def apply_document_version_preference(
+    ranked: list[dict],
+    source_versions: dict[str, str] | None,
+    *,
+    explicit_sources: set[str] | None = None,
+) -> list[dict]:
+    """Softly prefer current revisions while keeping historical evidence searchable."""
+    if not source_versions:
+        return ranked
+    normalized_versions = {
+        Path(str(source)).name.casefold(): str(status or "unknown").casefold()
+        for source, status in source_versions.items()
+    }
+    adjusted: list[dict] = []
+    for original in ranked:
+        item = dict(original)
+        source_id = Path(str(item.get("file", ""))).name.casefold()
+        status = normalized_versions.get(source_id, "unknown")
+        item["version_status"] = status
+        if not explicit_sources:
+            adjustment = 0.15 if status == "latest" else (-0.15 if status == "superseded" else 0.0)
+            if adjustment:
+                item["score"] = round(float(item.get("score", 0.0)) + adjustment, 4)
+                item["version_adjustment"] = adjustment
+        adjusted.append(item)
+    return sorted(adjusted, key=lambda item: float(item.get("score", 0.0)), reverse=True)
+
+
 def sanitize_grounded_answer(answer: str, question: str, allowed_calculations: list[str]) -> str:
     if contains_prompt_injection(answer):
         return refusal_answer()
@@ -2346,6 +2510,7 @@ class RAGAgent:
 
         # ── Exact response cache ──────────────────────────────
         self.response_cache = ResponseCache()
+        self.reranker = HttpReranker()
         self._generation_state = threading.local()
         self._generation_state.from_cache = False
         self._index_refresh_lock = threading.Lock()
@@ -2653,6 +2818,7 @@ class RAGAgent:
         source_aliases: dict[str, str] | None = None,
         priority_sources: set[str] | None = None,
         source_domains: dict[str, tuple[str, ...]] | None = None,
+        source_versions: dict[str, str] | None = None,
         retrieval_focus: str = "auto",
     ) -> tuple[str, list[dict], bool]:
         """
@@ -2692,6 +2858,7 @@ class RAGAgent:
             source_aliases=source_aliases,
             priority_sources=priority_sources,
             source_domains=source_domains,
+            source_versions=source_versions,
             retrieval_focus=retrieval_focus,
         )
         if is_document_occurrence_question(understood_question):
@@ -3103,10 +3270,70 @@ class RAGAgent:
                 seeds.append(best[1])
         return seeds
 
+    def _exact_entity_seed_results(self, question: str, limit: int = 24) -> list[dict]:
+        """Seed rare abbreviations across documents before semantic ranking."""
+        entities = {
+            match.group(0).upper().replace("Ё", "Е")
+            for match in re.finditer(r"(?<![А-Яа-яA-Za-z0-9])(?:[А-ЯЁ]{3,10}[0-9-]{0,3}|ИВ[01](?:-1)?)(?![А-Яа-яA-Za-z0-9])", question)
+        }
+        entities -= {"ЭЛЕКТРОЭНЕРГИЯ"}
+        if not entities:
+            return []
+        ranked: list[tuple[float, dict]] = []
+        for node in self._all_nodes:
+            meta = node.metadata or {}
+            text = node.text or ""
+            file_name = str(meta.get("file_name", meta.get("file_path", "?")))
+            section_path = str(meta.get("section_path", ""))
+            section_title = str(meta.get("section_title", ""))
+            source_scope = user_facing_source_name(file_name).upper().replace("Ё", "Е")
+            section_scope = f"{section_path}\n{section_title}".upper().replace("Ё", "Е")
+            body_scope = text.upper().replace("Ё", "Е")
+            matched = {
+                entity for entity in entities
+                if contains_term(f"{source_scope}\n{section_scope}\n{body_scope}", entity)
+            }
+            if not matched:
+                continue
+            chunk_meta = {
+                **extract_chunk_metadata(text),
+                **{key: value for key, value in meta.items() if key in {
+                    "section_path", "section_title", "parent_section", "status", "chunk_type",
+                } and value},
+            }
+            if chunk_meta.get("status") == "deleted":
+                continue
+            score = 3.0 + len(matched) * 0.6
+            if any(contains_term(section_scope, entity) for entity in matched):
+                score += 1.4
+            if any(contains_term(source_scope, entity) for entity in matched):
+                score += 1.8
+            if any(contains_term(body_scope[:1200], entity) for entity in matched):
+                score += 0.8
+            ranked.append((score, {
+                "file": file_name,
+                "score": round(score, 4),
+                "text": text,
+                "matched_queries": [f"entity-exact:{entity}" for entity in sorted(matched)],
+                **chunk_meta,
+            }))
+        selected: list[dict] = []
+        per_source: dict[str, int] = {}
+        for _, item in sorted(ranked, key=lambda pair: pair[0], reverse=True):
+            source = user_facing_source_name(item.get("file", "")).casefold()
+            if per_source.get(source, 0) >= 3:
+                continue
+            selected.append(item)
+            per_source[source] = per_source.get(source, 0) + 1
+            if len(selected) >= limit:
+                break
+        return selected
+
     def _price_category_seed_results(self, question: str, limit: int = 60) -> list[dict]:
         """Seed direct definition and calculation clauses for one price category."""
         category = price_category_number(question)
-        if not category:
+        generic_category = bool(re.search(r"ценов\w*\s+категор\w*", question, re.IGNORECASE))
+        if not category and not generic_category:
             return []
         source_signals: dict[str, dict[str, bool]] = {}
         for node in self._all_nodes:
@@ -3118,7 +3345,10 @@ class RAGAgent:
             signals = source_signals.setdefault(source, {
                 "category": False, "transfer": False, "one_rate": False, "two_rate": False,
             })
-            signals["category"] = signals["category"] or contains_price_category(lower, category)
+            signals["category"] = signals["category"] or (
+                contains_price_category(lower, category)
+                if category else bool(re.search(r"ценов\w*\s+категор\w*", lower))
+            )
             signals["transfer"] = signals["transfer"] or "передач" in lower
             signals["one_rate"] = signals["one_rate"] or "одноставоч" in lower
             signals["two_rate"] = signals["two_rate"] or "двухставоч" in lower
@@ -3129,8 +3359,14 @@ class RAGAgent:
             section_path = str(meta.get("section_path", ""))
             section_title = str(meta.get("section_title", ""))
             section_haystack = f"{section_path}\n{section_title}"
-            body_match = contains_price_category(text, category)
-            section_match = contains_price_category(section_haystack, category)
+            body_match = (
+                contains_price_category(text, category)
+                if category else bool(re.search(r"ценов\w*\s+категор\w*", text, re.IGNORECASE))
+            )
+            section_match = (
+                contains_price_category(section_haystack, category)
+                if category else bool(re.search(r"ценов\w*\s+категор\w*", section_haystack, re.IGNORECASE))
+            )
             lower = f"{section_haystack}\n{text}".lower().replace("ё", "е")
             source = user_facing_source_name(meta.get("file_name", meta.get("file_path", "?"))).casefold()
             signals = source_signals.get(source, {})
@@ -3166,7 +3402,7 @@ class RAGAgent:
                 score += 2.0
             if body_match:
                 score += 1.0
-            stem = PRICE_CATEGORY_STEMS.get(category, "")
+            stem = PRICE_CATEGORY_STEMS.get(category or "", "")
             if stem and re.search(rf"\b{stem}\w*\s+ценов\w*\s+категор\w*\b", lower):
                 score += 6.0
             if "порядок определения стоимости" in lower:
@@ -3180,9 +3416,9 @@ class RAGAgent:
                 "score": round(score, 4),
                 "text": text,
                 "matched_queries": [
-                    f"price-category-exact:{category}"
+                    f"price-category-exact:{category or 'generic'}"
                     if (body_match or section_match)
-                    else f"price-category-related:{category}"
+                    else f"price-category-related:{category or 'generic'}"
                 ],
                 **chunk_meta,
             }
@@ -3451,6 +3687,7 @@ class RAGAgent:
         source_aliases: dict[str, str] | None = None,
         priority_sources: set[str] | None = None,
         source_domains: dict[str, tuple[str, ...]] | None = None,
+        source_versions: dict[str, str] | None = None,
         retrieval_focus: str = "auto",
     ) -> list[dict]:
         """Return chunks after query planning unless a validated plan is supplied."""
@@ -3475,6 +3712,9 @@ class RAGAgent:
             key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
             merged[key] = item
         for item in self._section_seed_results(question):
+            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
+            merged[key] = item
+        for item in self._exact_entity_seed_results(question):
             key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
             merged[key] = item
         for item in self._formula_clause_seed_results(question):
@@ -3567,11 +3807,31 @@ class RAGAgent:
             and not contains_prompt_injection(str(item.get("text", "")))
         ]
         ranked = rerank_context_results(results, question)
+        related = relationship_expansion_results(
+            getattr(self, "_all_nodes", []),
+            ranked,
+            question,
+            limit=max(top_k, 12),
+        )
+        if related:
+            ranked = rerank_context_results([*ranked, *related], question)
+        reranker = getattr(self, "reranker", None)
+        if reranker is not None:
+            with _pipeline_span(
+                "cross_encoder_rerank",
+                attributes={"rag.reranker.enabled": reranker.enabled},
+            ):
+                ranked = reranker.rerank(question, ranked)
         ranked = apply_domain_routing(
             ranked,
             source_domains,
             domain_routing,
             top_k,
+        )
+        ranked = apply_document_version_preference(
+            ranked,
+            source_versions,
+            explicit_sources=explicit_sources,
         )
         if priority_sources and not explicit_sources:
             # Vector/BM25 scores are backend-specific and can be much larger

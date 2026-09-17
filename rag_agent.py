@@ -4051,6 +4051,29 @@ class RAGAgent:
             and not contains_prompt_injection(str(item.get("text", "")))
         ]
         ranked = rerank_context_results(results, question)
+        if is_document_occurrence_question(selection_question):
+            # A document-occurrence query asks for a positive set, not for the
+            # best explanatory chunks. The general domain router deliberately
+            # caps its candidate pool; on a large regulation that cap can be
+            # consumed by many chunks from the same sources and discard a
+            # lower-scoring document even though it contains an exact match.
+            # ACL/source filtering already ran above, so collapse the complete
+            # direct-match set by active physical revision before any lossy
+            # top-k routing or semantic reranking.
+            ranked = apply_document_version_preference(
+                ranked,
+                source_versions,
+                explicit_sources=explicit_sources,
+            )
+            diversified = diversify_context_results(
+                ranked,
+                selection_question,
+                top_k,
+            )
+            return [
+                item for item in diversified
+                if item.get("status") != "deleted"
+            ][:top_k]
         related = relationship_expansion_results(
             getattr(self, "_all_nodes", []),
             ranked,
@@ -4084,18 +4107,6 @@ class RAGAgent:
             # by a large shared document, while global evidence still remains.
             ranked = prioritize_scoped_results(ranked, top_k)
         diversified = diversify_context_results(ranked, selection_question, top_k)
-        if is_document_occurrence_question(selection_question):
-            # This intent asks for the complete positive set of accessible,
-            # active documents.  ``history`` is normally excluded from an
-            # explanatory answer, but it is also used for normative preambles
-            # and revision clauses that can be a valid direct occurrence (for
-            # example, regulations 1179 and 442).  ACL/source filtering and
-            # prompt-injection checks already ran above; retain every active
-            # direct match instead of applying answer-type exclusions.
-            return [
-                item for item in diversified
-                if item.get("status") != "deleted"
-            ][:top_k]
         selected = select_prism_evidence(diversified, spec, top_k)
         concept_selected = [
             item for item in selected

@@ -50,7 +50,7 @@ from db_store import (
 from document_catalog import annotate_document_versions, build_document_catalog_answer, is_document_catalog_question
 from domain_routing import infer_document_domains, normalize_retrieval_focus
 from llm_providers import DEFAULTS, ProviderLLM
-from rag_agent import CACHE_VERSION, DATA_DIR, GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, format_formula_for_display, is_formula_question, refine_prism_query, source_locator, user_facing_source_name, validate_retrieval
+from rag_agent import CACHE_VERSION, DATA_DIR, GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, format_formula_for_display, is_document_occurrence_question, is_formula_question, refine_prism_query, source_locator, user_facing_source_name, validate_retrieval
 from runtime_paths import MATHML_CACHE_DIR, STATE_DIR, UPLOAD_DIR
 from system_prompts import get_profile, profiles
 from opentelemetry.trace import Status, StatusCode
@@ -289,6 +289,11 @@ def project_context_prompt(scope: dict) -> str:
 
 def contextualize_retrieval_question(question: str, scope: dict, chat_id: str) -> str:
     """Resolve short referential follow-ups using the previous user turn in this chat."""
+    # A complete document-occurrence request already carries its own subject.
+    # Natural standalone questions beginning with "где" must not inherit an
+    # unrelated previous turn and change their retrieval terms.
+    if is_document_occurrence_question(question):
+        return question
     normalized = re.sub(r"\s+", " ", question.strip().lower())
     explicit_subject = bool(
         re.search(r"\b\d+\s*[а-яёa-z]{1,5}\b", normalized)

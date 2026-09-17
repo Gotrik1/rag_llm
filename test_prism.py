@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from rag_agent import (
     QueryUnderstanding,
@@ -1034,6 +1034,52 @@ class PrismQueryTests(unittest.TestCase):
             retrieval_queries=(),
         )
 
+        self.assertEqual(
+            {item["file"] for item in results},
+            {"Постановление 1179.docx", "Методика РРЭ.docx"},
+        )
+
+    @patch("rag_agent.apply_domain_routing")
+    def test_document_occurrence_positive_set_bypasses_lossy_domain_cap(self, domain_routing):
+        agent = object.__new__(RAGAgent)
+        agent._all_nodes = [
+            SimpleNamespace(
+                text="Описаны первая — шестая ценовые категории.",
+                metadata={"file_name": "Постановление 1179.docx", "section_path": "Правила"},
+            ),
+            SimpleNamespace(
+                text="Выбранная ценовая категория задаётся в договорных условиях.",
+                metadata={"file_name": "Методика РРЭ.docx", "section_path": "Договорные условия"},
+            ),
+        ]
+        agent._refresh_docstore_if_changed = Mock()
+        retriever = Mock()
+        retriever.retrieve.return_value = []
+        agent._build_query_engine = Mock(return_value=SimpleNamespace(retriever=retriever))
+        for method_name in (
+            "_procedural_seed_results",
+            "_exact_section_seed_results",
+            "_price_category_seed_results",
+            "_lexical_section_seed_results",
+            "_section_seed_results",
+            "_formula_clause_seed_results",
+            "_regulation_concept_seed_results",
+        ):
+            setattr(agent, method_name, Mock(return_value=[]))
+
+        results = RAGAgent.retrieve_context(
+            agent,
+            "В каких документах написано про ценовые категории?",
+            top_k=10,
+            retrieval_queries=(),
+            source_domains={
+                "постановление 1179.docx": ("rre",),
+                "методика ррэ.docx": ("rre",),
+            },
+            retrieval_focus="both",
+        )
+
+        domain_routing.assert_not_called()
         self.assertEqual(
             {item["file"] for item in results},
             {"Постановление 1179.docx", "Методика РРЭ.docx"},

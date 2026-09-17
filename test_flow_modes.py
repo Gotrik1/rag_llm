@@ -202,6 +202,14 @@ class FlowModeTests(unittest.TestCase):
         ]}
         self.assertEqual(web_ui.contextualize_retrieval_question(question, scope, "chat-1"), question)
 
+    def test_standalone_document_occurrence_question_is_not_a_follow_up(self):
+        question = "где в документах есть информация про цк"
+        scope = {"messages": [
+            {"chat_id": "chat-1", "role": "user", "content": "Как рассчитываются авансы?"},
+            {"chat_id": "chat-1", "role": "user", "content": question},
+        ]}
+        self.assertEqual(web_ui.contextualize_retrieval_question(question, scope, "chat-1"), question)
+
     def test_shared_sources_exclude_private_and_ambiguous_names(self):
         documents = [
             {"source_path": "C:/uploads/global.pdf", "file_name": "Регламент.pdf", "owner_subject": None, "status": "ready"},

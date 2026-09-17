@@ -69,7 +69,7 @@ VECTOR_TOP_K     = 12      # кандидатов от вектора
 # A semantic/chunking change must never reuse an older docstore or vector
 # collection: the two indexes must describe precisely the same corpus.
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25_v12"))
-CACHE_VERSION    = "v32-exact-unicode-cache"
+CACHE_VERSION    = "v33-document-occurrence-coverage"
 QUERY_UNDERSTANDING_VERSION = "v1"
 MAX_OUTPUT_TOKENS = 4056
 
@@ -349,16 +349,69 @@ def price_category_item_matches(item: dict, number: str) -> bool:
     return contains_price_category(haystack, number)
 
 
+DOCUMENT_OCCURRENCE_STOP_PREFIXES = (
+    "документ", "напис", "фигур", "упомин", "встреч", "содерж", "перечисл",
+    "назов", "покаж", "каки", "како", "котор", "информац", "сведен", "привед",
+)
+DOCUMENT_OCCURRENCE_STOP_WORDS = {
+    "есть", "имеется", "про", "тема", "темы", "этот", "эта", "это", "эти",
+}
+
+
+def document_occurrence_terms(question: str) -> tuple[str, ...]:
+    """Extract the subject of a positive document-occurrence lookup."""
+    normalized = normalize_user_question(question)[0].lower().replace("ё", "е")
+    terms = []
+    for token in re.findall(r"[а-яa-z0-9-]{3,}", normalized):
+        if token in DOCUMENT_OCCURRENCE_STOP_WORDS:
+            continue
+        if any(token.startswith(prefix) for prefix in DOCUMENT_OCCURRENCE_STOP_PREFIXES):
+            continue
+        terms.append(token)
+    return tuple(dict.fromkeys(terms))
+
+
 def is_document_occurrence_question(question: str) -> bool:
     normalized = (question or "").lower().replace("ё", "е")
-    return bool(
-        price_category_number(normalized)
-        and re.search(
-            r"\b(?:в\s+каких\s+документ\w*|какие\s+документ\w*|"
-            r"где\s+(?:фигурир\w*|упомина\w*|встреча\w*)|перечисл\w*\s+документ\w*)\b",
-            normalized,
-        )
-    )
+    has_list_intent = bool(re.search(
+        r"\b(?:в\s+каких\s+документ\w*|какие\s+документ\w*|"
+        r"где\s+(?:фигурир\w*|упомина\w*|встреча\w*)|"
+        r"перечисл\w*\s+документ\w*)\b",
+        normalized,
+    ))
+    return has_list_intent and bool(price_category_number(normalized) or document_occurrence_terms(normalized))
+
+
+def document_occurrence_item_matches(item: dict, question: str) -> bool:
+    """Confirm that an evidence item directly contains the requested subject."""
+    category = price_category_number(question)
+    if category:
+        return price_category_item_matches(item, category)
+
+    terms = document_occurrence_terms(question)
+    if not terms:
+        return False
+    haystack = "\n".join((
+        str(item.get("section_path", "")),
+        str(item.get("section_title", "")),
+        str(item.get("text", "")),
+    )).lower().replace("ё", "е")
+    long_terms = tuple(term for term in terms if len(term) >= 4)
+    short_terms = tuple(term for term in terms if len(term) < 4)
+    term_keys = set(lexical_term_keys(" ".join(long_terms)))
+    haystack_keys = set(lexical_term_keys(haystack))
+    if not term_keys.issubset(haystack_keys):
+        return False
+    if any(
+        not re.search(rf"(?<![а-яa-z0-9-]){re.escape(term)}(?![а-яa-z0-9-])", haystack)
+        for term in short_terms
+    ):
+        return False
+    # Require the actual phrase so a document that separately mentions prices
+    # and unrelated categories cannot become a false positive.
+    if {"цено", "кате"}.issubset(term_keys):
+        return bool(re.search(r"\bценов\w*\s+категор\w*\b", haystack))
+    return True
 
 
 def deterministic_query_understanding(question: str) -> QueryUnderstanding:
@@ -837,9 +890,11 @@ def diversify_context_results(ranked: list[dict], question: str, top_k: int) -> 
 
     # This is a positive set lookup: one strongest direct hit per document,
     # without padding the result with documents that do not contain the entity.
-    if category and is_document_occurrence_question(question):
+    if is_document_occurrence_question(question):
         per_source: dict[str, dict] = {}
-        for item in category_matches:
+        for item in ranked:
+            if not document_occurrence_item_matches(item, question):
+                continue
             source = user_facing_source_name(item.get("file", "")).casefold()
             per_source.setdefault(source, item)
         return list(per_source.values())[:top_k]
@@ -1319,18 +1374,18 @@ def ensure_price_category_source_coverage(answer: str, question: str, context: l
 def generate_document_occurrence_answer(question: str, context: list[dict]) -> str:
     """List only documents with a confirmed direct occurrence of the entity."""
     category = price_category_number(question)
-    if not category:
-        return ""
     positive: dict[str, dict] = {}
     for item in context:
-        if not price_category_item_matches(item, category):
+        if not document_occurrence_item_matches(item, question):
             continue
         name = user_facing_source_name(item.get("file", ""))
         positive.setdefault(name.casefold(), item)
     if not positive:
-        return f"В доступных документах прямых упоминаний {category} ЦК не найдено."
+        subject = f"{category} ЦК" if category else "темы запроса"
+        return f"В доступных документах прямых упоминаний {subject} не найдено."
 
-    lines = [f"{category} ЦК прямо упоминается в следующих документах:", ""]
+    subject = f"{category} ЦК" if category else "Тема запроса"
+    lines = [f"{subject} прямо упоминается в следующих документах:", ""]
     for item in positive.values():
         name = user_facing_source_name(item.get("file", ""))
         locator = source_locator(item.get("section_path", item.get("section", "")), item.get("page_number"))
@@ -2635,10 +2690,9 @@ class RAGAgent:
             priority_sources=priority_sources,
         )
         if is_document_occurrence_question(understood_question):
-            category = price_category_number(understood_question)
             context = [
                 item for item in context
-                if category and price_category_item_matches(item, category)
+                if document_occurrence_item_matches(item, understood_question)
             ]
         # The UI must show exactly the evidence used to produce the answer.
         # Keeping it request-thread-local avoids a second, potentially divergent
@@ -3140,6 +3194,43 @@ class RAGAgent:
                 break
         return selected
 
+    def _document_occurrence_seed_results(self, question: str, limit: int = 100) -> list[dict]:
+        """Return the strongest direct subject occurrence from every document."""
+        if not is_document_occurrence_question(question):
+            return []
+
+        best_by_source: dict[str, tuple[float, dict]] = {}
+        for node in self._all_nodes:
+            meta = node.metadata or {}
+            text = node.text or ""
+            item = {
+                "file": meta.get("file_name", meta.get("file_path", "?")),
+                "score": 0.0,
+                "text": text,
+                "matched_queries": ["document-occurrence-exact"],
+                **extract_chunk_metadata(text),
+                **{key: value for key, value in meta.items() if key in {
+                    "section_path", "section_title", "parent_section", "status", "chunk_type",
+                } and value},
+            }
+            if item.get("status") == "deleted" or not document_occurrence_item_matches(item, question):
+                continue
+
+            score = 4.0
+            if document_occurrence_item_matches({**item, "text": ""}, question):
+                score += 2.0
+            if text.lstrip().startswith("[SECTION:"):
+                score += 0.25
+            item["score"] = round(score, 4)
+            source_key = user_facing_source_name(item["file"]).casefold()
+            current = best_by_source.get(source_key)
+            if current is None or score > current[0]:
+                best_by_source[source_key] = (score, item)
+
+        return [
+            item for _, item in sorted(best_by_source.values(), key=lambda pair: pair[0], reverse=True)[:limit]
+        ]
+
     def _formula_clause_seed_results(self, question: str) -> list[dict]:
         """Seed the clause whose wording most exactly matches a formula request."""
         normalized = question.lower().replace("ё", "е")
@@ -3383,6 +3474,9 @@ class RAGAgent:
             merged[key] = item
         concept_seeds = self._regulation_concept_seed_results(question)
         for item in concept_seeds:
+            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
+            merged[key] = item
+        for item in self._document_occurrence_seed_results(question):
             key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
             merged[key] = item
         # Run exact category seeding last so broad lexical/section seeds cannot

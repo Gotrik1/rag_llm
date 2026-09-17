@@ -11,6 +11,7 @@ from rag_agent import (
     contains_price_category,
     detect_query_intent,
     deterministic_query_understanding,
+    document_occurrence_item_matches,
     diversify_context_results,
     extract_formula_lines_from_texts,
     ensure_price_category_source_coverage,
@@ -21,6 +22,7 @@ from rag_agent import (
     generate_formula_only_answer,
     generate_extractive_value_answer,
     generate_image_transcription_answer,
+    is_document_occurrence_question,
     matching_explicit_sources,
     _question_hash,
     parse_query_understanding,
@@ -169,6 +171,27 @@ class PrismQueryTests(unittest.TestCase):
         self.assertTrue(contains_price_category("Порядок расчета 1 ЦК", "1"))
         self.assertTrue(contains_price_category("тариф для первой ценовой категории", "1"))
         self.assertFalse(contains_price_category("Методика расчета 1-6ЦК", "1"))
+
+    def test_generic_document_occurrence_question_is_positive_list_intent(self):
+        question = "В каких документах написано про ценовые категории?"
+
+        self.assertTrue(is_document_occurrence_question(question))
+        self.assertTrue(document_occurrence_item_matches(
+            {"text": "Указаны вторая, третья и четвертая ценовые категории."},
+            question,
+        ))
+        self.assertFalse(document_occurrence_item_matches(
+            {"text": "Указаны категории документов и предельные цены."},
+            question,
+        ))
+        self.assertTrue(document_occurrence_item_matches(
+            {"text": "Расчеты выполняются на РРЭ."},
+            "В каких документах упоминается РРЭ?",
+        ))
+        self.assertFalse(document_occurrence_item_matches(
+            {"text": "Расчеты выполняются на ОРЭМ."},
+            "В каких документах упоминается РРЭ?",
+        ))
 
     def test_llm_query_plan_is_validated_and_keeps_identifiers(self):
         plan = parse_query_understanding(
@@ -345,6 +368,7 @@ class PrismQueryTests(unittest.TestCase):
             "_section_seed_results",
             "_formula_clause_seed_results",
             "_regulation_concept_seed_results",
+            "_document_occurrence_seed_results",
         ):
             setattr(agent, method_name, Mock(return_value=[]))
 
@@ -391,6 +415,77 @@ class PrismQueryTests(unittest.TestCase):
         self.assertEqual({item["file"] for item in seeds}, {"categories.docx", "transfer.docx", "network.docx"})
         self.assertTrue(any("price-category-related:6" in item["matched_queries"] for item in seeds))
 
+    def test_document_occurrence_seed_covers_every_directly_matching_document(self):
+        class Node:
+            def __init__(self, text, metadata):
+                self.text = text
+                self.metadata = metadata
+
+        agent = object.__new__(RAGAgent)
+        agent._all_nodes = [
+            Node(
+                "В правилах применяются вторая, третья, четвертая, пятая и шестая ценовые категории.",
+                {"file_name": "Постановление 1179.docx", "section_path": "1. Предельные уровни цен"},
+            ),
+            Node(
+                "Выбор ценовой категории выполняется для объекта потребления.",
+                {"file_name": "Методика РРЭ.docx", "section_path": "Объекты потребления"},
+            ),
+            Node(
+                "Категории документов и предельные цены ведутся в разных справочниках.",
+                {"file_name": "Шум.docx", "section_path": "Справочники"},
+            ),
+        ]
+
+        seeds = agent._document_occurrence_seed_results(
+            "В каких документах написано про ценовые категории?"
+        )
+
+        self.assertEqual(
+            {item["file"] for item in seeds},
+            {"Постановление 1179.docx", "Методика РРЭ.docx"},
+        )
+        self.assertTrue(all(
+            "document-occurrence-exact" in item["matched_queries"] for item in seeds
+        ))
+
+    def test_document_occurrence_retrieval_respects_excluded_source_scope(self):
+        agent = object.__new__(RAGAgent)
+        agent._all_nodes = [
+            SimpleNamespace(
+                text="Описаны первая и вторая ценовые категории.",
+                metadata={"file_name": "visible.docx", "section_path": "Ценовые категории"},
+            ),
+            SimpleNamespace(
+                text="Описаны пятая и шестая ценовые категории.",
+                metadata={"file_name": "hidden.docx", "section_path": "Ценовые категории"},
+            ),
+        ]
+        agent._refresh_docstore_if_changed = Mock()
+        retriever = Mock()
+        retriever.retrieve.return_value = []
+        agent._build_query_engine = Mock(return_value=SimpleNamespace(retriever=retriever))
+        for method_name in (
+            "_procedural_seed_results",
+            "_exact_section_seed_results",
+            "_price_category_seed_results",
+            "_lexical_section_seed_results",
+            "_section_seed_results",
+            "_formula_clause_seed_results",
+            "_regulation_concept_seed_results",
+        ):
+            setattr(agent, method_name, Mock(return_value=[]))
+
+        results = RAGAgent.retrieve_context(
+            agent,
+            "В каких документах написано про ценовые категории?",
+            top_k=10,
+            excluded_sources={"hidden.docx"},
+            retrieval_queries=(),
+        )
+
+        self.assertEqual([item["file"] for item in results], ["visible.docx"])
+
     def test_price_category_rerank_penalizes_other_category_heading(self):
         results = [
             {"file": "wrong.docx", "score": 1.0, "section_path": "5.1 Порядок для 1 ЦК", "text": "Общий расчет стоимости."},
@@ -424,6 +519,24 @@ class PrismQueryTests(unittest.TestCase):
         self.assertIn("positive.docx", answer)
         self.assertNotIn("negative.docx", answer)
         self.assertNotIn("не указана", answer)
+
+    def test_generic_document_occurrence_answer_lists_only_positive_documents(self):
+        question = "В каких документах написано про ценовые категории?"
+        answer = generate_document_occurrence_answer(question, [
+            {
+                "file": "Постановление 1179.docx",
+                "section_path": "1. Предельные уровни цен",
+                "text": "Вторая, третья и четвертая ценовые категории.",
+            },
+            {
+                "file": "negative.docx",
+                "section_path": "Общие положения",
+                "text": "Категории документов и значения цен.",
+            },
+        ])
+
+        self.assertIn("Постановление 1179.docx", answer)
+        self.assertNotIn("negative.docx", answer)
 
     def test_price_category_answer_cites_relevant_second_document(self):
         answer = ensure_price_category_source_coverage(

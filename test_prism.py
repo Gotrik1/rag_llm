@@ -299,6 +299,55 @@ class PrismQueryTests(unittest.TestCase):
         self.assertIn("list", understanding.facets)
         self.assertEqual(price_category_number(understanding.canonical_question), "1")
         self.assertTrue(contains_price_category("Порядок расчета 1 ЦК", "1"))
+
+    def test_rre_prerequisite_paraphrases_get_conditions_and_operational_queries(self):
+        questions = (
+            "Для расчётов в системе по договорам РРЭ какие условия должны быть выполнены?",
+            "Что необходимо настроить перед запуском расчёта договора РРЭ?",
+            "Перечисли предварительные условия расчёта по договору розничного рынка.",
+            "что должно быть заведено чтобы посчитать договор ррэ",
+            "Какие объекты, условия и тарифы требуются для расчёта РРЭ?",
+            "Почему расчёт по договору РРЭ может не сформироваться?",
+            "Дай чек-лист готовности договора РРЭ к расчёту.",
+            "Какие данные система проверяет перед расчётом договора РРЭ?",
+        )
+
+        for question in questions:
+            with self.subTest(question=question):
+                understanding = deterministic_query_understanding(question)
+                self.assertIn("conditions", understanding.facets)
+                self.assertTrue(any(
+                    "договорные условия объекты потребления" in query
+                    for query in understanding.retrieval_queries
+                ))
+                self.assertTrue(any(
+                    "тарифная схема" in query
+                    for query in understanding.retrieval_queries
+                ))
+
+    def test_llm_query_plan_cannot_crowd_out_rre_prerequisite_safeguards(self):
+        question = "Что необходимо настроить перед запуском расчёта договора РРЭ?"
+        raw = (
+            '{"canonical_question":"Какие настройки нужны для расчёта?",'
+            '"facets":["procedure"],"retrieval_queries":['
+            '"шум один","шум два","шум три","шум четыре","шум пять","шум шесть"]}'
+        )
+
+        understanding = parse_query_understanding(raw, question)
+
+        self.assertIn("conditions", understanding.facets)
+        self.assertTrue(any(
+            "договорные условия объекты потребления" in query
+            for query in understanding.retrieval_queries
+        ))
+        self.assertNotIn("шум шесть", understanding.retrieval_queries)
+
+    def test_find_documents_is_recognized_as_list_facet(self):
+        understanding = deterministic_query_understanding(
+            "Найди все доступные документы, где фигурирует ЦК."
+        )
+
+        self.assertIn("list", understanding.facets)
         self.assertTrue(contains_price_category("тариф для первой ценовой категории", "1"))
         self.assertFalse(contains_price_category("Методика расчета 1-6ЦК", "1"))
 
@@ -310,6 +359,24 @@ class PrismQueryTests(unittest.TestCase):
             {"text": "Указаны вторая, третья и четвертая ценовые категории."},
             question,
         ))
+
+    def test_generic_price_category_alias_lists_only_directly_matching_documents(self):
+        questions = (
+            "Перечисли все доступные документы, где фигурирует ЦК.",
+            "Найди документы с правилами выбора или расчёта ценовой категории.",
+        )
+
+        for question in questions:
+            with self.subTest(question=question):
+                self.assertTrue(is_document_occurrence_question(question))
+                self.assertTrue(document_occurrence_item_matches(
+                    {"text": "Правила выбора с первой по шестую ЦК."},
+                    question,
+                ))
+                self.assertFalse(document_occurrence_item_matches(
+                    {"text": "Категории документов и предельные цены."},
+                    question,
+                ))
         self.assertFalse(document_occurrence_item_matches(
             {"text": "Указаны категории документов и предельные цены."},
             question,
@@ -548,6 +615,43 @@ class PrismQueryTests(unittest.TestCase):
 
         self.assertEqual({item["file"] for item in seeds}, {"categories.docx", "transfer.docx", "network.docx"})
         self.assertTrue(any("price-category-related:6" in item["matched_queries"] for item in seeds))
+
+    def test_generic_price_category_alias_seeds_multiple_documents(self):
+        class Node:
+            def __init__(self, text, metadata):
+                self.text = text
+                self.metadata = metadata
+
+        agent = object.__new__(RAGAgent)
+        agent._all_nodes = [
+            Node(
+                "ЦК — ценовая категория потребителя.",
+                {"file_name": "rules.docx", "section_path": "Термины"},
+            ),
+            Node(
+                "Выбор ценовой категории выполняется в объекте потребления.",
+                {"file_name": "method.docx", "section_path": "Настройка"},
+            ),
+        ]
+
+        seeds = agent._price_category_seed_results("Что значит ЦК в расчётах электроэнергии?")
+
+        self.assertEqual({item["file"] for item in seeds}, {"rules.docx", "method.docx"})
+
+    def test_generic_price_category_context_reserves_one_hit_per_document(self):
+        ranked = [
+            {"file": "rules.docx", "score": 9.0, "text": "ЦК — ценовая категория."},
+            {"file": "rules.docx", "score": 8.0, "text": "Первая ценовая категория."},
+            {"file": "method.docx", "score": 7.0, "text": "Выбор ценовой категории."},
+        ]
+
+        selected = diversify_context_results(
+            ranked,
+            "Что значит ЦК в расчётах электроэнергии?",
+            2,
+        )
+
+        self.assertEqual([item["file"] for item in selected], ["rules.docx", "method.docx"])
 
     def test_document_occurrence_seed_covers_every_directly_matching_document(self):
         class Node:

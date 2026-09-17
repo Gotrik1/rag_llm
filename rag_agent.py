@@ -373,15 +373,29 @@ def document_occurrence_terms(question: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(terms))
 
 
+def mentions_price_category_subject(value: str) -> bool:
+    """Recognize the generic price-category subject, including the ``ЦК`` alias."""
+    normalized = (value or "").lower().replace("ё", "е")
+    return bool(
+        re.search(r"\bценов\w*\s+категор\w*\b", normalized)
+        or re.search(r"(?<![а-яa-z])(?:[1-6]\s*)?цк(?![а-яa-z])", normalized)
+    )
+
+
 def is_document_occurrence_question(question: str) -> bool:
     normalized = (question or "").lower().replace("ё", "е")
     has_list_intent = bool(re.search(
         r"\b(?:в\s+каких\s+документ\w*|какие\s+документ\w*|"
         r"где\s+(?:фигурир\w*|упомина\w*|встреча\w*)|"
-        r"перечисл\w*\s+документ\w*)\b",
+        r"перечисл\w*\s+(?:все\s+)?(?:доступн\w*\s+)?документ\w*|"
+        r"найд\w*\s+(?:все\s+)?(?:доступн\w*\s+)?документ\w*)\b",
         normalized,
     ))
-    return has_list_intent and bool(price_category_number(normalized) or document_occurrence_terms(normalized))
+    return has_list_intent and bool(
+        price_category_number(normalized)
+        or mentions_price_category_subject(normalized)
+        or document_occurrence_terms(normalized)
+    )
 
 
 def document_occurrence_item_matches(item: dict, question: str) -> bool:
@@ -389,6 +403,14 @@ def document_occurrence_item_matches(item: dict, question: str) -> bool:
     category = price_category_number(question)
     if category:
         return price_category_item_matches(item, category)
+
+    if mentions_price_category_subject(question):
+        haystack = "\n".join((
+            str(item.get("section_path", "")),
+            str(item.get("section_title", "")),
+            str(item.get("text", "")),
+        ))
+        return mentions_price_category_subject(haystack)
 
     terms = document_occurrence_terms(question)
     if not terms:
@@ -430,11 +452,17 @@ def deterministic_query_understanding(question: str) -> QueryUnderstanding:
         facets.append("calculation")
     if re.search(r"\b(?:порядок|этап\w*|как\s+(?:примен\w*|определ\w*|выполн\w*))\b", normalized):
         facets.append("procedure")
-    if re.search(r"\b(?:услови\w*|огранич\w*|требован\w*)\b", normalized):
+    if re.search(
+        r"\b(?:услови\w*|огранич\w*|требован\w*|необходим\w*|должн\w*|"
+        r"готовност\w*|настро\w*|завед\w*|провер\w*|не\s+сформир\w*)\b",
+        normalized,
+    ):
         facets.append("conditions")
     if re.search(
         r"\b(?:в\s+каких\s+документ\w*|какие\s+документ\w*|"
-        r"где\s+(?:фигурир\w*|упомина\w*|встреча\w*)|перечисл\w*\s+документ\w*)\b",
+        r"где\s+(?:фигурир\w*|упомина\w*|встреча\w*)|"
+        r"перечисл\w*\s+(?:все\s+)?(?:доступн\w*\s+)?документ\w*|"
+        r"найд\w*\s+(?:все\s+)?(?:доступн\w*\s+)?документ\w*)\b",
         normalized,
     ):
         facets.append("list")
@@ -452,6 +480,17 @@ def deterministic_query_understanding(question: str) -> QueryUnderstanding:
         if "procedure" in facets:
             queries.append(f"{term} порядок определения стоимости и цены этапы расчета")
         queries.extend(price_variants[1:])
+
+    is_rre = bool(re.search(r"\b(?:ррэ|розничн\w*\s+рын\w*)\b", normalized))
+    if is_rre and "conditions" in facets:
+        # Operational prerequisite questions are phrased very differently by
+        # users.  Expand them into stable concepts used in RRE documentation,
+        # without pinning retrieval to a particular file name or revision.
+        queries.extend((
+            "РРЭ договорные условия объекты потребления тарифная схема текущий расчет обязательные данные",
+            "договор РРЭ объект потребления ЭПУ тарифная схема признак текущий расчет",
+            "модули основная информация необходимая для определения стоимости электроэнергии на РРЭ",
+        ))
 
     seen: set[str] = set()
     deduped: list[str] = []
@@ -501,7 +540,19 @@ def parse_query_understanding(raw: str, question: str) -> QueryUnderstanding:
             facets.append(value)
 
     raw_queries = payload.get("retrieval_queries") if isinstance(payload.get("retrieval_queries"), list) else []
-    candidates = [canonical, *[str(value) for value in raw_queries], *fallback.retrieval_queries]
+    fallback_queries = [
+        query for query in fallback.retrieval_queries
+        if query.casefold() != fallback.canonical_question.casefold()
+    ]
+    # Reserve three slots for deterministic typo/domain safeguards and two for
+    # useful LLM reformulations. This keeps both layers effective under the
+    # six-query cap instead of allowing either one to crowd out the other.
+    candidates = [
+        canonical,
+        *fallback_queries[:3],
+        *[str(value) for value in raw_queries],
+        *fallback_queries[3:],
+    ]
     queries: list[str] = []
     seen: set[str] = set()
     for candidate in candidates:
@@ -1023,7 +1074,15 @@ def diversify_context_results(ranked: list[dict], question: str, top_k: int) -> 
     requested = sorted(requested_formula_terms(question), key=lambda value: (-len(value), value))
     section_numbers = requested_section_numbers(question)
     category = price_category_number(question)
-    category_matches = [item for item in ranked if category and price_category_item_matches(item, category)]
+    generic_category = not category and mentions_price_category_subject(question)
+    category_matches = [
+        item for item in ranked
+        if (
+            category and price_category_item_matches(item, category)
+        ) or (
+            generic_category and document_occurrence_item_matches(item, question)
+        )
+    ]
 
     # This is a positive set lookup: one strongest direct hit per document,
     # without padding the result with documents that do not contain the entity.
@@ -1042,6 +1101,20 @@ def diversify_context_results(ranked: list[dict], question: str, top_k: int) -> 
     def add(item: dict) -> None:
         selected.append(item)
         selected_ids.add(id(item))
+
+    if generic_category:
+        # Generic ЦК questions usually need both normative and implementation
+        # evidence.  Reserve one strongest direct hit per document before
+        # filling the remaining context with additional chunks.
+        selected_sources: set[str] = set()
+        for item in category_matches:
+            source = user_facing_source_name(item.get("file", "")).casefold()
+            if source in selected_sources:
+                continue
+            add(item)
+            selected_sources.add(source)
+            if len(selected) >= min(top_k, 6):
+                break
 
     if category:
         # Keep the best definition/calculation clauses, then ensure every other
@@ -3332,7 +3405,7 @@ class RAGAgent:
     def _price_category_seed_results(self, question: str, limit: int = 60) -> list[dict]:
         """Seed direct definition and calculation clauses for one price category."""
         category = price_category_number(question)
-        generic_category = bool(re.search(r"ценов\w*\s+категор\w*", question, re.IGNORECASE))
+        generic_category = mentions_price_category_subject(question)
         if not category and not generic_category:
             return []
         source_signals: dict[str, dict[str, bool]] = {}

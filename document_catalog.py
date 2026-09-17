@@ -13,6 +13,13 @@ _SEMVER_RE = re.compile(
     r"(?<![0-9A-Za-zА-Яа-яЁё])(?:v|ver(?:sion)?|версия|ред(?:акция)?|rev)\s*[-_.]?\s*(\d+(?:[._-]\d+){0,3})",
     re.IGNORECASE,
 )
+# Russian users often abbreviate "версия" as a trailing "в.1" or "в 1".
+# Restrict this alias to the end of a file stem: accepting a bare "в" in the
+# middle would misread the ordinary Russian preposition as a revision marker.
+_TRAILING_RU_VERSION_RE = re.compile(
+    r"(?<!\S)в(?:\.|\s)\s*(\d+(?:[._-]\d+){0,3})\s*$",
+    re.IGNORECASE,
+)
 _DATE_RE = re.compile(r"(?<!\d)(20\d{2})[-_.](0?[1-9]|1[0-2])[-_.](0?[1-9]|[12]\d|3[01])(?!\d)")
 _RU_DATE_RE = re.compile(r"(?<!\d)(0?[1-9]|[12]\d|3[01])[._-](0?[1-9]|1[0-2])[._-](20\d{2})(?!\d)")
 _YEAR_RE = re.compile(r"(?i)(?:ред(?:акция)?|версия|от)\s*(20\d{2})(?!\d)")
@@ -60,6 +67,8 @@ def detect_document_version(document: dict[str, Any]) -> dict[str, Any]:
             candidates.append((value, "metadata"))
     for value, source in candidates:
         semantic = _SEMVER_RE.search(value)
+        if semantic is None and source == "file_name":
+            semantic = _TRAILING_RU_VERSION_RE.search(value)
         if semantic is None and source == "metadata":
             semantic = _BARE_SEMVER_RE.fullmatch(value)
         if semantic:

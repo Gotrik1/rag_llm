@@ -24,6 +24,21 @@ class DocumentCatalogTests(unittest.TestCase):
         self.assertEqual(fields["version_sort_key"], [1, 4, 0, 0])
         self.assertEqual(fields["effective_on"], "2026-09-01")
 
+    def test_trailing_russian_version_abbreviation_is_comparable(self):
+        dotted = document_version_fields({"file_name": "Методика на передачу в.1.docx"})
+        spaced = document_version_fields({"file_name": "Методика расчеты на РРЭ в 1.docx"})
+
+        self.assertEqual(dotted["document_family"], "методика на передачу")
+        self.assertEqual(dotted["version_label"], "1")
+        self.assertEqual(dotted["version_sort_key"], [1, 0, 0, 0])
+        self.assertEqual(spaced["document_family"], "методика расчеты на ррэ")
+        self.assertEqual(spaced["version_label"], "1")
+
+    def test_russian_preposition_inside_name_is_not_a_version(self):
+        fields = document_version_fields({"file_name": "Инструкция по работе в модуле 1.docx"})
+
+        self.assertIsNone(fields["version_label"])
+
     def test_explicit_family_groups_differently_named_revisions(self):
         annotated = annotate_document_versions([
             {

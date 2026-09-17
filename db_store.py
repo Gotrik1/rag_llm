@@ -601,24 +601,39 @@ def _rebuild_document_version_chain(cur: object, group: tuple[object, object, ob
 
 
 def _backfill_document_versions(conn: object) -> None:
-    """Populate persisted version metadata and a same-scope supersession chain."""
+    """Refresh persisted version metadata and a same-scope supersession chain."""
     with conn.cursor() as cur:
         cur.execute(
             """SELECT * FROM documents
-               WHERE deleted_at IS NULL AND document_family IS NULL"""
+               WHERE deleted_at IS NULL"""
         )
-        missing = [dict(row) for row in cur.fetchall()]
-    if missing:
+        documents = [dict(row) for row in cur.fetchall()]
+    changed: list[tuple[dict, dict]] = []
+    for document in documents:
+        fields = _document_version_fields(
+            str(document.get("file_name") or ""),
+            dict(document.get("metadata") or {}),
+        )
+        persisted_key = list(document.get("version_sort_key") or []) or None
+        persisted_effective = str(document.get("effective_on") or "") or None
+        expected_effective = str(fields.get("effective_on") or "") or None
+        if any((
+            document.get("document_family") != fields["document_family"],
+            document.get("version_label") != fields["version_label"],
+            document.get("version_kind") != fields["version_kind"],
+            persisted_key != fields["version_sort_key"],
+            document.get("version_source") != fields["version_source"],
+            persisted_effective != expected_effective,
+        )):
+            changed.append((document, fields))
+    if changed:
         with conn.cursor() as cur:
-            for document in missing:
-                fields = _document_version_fields(
-                    str(document.get("file_name") or ""),
-                    dict(document.get("metadata") or {}),
-                )
+            for document, fields in changed:
                 cur.execute(
                     """UPDATE documents
                        SET document_family = %s, version_label = %s, version_kind = %s,
                            version_sort_key = %s, version_source = %s, effective_on = %s,
+                           supersedes_document_id = NULL,
                            updated_at = now()
                        WHERE id = %s""",
                     (

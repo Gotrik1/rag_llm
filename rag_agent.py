@@ -69,7 +69,7 @@ VECTOR_TOP_K     = 12      # кандидатов от вектора
 # A semantic/chunking change must never reuse an older docstore or vector
 # collection: the two indexes must describe precisely the same corpus.
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25_v12"))
-CACHE_VERSION    = "v34-document-occurrence-selection"
+CACHE_VERSION    = "v35-document-occurrence-intent-verbs"
 QUERY_UNDERSTANDING_VERSION = "v1"
 MAX_OUTPUT_TOKENS = 4056
 
@@ -350,7 +350,7 @@ def price_category_item_matches(item: dict, number: str) -> bool:
 
 
 DOCUMENT_OCCURRENCE_STOP_PREFIXES = (
-    "документ", "напис", "фигур", "упомин", "встреч", "содерж", "перечисл",
+    "документ", "напис", "опис", "фигур", "упомин", "встреч", "содерж", "перечисл",
     "назов", "покаж", "каки", "како", "котор", "информац", "сведен", "привед",
 )
 DOCUMENT_OCCURRENCE_STOP_WORDS = {

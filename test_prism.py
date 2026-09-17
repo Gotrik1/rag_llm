@@ -192,6 +192,10 @@ class PrismQueryTests(unittest.TestCase):
             {"text": "Расчеты выполняются на ОРЭМ."},
             "В каких документах упоминается РРЭ?",
         ))
+        self.assertTrue(document_occurrence_item_matches(
+            {"text": "Упоминаются вторая, третья и четвертая ценовые категории."},
+            "В каких документах описаны ценовые категории?",
+        ))
 
     def test_llm_query_plan_is_validated_and_keeps_identifiers(self):
         plan = parse_query_understanding(

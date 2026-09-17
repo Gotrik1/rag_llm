@@ -785,7 +785,7 @@ async def cancel_job(job_id: str, principal: Principal = Depends(current_princip
     methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
     include_in_schema=False,
 )
-async def legacy_api(operation: str, request: Request, _: Principal = Depends(current_principal)):
+async def legacy_api(operation: str, request: Request, principal: Principal = Depends(current_principal)):
     """Protected async facade for remaining legacy API endpoints."""
     path = f"/api/{operation}"
     raw_body = await request.body()
@@ -796,7 +796,15 @@ async def legacy_api(operation: str, request: Request, _: Principal = Depends(cu
             body = await request.json() if raw_body else {}
         except ValueError as exc:
             raise HTTPException(400, "invalid JSON") from exc
-    payload, status = await asyncio.to_thread(
-        legacy_operation, request.method, path, body, content_type=content_type, raw_body=raw_body
-    )
+    def invoke_scoped_legacy_operation() -> tuple[dict, int]:
+        with request_scope(principal.subject, is_admin="superadmin" in principal.roles):
+            return legacy_operation(
+                request.method,
+                path,
+                body,
+                content_type=content_type,
+                raw_body=raw_body,
+            )
+
+    payload, status = await asyncio.to_thread(invoke_scoped_legacy_operation)
     return JSONResponse(jsonable_encoder(payload), status_code=status)

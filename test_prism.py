@@ -22,6 +22,7 @@ from rag_agent import (
     generate_extractive_value_answer,
     generate_image_transcription_answer,
     matching_explicit_sources,
+    _question_hash,
     parse_query_understanding,
     price_category_number,
     prioritize_scoped_results,
@@ -142,6 +143,17 @@ class PrismQueryTests(unittest.TestCase):
         self.assertNotIn("cost", spec.excluded_chunk_types)
         self.assertNotIn("rate", spec.excluded_chunk_types)
 
+    def test_common_typo_question_is_normalized_before_calculation_retrieval(self):
+        understanding = deterministic_query_understanding(
+            "Как в сиситеме щитаются авнсы по РРЭ?"
+        )
+
+        self.assertEqual(
+            understanding.canonical_question,
+            "Как в системе рассчитываются авансы по РРЭ?",
+        )
+        self.assertIn("calculation", understanding.facets)
+
     def test_price_category_plan_searches_each_requested_facet(self):
         queries = build_targeted_queries("что такое 6ЦК и ак она рассчитывается")
 
@@ -238,6 +250,12 @@ class PrismQueryTests(unittest.TestCase):
         self.assertFalse(from_cache)
         self.assertFalse(agent._generate_grounded_answer.call_args.kwargs["cache_enabled"])
 
+    def test_exact_cache_hash_keeps_price_category_number(self):
+        self.assertNotEqual(
+            _question_hash("Как рассчитывается 1 ЦК?"),
+            _question_hash("Как рассчитывается 6 ЦК?"),
+        )
+
     def test_ask_enables_cross_user_cache_only_for_global_context(self):
         agent = object.__new__(RAGAgent)
         agent.response_cache = Mock()
@@ -266,6 +284,12 @@ class PrismQueryTests(unittest.TestCase):
 
         self.assertEqual(answer, "Ответ")
         self.assertFalse(from_cache)
+        self.assertEqual(agent.last_retrieved_context(), [{
+            "file": "global-method.docx",
+            "section_path": "1 ЦК",
+            "score": 1.0,
+            "text": "Стоимость рассчитывается по правилам документа.",
+        }])
         call = agent._generate_grounded_answer.call_args
         self.assertEqual(call.args[4], "global prompt")
         self.assertTrue(call.kwargs["cache_enabled"])
@@ -480,6 +504,40 @@ class PrismQueryTests(unittest.TestCase):
         self.assertTrue(seeds)
         self.assertEqual(seeds[0]["file"], "r7.docx")
         self.assertIn("section-lexical", seeds[0]["matched_queries"][0])
+
+    def test_calculation_seed_accepts_subject_in_governing_algorithm_section(self):
+        class Node:
+            def __init__(self, text, metadata):
+                self.text = text
+                self.metadata = metadata
+
+        agent = object.__new__(RAGAgent)
+        agent._all_nodes = [
+            Node(
+                "Аванс по договорной цене определяется как процент стоимости договора.",
+                {
+                    "file_name": "rrе-method.docx",
+                    "section_path": "РРЭ > Авансы > Алгоритмы расчета авансов",
+                    "section_title": "Алгоритмы расчета авансов",
+                },
+            ),
+            Node(
+                "В документе начислений хранится статус аванса.",
+                {
+                    "file_name": "charging.docx",
+                    "section_path": "РРЭ > Документы начислений",
+                    "section_title": "Документы начислений",
+                },
+            ),
+        ]
+
+        seeds = agent._lexical_section_seed_results(
+            "Как в системе рассчитываются авансы по РРЭ?"
+        )
+
+        self.assertTrue(seeds)
+        self.assertEqual(seeds[0]["file"], "rrе-method.docx")
+        self.assertIn("section-intent-anchored:аван", seeds[0]["matched_queries"])
 
     def test_rare_heading_terms_beat_shared_market_boilerplate(self):
         class Node:
@@ -764,6 +822,20 @@ class PrismQueryTests(unittest.TestCase):
         warnings = validate_retrieval("дай формулы из пункта 2.1.4", [], spec=spec)
 
         self.assertTrue(any("2.1.4" in warning for warning in warnings))
+
+    def test_validator_warns_when_calculation_context_has_no_governing_section(self):
+        warnings = validate_retrieval(
+            "Как рассчитываются авансы в Системе по РРЭ?",
+            [{
+                "file": "charging.docx",
+                "section_path": "РРЭ > Документы начислений",
+                "section_title": "Документы начислений",
+                "status": "active",
+                "text": "Для документа указывается признак аванса.",
+            }],
+        )
+
+        self.assertTrue(any("алгоритмом, порядком или формулой" in warning for warning in warnings))
 
     def test_parameter_creation_beats_document_and_macro_sections(self):
         results = [

@@ -8,6 +8,7 @@ import web_ui
 class FakeAgent:
     def __init__(self):
         self.calls = []
+        self._last_retrieved_context = None
 
     def ask(
         self,
@@ -28,7 +29,13 @@ class FakeAgent:
             self.calls.append(("excluded_sources", excluded_sources))
         self.calls.append(("source_scope", source_aliases, priority_sources))
         self.calls.append(("shared_cache", shared_cache_sources, shared_system_prompt))
+        self._last_retrieved_context = [context_item("python")]
         return "python answer", [{"file": "python.docx", "section": "1", "score": 1, "text_preview": "evidence"}], False
+
+    def last_retrieved_context(self):
+        if self._last_retrieved_context is None:
+            return None
+        return [dict(item) for item in self._last_retrieved_context]
 
     def retrieve_context(
         self,
@@ -90,6 +97,8 @@ class FlowModeTests(unittest.TestCase):
         self.assertEqual(result["payload"]["answer"], "python answer")
         self.assertEqual(result["payload"]["flow_mode"], "python")
         self.assertIn(("ask", "Что сказано?"), agent.calls)
+        self.assertFalse(any(call[0] == "retrieve" for call in agent.calls))
+        self.assertEqual(result["payload"]["context"][0]["file"], "python.docx")
 
     def test_missing_chat_id_uses_active_workspace_chat(self):
         result, agent = self.invoke("python", include_chat=False)

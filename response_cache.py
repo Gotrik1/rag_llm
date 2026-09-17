@@ -17,8 +17,11 @@ except ImportError:  # Allows local code inspection before runtime dependencies 
     redis = None  # type: ignore[assignment]
 
 
-DEFAULT_TTL_SECONDS = 7 * 24 * 60 * 60
-CACHE_NAMESPACE = "rag:answer:"
+# An answer is only reusable while both the prompt policy and the retrieved
+# global corpus snapshot are current.  A day preserves cross-user reuse for
+# recurring questions without retaining a long tail of abandoned exact keys.
+DEFAULT_TTL_SECONDS = 24 * 60 * 60
+CACHE_NAMESPACE = "rag:answer:v2:"
 
 
 class ResponseCache:
@@ -73,8 +76,16 @@ class ResponseCache:
         if self.client is None:
             return
         try:
-            keys = list(self.client.scan_iter(match=f"{CACHE_NAMESPACE}*", count=200))
-            if keys:
-                self.client.delete(*keys)
+            # Keep invalidation bounded even when the cache has accumulated a
+            # large number of expired-soon keys.  Materialising every key at
+            # once can itself become the next memory spike.
+            batch: list[str] = []
+            for key in self.client.scan_iter(match=f"{CACHE_NAMESPACE}*", count=200):
+                batch.append(key)
+                if len(batch) >= 200:
+                    self.client.delete(*batch)
+                    batch.clear()
+            if batch:
+                self.client.delete(*batch)
         except Exception:
             pass

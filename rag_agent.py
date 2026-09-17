@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import threading
+import unicodedata
 import time
 import zipfile
 from contextlib import contextmanager
@@ -68,7 +69,7 @@ VECTOR_TOP_K     = 12      # кандидатов от вектора
 # A semantic/chunking change must never reuse an older docstore or vector
 # collection: the two indexes must describe precisely the same corpus.
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25_v12"))
-CACHE_VERSION    = "v31-price-category-source-coverage"
+CACHE_VERSION    = "v32-exact-unicode-cache"
 QUERY_UNDERSTANDING_VERSION = "v1"
 MAX_OUTPUT_TOKENS = 4056
 
@@ -240,6 +241,28 @@ FORMULA_QUERY_MARKERS = (
     "уравнение", "уравнении", "расчетное правило", "расчётное правило",
 )
 
+# These are deliberately limited to unambiguous, frequent keyboard/transposition
+# errors observed in real questions.  General fuzzy correction would be unsafe
+# for regulatory terminology and identifiers, so semantic planning still sees
+# the original wording for everything outside this list.
+HIGH_CONFIDENCE_QUERY_TYPOS = {
+    "ак": "как",
+    "авнсы": "авансы",
+    "расчитывается": "рассчитывается",
+    "расчитываются": "рассчитываются",
+    "сиситеме": "системе",
+    "щитается": "рассчитывается",
+    "щитаются": "рассчитываются",
+}
+
+# A calculation request needs evidence from a governing calculation/procedure
+# section, not merely a mention of the subject somewhere in a document.
+CALCULATION_SECTION_KEYS = frozenset({"алго", "форм", "поря", "расч", "начи"})
+GENERIC_CALCULATION_QUERY_KEYS = frozenset({
+    "расс", "расч", "форм", "поря", "сист", "докум", "разд", "глав",
+    "прав", "услов", "мето", "данн", "пери", "объе",
+})
+
 
 def is_formula_question(question: str) -> bool:
     """Recognise every common Russian grammatical form of a formula request."""
@@ -251,8 +274,8 @@ def asks_for_calculation(question: str) -> bool:
     """Recognise explanatory calculation requests without forcing formula-only mode."""
     normalized = (question or "").lower().replace("ё", "е")
     return is_formula_question(question) or bool(re.search(
-        r"\b(?:как\s+(?:(?:она|он|оно|это|ее)\s+)?рассчит\w*|"
-        r"рассчитывается|расчет\w*|порядок\s+расчета)\b",
+        r"\b(?:рассчит\w*|рассчитыва\w*|расчет\w*|"
+        r"порядок\s+расчета)\b",
         normalized,
     ))
 
@@ -260,7 +283,12 @@ def asks_for_calculation(question: str) -> bool:
 def normalize_user_question(question: str) -> tuple[str, tuple[str, ...]]:
     """Apply only high-confidence corrections before semantic planning."""
     original = re.sub(r"\s+", " ", (question or "").strip())
-    normalized = re.sub(r"(?i)(?<![а-яё])ак(?![а-яё])", "как", original)
+    typo_pattern = "|".join(sorted(map(re.escape, HIGH_CONFIDENCE_QUERY_TYPOS), key=len, reverse=True))
+    normalized = re.sub(
+        rf"(?i)(?<![а-яё])(?:{typo_pattern})(?![а-яё])",
+        lambda match: HIGH_CONFIDENCE_QUERY_TYPOS[match.group(0).casefold()],
+        original,
+    )
     normalized = re.sub(
         r"(?i)(?<![а-яёa-z0-9])(\d+)\s*цк(?![а-яёa-z0-9])",
         lambda match: f"{match.group(1)} ЦК",
@@ -341,7 +369,7 @@ def deterministic_query_understanding(question: str) -> QueryUnderstanding:
     if re.search(r"\b(?:что\s+такое|что\s+значит|определение|расшифр\w*)\b", normalized):
         facets.append("definition")
     if re.search(
-        r"\b(?:как\s+(?:(?:она|он|оно|это|ее|её)\s+)?рассчит\w*|расчет\w*|расчёт\w*|формул\w*)\b",
+        r"\b(?:рассчит\w*|рассчитыва\w*|расчет\w*|расчёт\w*|формул\w*)\b",
         normalized,
     ):
         facets.append("calculation")
@@ -475,12 +503,16 @@ def refine_prism_query(question: str) -> PrismQuery:
 
 
 def _question_hash(question: str) -> str:
-    """Нормализуем и хэшируем вопрос для кэша."""
-    normalized = " ".join(
-        c for c in question.lower() if c.isalpha() or c.isspace()
-    ).split()
-    normalized_str = " ".join(normalized)
-    return hashlib.sha256(f"{CACHE_VERSION}:{normalized_str}".encode()).hexdigest()
+    """Hash the complete normalized cache input without erasing semantics.
+
+    The response cache is exact by design.  In particular, numeric labels such
+    as ``1 ЦК`` and ``6 ЦК`` must never share an entry; stripping digits here
+    could make the planner or answer cache return evidence for another price
+    category.  The input is still never stored in Redis, only its SHA-256 hash.
+    """
+    normalized = unicodedata.normalize("NFKC", question).casefold()
+    normalized = " ".join(normalized.split())
+    return hashlib.sha256(f"{CACHE_VERSION}:{normalized}".encode()).hexdigest()
 
 
 def _read_docx_text(path: Path) -> str:
@@ -1024,6 +1056,31 @@ def validate_retrieval(question: str, context: list[dict], answer: str = "", spe
         formulas = extract_formula_lines_from_texts([item.get("text", "") for item in context], question)
         if not formulas:
             warnings.append("В отобранном evidence не выделены формулы или расчетные правила.")
+
+    # A generic mention of the requested entity is not sufficient for an
+    # explanatory calculation answer.  When the question names a subject,
+    # require an evidence section that also signals a calculation, procedure,
+    # formula, or algorithm.  This surfaces a retrieval miss instead of
+    # confidently reporting that the corpus lacks an answer.
+    query_keys = set(lexical_term_keys(" ".join(section_query_terms(question))))
+    subject_keys = query_keys - GENERIC_CALCULATION_QUERY_KEYS
+    if asks_for_calculation(question) and subject_keys:
+        has_governing_evidence = any(
+            bool(subject_keys & set(lexical_term_keys(" ".join([
+                str(item.get("section_path", "")),
+                str(item.get("section_title", "")),
+            ]))))
+            and bool(CALCULATION_SECTION_KEYS & set(lexical_term_keys(" ".join([
+                str(item.get("section_path", "")),
+                str(item.get("section_title", "")),
+            ]))))
+            for item in context
+            if item.get("status") != "deleted"
+        )
+        if not has_governing_evidence:
+            warnings.append(
+                "Для вопроса о расчете не найден раздел с алгоритмом, порядком или формулой по запрошенной сущности."
+            )
 
     return warnings
 
@@ -2228,7 +2285,7 @@ class RAGAgent:
         self._load_nodes_from_docstore()
         self._docstore_mtime_ns = self.docstore_path.stat().st_mtime_ns if self.docstore_path.exists() else 0
 
-        print(f"✓ Агент готов. Документов в docstore: {len(self._all_nodes)} чанков")
+        print(f"[OK] Агент готов. Документов в docstore: {len(self._all_nodes)} чанков")
 
     @property
     def last_generation_from_cache(self) -> bool:
@@ -2421,7 +2478,7 @@ class RAGAgent:
         # question itself is identical.
         self.clear_cache()
 
-        print(f"✓ Проиндексировано {len(nodes)} чанков из {p.name}")
+        print(f"[OK] Проиндексировано {len(nodes)} чанков из {p.name}")
         return len(nodes)
 
     def delete_source(self, path: str) -> int:
@@ -2463,7 +2520,7 @@ class RAGAgent:
         # Cached answers may cite a deleted source even when no local node was
         # found (for example after a previously interrupted cleanup).
         self.clear_cache()
-        print(f"✓ Удалено {len(node_ids)} чанков из {target.name}")
+        print(f"[OK] Удалено {len(node_ids)} чанков из {target.name}")
         return len(node_ids)
 
     def understand_query(self, question: str) -> QueryUnderstanding:
@@ -2537,6 +2594,7 @@ class RAGAgent:
         if not hasattr(self, "_generation_state"):
             self._generation_state = threading.local()
         self._generation_state.from_cache = False
+        self._generation_state.retrieved_context = []
         search_question = (retrieval_query or question).strip()
 
         self._refresh_docstore_if_changed()
@@ -2568,6 +2626,10 @@ class RAGAgent:
                 item for item in context
                 if category and price_category_item_matches(item, category)
             ]
+        # The UI must show exactly the evidence used to produce the answer.
+        # Keeping it request-thread-local avoids a second, potentially divergent
+        # retrieval pass and cannot cross-contaminate simultaneous chats.
+        self._generation_state.retrieved_context = [dict(item) for item in context]
         calculations = extract_formula_lines_from_texts([item["text"] for item in context], understood_question)
         answer = (
             generate_document_occurrence_answer(understood_question, context)
@@ -2606,6 +2668,14 @@ class RAGAgent:
         } for item in context]
 
         return answer, sources, bool(self.last_generation_from_cache)
+
+    def last_retrieved_context(self) -> list[dict] | None:
+        """Return this request's retrieval evidence, if ``ask`` has run."""
+        state = getattr(self, "_generation_state", None)
+        context = getattr(state, "retrieved_context", None)
+        if context is None:
+            return None
+        return [dict(item) for item in context]
 
     def _generate_grounded_answer(
         self,
@@ -2666,7 +2736,14 @@ class RAGAgent:
 
 ОТВЕТ:
 """
-        generation_key = _question_hash(f"generation\n{self.llm_model}\n{prompt}")
+        # A dedicated worker can atomically replace the docstore while web
+        # workers stay alive.  Include its snapshot marker so a global answer
+        # never survives a corpus update merely because its old prompt happens
+        # to look identical.
+        corpus_snapshot = getattr(self, "_docstore_mtime_ns", 0)
+        generation_key = _question_hash(
+            f"generation\n{corpus_snapshot}\n{self.llm_model}\n{prompt}"
+        )
         cached = None
         if cache_enabled:
             with _pipeline_span("cache.lookup") as span:
@@ -2712,6 +2789,8 @@ class RAGAgent:
             return []
 
         query_key_set = set(query_keys)
+        calculation_intent = asks_for_calculation(question)
+        anchor_keys = query_key_set - GENERIC_CALCULATION_QUERY_KEYS
         prepared: list[tuple[object, dict, str, str, str, tuple[str, ...], set[str]]] = []
         heading_frequency: dict[str, int] = {key: 0 for key in query_key_set}
         for node in self._all_nodes:
@@ -2738,7 +2817,12 @@ class RAGAgent:
             matched = query_key_set & section_key_set
             common_run = longest_common_token_run(query_keys, section_keys)
             minimum_matches = max(3, min(6, round(len(query_key_set) * 0.35)))
-            if common_run < 3 and len(matched) < minimum_matches:
+            calculation_anchor = (
+                calculation_intent
+                and bool(matched & anchor_keys)
+                and bool(section_key_set & CALCULATION_SECTION_KEYS)
+            )
+            if common_run < 3 and len(matched) < minimum_matches and not calculation_anchor:
                 continue
 
             coverage = len(matched) / len(query_key_set)
@@ -2757,6 +2841,11 @@ class RAGAgent:
                 for key in matched
             ) / max(1, len(matched))
             score = 2.0 + common_run * 0.4 + coverage * 3.0 + density + body_coverage * 2.0 + rarity_bonus
+            if calculation_anchor:
+                # One exact domain anchor in a governing "algorithm/formula/
+                # procedure/calculation" heading is more meaningful than three
+                # generic words such as "system" and "calculation".
+                score += 6.0
             if len(section_text) > 900:
                 score -= 1.5
             chunk_meta = {
@@ -2771,7 +2860,10 @@ class RAGAgent:
                 "file": meta.get("file_name", meta.get("file_path", "?")),
                 "score": round(score, 4),
                 "text": text,
-                "matched_queries": [f"section-lexical:{common_run}"],
+                "matched_queries": [
+                    f"section-intent-anchored:{','.join(sorted(matched & anchor_keys))}"
+                    if calculation_anchor else f"section-lexical:{common_run}"
+                ],
                 **chunk_meta,
             }))
 
@@ -3394,7 +3486,7 @@ class RAGAgent:
 
     def clear_cache(self):
         self.response_cache.clear()
-        print("✓ Кэш очищен")
+        print("[OK] Кэш очищен")
 
     def bm25_search(self, query: str, top_k: int = 10):
         """Диагностика: прямой BM25 поиск."""

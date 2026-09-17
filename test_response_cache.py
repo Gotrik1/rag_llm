@@ -18,7 +18,9 @@ class FakeRedis:
 
     def scan_iter(self, match, count):
         prefix = match.removesuffix("*")
-        yield from (key for key in self.data if key.startswith(prefix))
+        # Redis SCAN is cursor-based and remains usable while keys are
+        # deleted.  Snapshot the in-memory fake so tests model that contract.
+        yield from (key for key in tuple(self.data) if key.startswith(prefix))
 
     def delete(self, *keys):
         for key in keys:
@@ -45,6 +47,26 @@ class ResponseCacheTests(unittest.TestCase):
 
         self.assertIsNone(cache.get("abc"))
         self.assertEqual(client.data["other:key"], "keep")
+
+    def test_clear_deletes_in_bounded_scan_batches(self):
+        class TrackingRedis(FakeRedis):
+            def __init__(self):
+                super().__init__()
+                self.delete_batch_sizes = []
+
+            def delete(self, *keys):
+                self.delete_batch_sizes.append(len(keys))
+                super().delete(*keys)
+
+        client = TrackingRedis()
+        cache = ResponseCache(client=client)
+        for index in range(401):
+            cache.set(f"entry-{index}", {"answer": "готово"})
+
+        cache.clear()
+
+        self.assertEqual(client.data, {})
+        self.assertEqual(client.delete_batch_sizes, [200, 200, 1])
 
     def test_payload_does_not_require_a_question_or_prompt(self):
         client = FakeRedis()

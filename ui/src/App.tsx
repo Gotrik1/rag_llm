@@ -1173,19 +1173,34 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
 
   const runDebug = useCallback(async () => {
     if (!lastQuestion || isRunning || isDebugging) return;
-    setIsDebugging(true);
     setDebugError("");
     setActiveTab("debug");
 
+    // Debug must describe the same evidence that generated the visible
+    // answer.  The response already contains it, so a second retrieval would
+    // be slower and could select a different set of chunks.
+    if (lastResult) {
+      setDebugResult({
+        formulas: lastResult.formulas,
+        context: lastResult.context,
+        warnings: lastResult.warnings,
+        elapsed_s: lastResult.elapsed_s,
+        usage: lastResult.usage
+      });
+      return;
+    }
+
+    setIsDebugging(true);
+
     try {
-      const data = await postJson<DebugResponse>("/api/debug", { question: lastQuestion }, DEBUG_TIMEOUT_MS);
+      const data = await postJson<DebugResponse>("/api/debug", { question: lastQuestion, chat_id: activeChatId }, DEBUG_TIMEOUT_MS);
       setDebugResult(data);
     } catch (error) {
       setDebugError(error instanceof Error ? error.message : "Ошибка debug-запроса");
     } finally {
       setIsDebugging(false);
     }
-  }, [isDebugging, isRunning, lastQuestion]);
+  }, [activeChatId, isDebugging, isRunning, lastQuestion, lastResult]);
 
   const uploadFiles = useCallback(async (target: UploadTarget) => {
     if (target !== uploadTarget || !selectedFiles.length || isUploading) return;

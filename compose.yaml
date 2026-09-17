@@ -16,7 +16,7 @@ x-app-environment: &app-environment
   REDIS_PORT: "6379"
   RESPONSE_CACHE_HOST: response-cache
   RESPONSE_CACHE_PORT: "6379"
-  RESPONSE_CACHE_TTL_SECONDS: ${RESPONSE_CACHE_TTL_SECONDS:-604800}
+  RESPONSE_CACHE_TTL_SECONDS: ${RESPONSE_CACHE_TTL_SECONDS:-86400}
   REDIS_PASSWORD_FILE: /run/secrets/redis_password
   RAG_SECRET_KEY_FILE: /run/secrets/app_secret_key
   QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
@@ -135,7 +135,7 @@ services:
     command:
       - /bin/sh
       - -ec
-      - exec redis-server --save "" --appendonly no --requirepass "$$(cat /run/secrets/redis_password)" --maxmemory "${RESPONSE_CACHE_MAXMEMORY:-256mb}" --maxmemory-policy allkeys-lru
+      - exec redis-server --save "" --appendonly no --requirepass "$$(cat /run/secrets/redis_password)" --maxmemory "${RESPONSE_CACHE_MAXMEMORY:-256mb}" --maxmemory-policy allkeys-lfu
     secrets:
       - redis_password
     networks:

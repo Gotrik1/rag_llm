@@ -1397,13 +1397,18 @@ class Handler(BaseHTTPRequestHandler):
             if excluded_sources:
                 ask_options["excluded_sources"] = excluded_sources
             answer, sources, from_cache = agent.ask(question, scoped_prompt, profile["id"], **ask_options)
-            context = agent.retrieve_context(
-                retrieval_question,
-                TOP_K,
-                excluded_sources=excluded_sources or None,
-                source_aliases=source_aliases,
-                priority_sources=priority_sources,
-            )
+            context_reader = getattr(agent, "last_retrieved_context", None)
+            context = context_reader() if callable(context_reader) else None
+            # Keep compatibility with lightweight test doubles and external
+            # agents while production RAG reuses the exact evidence from ask().
+            if context is None:
+                context = agent.retrieve_context(
+                    retrieval_question,
+                    TOP_K,
+                    excluded_sources=excluded_sources or None,
+                    source_aliases=source_aliases,
+                    priority_sources=priority_sources,
+                )
         elif mode == "rust":
             python_items = agent.retrieve_context(
                 retrieval_question,
@@ -1489,10 +1494,36 @@ class Handler(BaseHTTPRequestHandler):
         if not question:
             self.send_json({"error": "empty question"}, 400)
             return
+        chat_id = str(body.get("chat_id", "")).strip()
+        if not chat_id:
+            workspace = get_workspace(*storage_defaults())
+            chat_id = str(workspace.get("active_chat_id") or "").strip()
+        if not chat_id:
+            self.send_json({"error": "active chat not found"}, 409)
+            return
+        scope = get_project_conversation(chat_id)
+        if scope is None:
+            self.send_json({"error": "chat not found"}, 404)
+            return
+        excluded_sources, source_aliases = retrieval_document_scope(scope, chat_id)
+        priority_sources = {
+            source for source in source_aliases
+            if Path(source).name.casefold() not in shared_global_document_sources()
+        }
+        retrieval_question = contextualize_retrieval_question(question, scope, chat_id)
         with _request_lock:
             mode = load_flow_mode()
-            python_items = get_agent().retrieve_context(question, TOP_K)
-            rust_items = filter_rust_context(question, rust_context(question)) if mode != "python" else []
+            python_items = get_agent().retrieve_context(
+                retrieval_question,
+                TOP_K,
+                excluded_sources=excluded_sources or None,
+                source_aliases=source_aliases,
+                priority_sources=priority_sources,
+            )
+            rust_items = filter_scoped_context(
+                filter_rust_context(retrieval_question, rust_context(retrieval_question)),
+                excluded_sources,
+            ) if mode != "python" else []
             context = python_items if mode == "python" else fuse_contexts(python_items, rust_items, TOP_K)
         formulas = requested_response_formulas(context, question)
         warnings = validate_retrieval(question, context)

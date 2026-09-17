@@ -48,6 +48,17 @@ class AsgiFoundationTests(unittest.TestCase):
         response = self.client.get("/api/me", headers={"Authorization": "Bearer ordinary-user:"})
         self.assertEqual(response.status_code, 403)
 
+    def test_legacy_routes_bind_principal_to_request_scope(self):
+        with patch("asgi_app.legacy_operation", return_value=({"ok": True}, 200)), \
+             patch("asgi_app.request_scope") as request_scope:
+            response = self.client.post("/api/debug", json={"question": "Проверка", "chat_id": "chat-1"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(any(
+            call.args == ("rag-superadmin",) and call.kwargs == {"is_admin": True}
+            for call in request_scope.call_args_list
+        ))
+
     def test_ask_keeps_existing_payload_and_runs_off_event_loop(self):
         payload = {"answer": "ok", "flow_mode": "python"}
         with patch("asgi_app.run_ask", return_value=payload) as ask:

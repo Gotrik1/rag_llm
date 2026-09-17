@@ -1018,6 +1018,38 @@ class PrismQueryTests(unittest.TestCase):
         }]
         self.assertEqual(select_prism_evidence(evidence, spec, 3), evidence)
 
+    def test_rre_prerequisite_questions_keep_governing_cost_evidence(self):
+        questions = (
+            "Для расчётов в системе по договорам РРЭ какие условия должны быть выполнены?",
+            "Что необходимо настроить перед запуском расчёта договора РРЭ?",
+            "Какие объекты, условия и тарифы требуются для расчёта РРЭ?",
+            "Почему расчёт по договору РРЭ может не сформироваться?",
+            "Дай чек-лист готовности договора РРЭ к расчёту.",
+        )
+        evidence = [{
+            "file": "Методика расчеты на РРЭ в 1.docx",
+            "section_path": "РРЭ > Договор и договорные условия",
+            "section_title": "Договорные условия",
+            "status": "active",
+            "chunk_type": "cost",
+            "score": 8.0,
+            "text": "До расчёта должны быть настроены договор, объект потребления и тарифная схема.",
+        }]
+
+        for question in questions:
+            with self.subTest(question=question):
+                spec = refine_prism_query(question)
+                self.assertIn("conditions", deterministic_query_understanding(question).facets)
+                self.assertNotIn("cost", spec.excluded_chunk_types)
+                self.assertNotIn("rate", spec.excluded_chunk_types)
+                self.assertEqual(select_prism_evidence(evidence, spec, 3), evidence)
+
+    def test_explicit_no_cost_request_still_excludes_cost_evidence(self):
+        spec = refine_prism_query("Как рассчитывается объём без стоимости?")
+
+        self.assertIn("cost", spec.excluded_chunk_types)
+        self.assertIn("rate", spec.excluded_chunk_types)
+
     def test_rare_heading_terms_beat_shared_market_boilerplate(self):
         class Node:
             def __init__(self, text, metadata):

@@ -594,8 +594,12 @@ def refine_prism_query(question: str) -> PrismQuery:
 
     excluded: list[str] = ["history"]
     is_value_question = detect_query_intent(question) == "value"
+    retrieval_facets = set(deterministic_query_understanding(question).facets)
+    needs_calculation_context = bool(
+        retrieval_facets.intersection({"calculation", "procedure", "conditions"})
+    )
     explicitly_excludes_cost = any(marker in normalized for marker in ("без стоимости", "не стоимость", "кроме стоимости"))
-    if is_value_question or explicitly_excludes_cost:
+    if explicitly_excludes_cost or (is_value_question and not needs_calculation_context):
         excluded.extend(("cost", "rate"))
 
     return PrismQuery(

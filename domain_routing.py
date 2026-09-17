@@ -14,6 +14,16 @@ RULES_PATH = Path(__file__).with_name("config") / "retrieval_domains.json"
 VALID_RETRIEVAL_FOCUS = {"auto", "rre", "orem", "both"}
 
 
+def _source_reservation_key(value: object) -> str:
+    """Group one uploaded document with its generated retrieval companions."""
+    name = Path(str(value or "")).name.casefold()
+    while re.match(r"^[0-9a-f]{32}_", name):
+        name = name[33:]
+    stem = Path(name).stem
+    stem = re.sub(r"_(?:rag|definitions|formulas|toc|abbreviations)$", "", stem)
+    return stem or name
+
+
 @dataclass(frozen=True)
 class DomainRouting:
     focus: str
@@ -137,12 +147,33 @@ def apply_domain_routing(
     def reserve(item: dict) -> None:
         reserved.append(item)
         reserved_ids.add(id(item))
-        reserved_sources.add(Path(str(item.get("file", ""))).name.casefold())
+        reserved_sources.add(_source_reservation_key(item.get("file")))
 
     for domain in routing.active_domains:
         match = next((item for item in enriched if domain in item.get("knowledge_domains", [])), None)
         if match is not None:
             reserve(match)
+
+    # A direct category hit is stronger evidence of document relevance than a
+    # generic high-score relationship expansion. Preserve one such hit per
+    # logical document before applying the lossy candidate cap. Generated
+    # companions (for example r12_rag.md and r12_formulas.md) share one key and
+    # therefore cannot consume the whole reservation budget.
+    category_source_quota = min(6, max(3, top_k // 2))
+    category_sources = 0
+    for item in enriched:
+        if not any(
+            str(query).startswith("price-category-exact:")
+            for query in item.get("matched_queries", [])
+        ):
+            continue
+        source = _source_reservation_key(item.get("file"))
+        if not source or source in reserved_sources:
+            continue
+        reserve(item)
+        category_sources += 1
+        if category_sources >= category_source_quota:
+            break
 
     direct_source_quota = min(6, max(2, top_k // 2))
     direct_sources = 0
@@ -155,7 +186,7 @@ def apply_domain_routing(
             for domain in routing.active_domains
         ):
             continue
-        source = Path(str(item.get("file", ""))).name.casefold()
+        source = _source_reservation_key(item.get("file"))
         if not source or source in reserved_sources:
             continue
         reserve(item)

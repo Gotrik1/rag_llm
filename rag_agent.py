@@ -72,7 +72,7 @@ VECTOR_TOP_K     = 12      # кандидатов от вектора
 # collection: the two indexes must describe precisely the same corpus.
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25_v12"))
 CACHE_VERSION    = "v36-soft-domain-routing-2026-09-17-1"
-QUERY_UNDERSTANDING_VERSION = "v1"
+QUERY_UNDERSTANDING_VERSION = "v2"
 MAX_OUTPUT_TOKENS = 4056
 
 PROMPT_INJECTION_MARKERS = (
@@ -250,6 +250,10 @@ FORMULA_QUERY_MARKERS = (
 HIGH_CONFIDENCE_QUERY_TYPOS = {
     "ак": "как",
     "авнсы": "авансы",
+    # Users frequently type the Cyrillic letter О instead of the zero in the
+    # domain identifier ИВ0.  Correct only the standalone token: identifiers
+    # such as ИВОН/ИВон remain untouched.
+    "иво": "ИВ0",
     "расчитывается": "рассчитывается",
     "расчитываются": "рассчитываются",
     "сиситеме": "системе",

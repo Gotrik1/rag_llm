@@ -78,6 +78,56 @@ class DomainRoutingTests(unittest.TestCase):
             6,
         )
 
+    def test_direct_category_sources_survive_relationship_noise_and_companion_duplicates(self):
+        route = route_query("Чем отличаются ценовые категории?", "both")
+        ranked = [
+            {
+                "file": f"noise-{index}.docx",
+                "score": 20.0 - index / 100,
+                "text": f"Связанный фрагмент {index}",
+                "matched_queries": ["relationship:section-child"],
+            }
+            for index in range(40)
+        ]
+        ranked.extend([
+            {
+                "file": "a" * 32 + "_r12_rag.md",
+                "score": 8.0,
+                "text": "Ценовая категория.",
+                "matched_queries": ["price-category-exact:generic", "domain-lexical"],
+            },
+            {
+                "file": "b" * 32 + "_r12_formulas.md",
+                "score": 7.9,
+                "text": "Формула категории.",
+                "matched_queries": ["price-category-exact:generic", "domain-lexical"],
+            },
+            {
+                "file": "Постановление N 1179.docx",
+                "score": 2.0,
+                "text": "Правила ценовых категорий.",
+                "matched_queries": ["price-category-exact:generic"],
+            },
+        ])
+
+        result = apply_domain_routing(
+            ranked,
+            {
+                ("a" * 32 + "_r12_rag.md"): ("orem",),
+                ("b" * 32 + "_r12_formulas.md"): ("orem",),
+                "постановление n 1179.docx": ("rre",),
+            },
+            route,
+            10,
+        )
+
+        files = [item["file"] for item in result]
+        self.assertIn("Постановление N 1179.docx", files[:6])
+        self.assertEqual(
+            sum("r12_" in file for file in files[:6]),
+            1,
+        )
+
     def test_document_tags_are_multi_label_and_explicit_metadata_wins(self):
         self.assertEqual(infer_document_domains("Методика РРЭ и ОРЭМ.docx"), ("rre", "orem"))
         self.assertEqual(

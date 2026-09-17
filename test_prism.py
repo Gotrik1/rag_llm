@@ -26,6 +26,7 @@ from rag_agent import (
     generate_image_transcription_answer,
     is_document_occurrence_question,
     matching_explicit_sources,
+    normalize_user_question,
     _question_hash,
     parse_query_understanding,
     price_category_number,
@@ -430,6 +431,17 @@ class PrismQueryTests(unittest.TestCase):
         spec = refine_prism_query(understanding.canonical_question)
         self.assertNotIn("cost", spec.excluded_chunk_types)
         self.assertNotIn("rate", spec.excluded_chunk_types)
+
+    def test_standalone_ivo_is_normalized_to_iv_zero(self):
+        understanding = deterministic_query_understanding("формула иво какая")
+
+        self.assertEqual(understanding.canonical_question, "формула ИВ0 какая")
+        self.assertIn("calculation", understanding.facets)
+        self.assertIn("формула ИВ0 какая", understanding.retrieval_queries)
+        self.assertEqual(
+            normalize_user_question("ИВОН и иво"),
+            ("ИВОН и ИВ0", ("ИВОН и иво -> ИВОН и ИВ0",)),
+        )
 
     def test_common_typo_question_is_normalized_before_calculation_retrieval(self):
         understanding = deterministic_query_understanding(

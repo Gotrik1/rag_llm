@@ -946,6 +946,50 @@ class PrismQueryTests(unittest.TestCase):
 
         self.assertEqual([item["file"] for item in results], [current_source])
 
+    def test_document_occurrence_survives_llm_canonical_rewrite(self):
+        agent = object.__new__(RAGAgent)
+        agent._all_nodes = [
+            SimpleNamespace(
+                text="Выбранная ценовая категория задаётся в договорных условиях.",
+                metadata={"file_name": "Методика РРЭ.docx", "section_path": "Условия"},
+            ),
+            SimpleNamespace(
+                text="Установлены первая — шестая ценовые категории.",
+                metadata={"file_name": "Постановление 1179.docx", "section_path": "Правила"},
+            ),
+        ]
+        agent.understand_query = Mock(return_value=QueryUnderstanding(
+            "Сведения о ценовых категориях",
+            ("list",),
+            ("ценовые категории",),
+            (),
+        ))
+        agent._refresh_docstore_if_changed = Mock()
+        retriever = Mock()
+        retriever.retrieve.return_value = []
+        agent._build_query_engine = Mock(return_value=SimpleNamespace(retriever=retriever))
+        for method_name in (
+            "_procedural_seed_results",
+            "_exact_section_seed_results",
+            "_price_category_seed_results",
+            "_lexical_section_seed_results",
+            "_section_seed_results",
+            "_formula_clause_seed_results",
+            "_regulation_concept_seed_results",
+        ):
+            setattr(agent, method_name, Mock(return_value=[]))
+
+        results = RAGAgent.retrieve_context(
+            agent,
+            "Какие постановления и методики описывают ценовые категории?",
+            top_k=10,
+        )
+
+        self.assertEqual(
+            {item["file"] for item in results},
+            {"Методика РРЭ.docx", "Постановление 1179.docx"},
+        )
+
     def test_document_occurrence_retrieval_keeps_active_normative_history_chunks(self):
         agent = object.__new__(RAGAgent)
         agent._all_nodes = [

@@ -3915,10 +3915,25 @@ class RAGAgent:
         retrieval_focus: str = "auto",
     ) -> list[dict]:
         """Return chunks after query planning unless a validated plan is supplied."""
+        original_question = question
         if retrieval_queries is None:
             understanding = self.understand_query(question)
             question = understanding.canonical_question
             retrieval_queries = understanding.retrieval_queries
+        # Query understanding may rewrite a list request into a declarative
+        # search phrase.  Keep the user's positive document-occurrence intent
+        # for seeding and final diversification while still using the clearer
+        # canonical wording for vector/lexical retrieval.
+        occurrence_question = (
+            original_question
+            if is_document_occurrence_question(original_question)
+            else question
+        )
+        selection_question = (
+            occurrence_question
+            if is_document_occurrence_question(occurrence_question)
+            else question
+        )
         self._refresh_docstore_if_changed()
         spec = spec or refine_prism_query(question)
         domain_routing = route_query(question, retrieval_focus)
@@ -3948,7 +3963,7 @@ class RAGAgent:
         for item in concept_seeds:
             key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
             merged[key] = item
-        for item in self._document_occurrence_seed_results(question):
+        for item in self._document_occurrence_seed_results(occurrence_question):
             key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
             merged[key] = item
         # Run exact category seeding last so broad lexical/section seeds cannot
@@ -4039,7 +4054,7 @@ class RAGAgent:
         related = relationship_expansion_results(
             getattr(self, "_all_nodes", []),
             ranked,
-            question,
+            selection_question,
             limit=max(top_k, 12),
         )
         if related:
@@ -4068,8 +4083,8 @@ class RAGAgent:
             # a genuinely matching chat/project document cannot be crowded out
             # by a large shared document, while global evidence still remains.
             ranked = prioritize_scoped_results(ranked, top_k)
-        diversified = diversify_context_results(ranked, question, top_k)
-        if is_document_occurrence_question(question):
+        diversified = diversify_context_results(ranked, selection_question, top_k)
+        if is_document_occurrence_question(selection_question):
             # This intent asks for the complete positive set of accessible,
             # active documents.  ``history`` is normally excluded from an
             # explanatory answer, but it is also used for normative preambles

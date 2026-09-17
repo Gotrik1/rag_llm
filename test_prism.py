@@ -87,6 +87,40 @@ class PrismQueryTests(unittest.TestCase):
         )
         self.assertEqual(metadata["status"], "deleted")
 
+    def test_repealed_sibling_does_not_delete_active_normative_clause(self):
+        metadata = extract_chunk_metadata(
+            "[SECTION: 2. Особенности применения нерегулируемых цен]\n"
+            "12. Пункт утратил силу.\n\n"
+            "2. Предельные уровни дифференцируются по ценовым категориям."
+        )
+        self.assertEqual(metadata["status"], "active")
+        self.assertNotEqual(metadata["chunk_type"], "history")
+
+    def test_docstore_load_repairs_stale_deleted_status(self):
+        text = (
+            "[SECTION: 2. Особенности применения нерегулируемых цен]\n"
+            "12. Пункт утратил силу.\n\n"
+            "2. Предельные уровни дифференцируются по ценовым категориям."
+        )
+        agent = object.__new__(RAGAgent)
+        agent.docstore = SimpleNamespace(docs={
+            "node": SimpleNamespace(
+                text=text,
+                metadata={
+                    "file_name": "Постановление 1179.docx",
+                    "section_title": "2. Особенности применения нерегулируемых цен",
+                    "status": "deleted",
+                    "chunk_type": "history",
+                },
+                doc_id="node",
+            ),
+        })
+
+        RAGAgent._load_nodes_from_docstore(agent)
+
+        self.assertEqual(agent._all_nodes[0].metadata["status"], "active")
+        self.assertNotEqual(agent._all_nodes[0].metadata["chunk_type"], "history")
+
     def test_relationship_expansion_adds_same_section_child_and_exception_sibling(self):
         nodes = [
             SimpleNamespace(

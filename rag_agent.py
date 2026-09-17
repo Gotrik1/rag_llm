@@ -882,6 +882,37 @@ def known_formula_terms() -> tuple[str, ...]:
     return ("ИВ0-1", "ИВ0", "ИВ1", "ИС", "ИВА", "ИВК", "ИВпр", "ИВон", "ИВ")
 
 
+REMOVED_CLAUSE_RE = re.compile(
+    r"утратил[аио]?\s+силу|пункт\s+(?:удален|исключен)|исключен[оа]?\s+из\s+регламента",
+    re.IGNORECASE,
+)
+
+
+def _current_clause_is_deleted(cleaned: str, section_title: str) -> bool:
+    """Limit repeal markers to the clause they actually describe.
+
+    Legal exports often place a repealed sibling near an active clause.  A
+    marker anywhere in the first chunk window must not delete the active
+    clause or every later occurrence in the regulation disappears from RAG.
+    """
+    if REMOVED_CLAUSE_RE.search(section_title):
+        return True
+
+    body = re.sub(r"^\s*\[SECTION:\s*[^\]]+\]\s*", "", cleaned, count=1)
+    prefix = body[:320]
+    marker = REMOVED_CLAUSE_RE.search(prefix)
+    if marker is None or marker.start() > 180:
+        return False
+
+    title_number = re.match(r"\s*(?:пункт\s*)?(\d+(?:\.\d+)*)", section_title, re.IGNORECASE)
+    marker_line_start = prefix.rfind("\n", 0, marker.start()) + 1
+    marker_line = prefix[marker_line_start:]
+    marker_number = re.match(r"\s*(?:пункт\s*)?(\d+(?:\.\d+)*)", marker_line, re.IGNORECASE)
+    if title_number and marker_number and title_number.group(1) != marker_number.group(1):
+        return False
+    return True
+
+
 def extract_chunk_metadata(text: str) -> dict:
     """Classify a retrieved chunk so ranking can separate values from prices/rates."""
     cleaned = _cleanup_formula_noise(text or "")
@@ -891,12 +922,7 @@ def extract_chunk_metadata(text: str) -> dict:
     section_parts = [part.strip() for part in section_path.split(">") if part.strip()]
     section_title = section_parts[-1] if section_parts else ""
     parent_section = " > ".join(section_parts[:-1])
-    status_scope = f"{section_path}\n{cleaned[:900]}".lower()
-
-    status = "deleted" if re.search(
-        r"утратил[аио]?\s+силу|пункт\s+(?:удален|исключен)|исключен[оа]?\s+из\s+регламента",
-        status_scope,
-    ) else "active"
+    status = "deleted" if _current_clause_is_deleted(cleaned, section_title) else "active"
 
     chunk_type = "unknown"
     if "[table]" in lower:
@@ -907,7 +933,7 @@ def extract_chunk_metadata(text: str) -> dict:
         chunk_type = "cost"
     if "исходные данные" in lower or "предварительных обязательств" in lower or "предварительных требований" in lower:
         chunk_type = "rate"
-    if "утратил силу" in status_scope:
+    if status == "deleted":
         chunk_type = "history"
     if (
         "определение величины отклонений" in lower
@@ -924,6 +950,23 @@ def extract_chunk_metadata(text: str) -> dict:
         "status": status,
         "chunk_type": chunk_type,
     }
+
+
+def effective_chunk_metadata(text: str, metadata: dict | None = None) -> dict:
+    """Combine stable locators with status/type recalculated from chunk text."""
+    parsed = extract_chunk_metadata(text)
+    for key in ("section_path", "section_title", "parent_section"):
+        value = (metadata or {}).get(key)
+        if value:
+            parsed[key] = value
+    parsed["status"] = (
+        "deleted"
+        if _current_clause_is_deleted(_cleanup_formula_noise(text or ""), str(parsed.get("section_title", "")))
+        else "active"
+    )
+    if parsed["status"] == "deleted":
+        parsed["chunk_type"] = "history"
+    return parsed
 
 
 def _context_roles(text: str) -> set[str]:
@@ -2676,11 +2719,18 @@ class RAGAgent:
             for d in docs.values():
                 if not getattr(d, "text", None):
                     continue
+                normalized_meta = dict(getattr(d, "metadata", {}) or {})
+                effective = effective_chunk_metadata(d.text, normalized_meta)
+                normalized_meta.update({
+                    "status": effective["status"],
+                    "chunk_type": effective["chunk_type"],
+                })
                 if isinstance(d, TextNode):
+                    d.metadata = normalized_meta
                     nodes.append(d)
                     continue
                 node_id = getattr(d, "doc_id", None) or getattr(d, "id_", None) or getattr(d, "id", None)
-                nodes.append(TextNode(text=d.text, metadata=d.metadata, id_=node_id))
+                nodes.append(TextNode(text=d.text, metadata=normalized_meta, id_=node_id))
             self._all_nodes = nodes
 
     def _refresh_docstore_if_changed(self) -> None:
@@ -3184,12 +3234,7 @@ class RAGAgent:
                 score += 6.0
             if len(section_text) > 900:
                 score -= 1.5
-            chunk_meta = {
-                **extract_chunk_metadata(text),
-                **{key: value for key, value in meta.items() if key in {
-                    "section_path", "section_title", "parent_section", "status", "chunk_type",
-                } and value},
-            }
+            chunk_meta = effective_chunk_metadata(text, meta)
             if chunk_meta.get("status") == "deleted":
                 continue
             ranked.append((score, {
@@ -3391,12 +3436,7 @@ class RAGAgent:
             }
             if not matched:
                 continue
-            chunk_meta = {
-                **extract_chunk_metadata(text),
-                **{key: value for key, value in meta.items() if key in {
-                    "section_path", "section_title", "parent_section", "status", "chunk_type",
-                } and value},
-            }
+            chunk_meta = effective_chunk_metadata(text, meta)
             if chunk_meta.get("status") == "deleted":
                 continue
             score = 3.0 + len(matched) * 0.6
@@ -3485,12 +3525,7 @@ class RAGAgent:
             )
             if not (body_match or section_match or related_transfer):
                 continue
-            chunk_meta = {
-                **extract_chunk_metadata(text),
-                **{key: value for key, value in meta.items() if key in {
-                    "section_path", "section_title", "parent_section", "status", "chunk_type",
-                } and value},
-            }
+            chunk_meta = effective_chunk_metadata(text, meta)
             if chunk_meta.get("status") == "deleted":
                 continue
             score = 3.0 if (body_match or section_match) else 4.0
@@ -3545,10 +3580,7 @@ class RAGAgent:
                 "score": 0.0,
                 "text": text,
                 "matched_queries": ["document-occurrence-exact"],
-                **extract_chunk_metadata(text),
-                **{key: value for key, value in meta.items() if key in {
-                    "section_path", "section_title", "parent_section", "status", "chunk_type",
-                } and value},
+                **effective_chunk_metadata(text, meta),
             }
             if item.get("status") == "deleted" or not document_occurrence_item_matches(item, question):
                 continue
@@ -3963,16 +3995,7 @@ class RAGAgent:
                 file_name = meta.get("file_name", meta.get("file_path", "?"))
                 key = hashlib.sha256(f"{file_name}\n{text[:700]}".encode("utf-8")).hexdigest()
                 score = float(item.score or 0)
-                chunk_meta = {
-                    **extract_chunk_metadata(text),
-                    **{k: v for k, v in meta.items() if k in {
-                        "section_path",
-                        "section_title",
-                        "parent_section",
-                        "status",
-                        "chunk_type",
-                    } and v},
-                }
+                chunk_meta = effective_chunk_metadata(text, meta)
                 current = merged.get(key)
                 if current is None:
                     merged[key] = {

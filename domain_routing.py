@@ -124,14 +124,42 @@ def apply_domain_routing(
         enriched.append(candidate)
     enriched.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
 
-    # At most one reserved item per relevant business domain. This prevents a
-    # large OREM or RRE manual from crowding out the other domain while leaving
-    # the remaining positions to normal relevance ranking.
+    # Reserve one item per relevant business domain, then a bounded number of
+    # direct lexical hits from distinct sources.  Scores produced by vector,
+    # lexical and relationship retrieval are not on one common scale; without
+    # the second reservation, many high-scoring chunks from a few large manuals
+    # can consume the candidate cap before a directly matching smaller document
+    # reaches the downstream source-diversification step.
     reserved: list[dict] = []
     reserved_ids: set[int] = set()
+    reserved_sources: set[str] = set()
+
+    def reserve(item: dict) -> None:
+        reserved.append(item)
+        reserved_ids.add(id(item))
+        reserved_sources.add(Path(str(item.get("file", ""))).name.casefold())
+
     for domain in routing.active_domains:
         match = next((item for item in enriched if domain in item.get("knowledge_domains", [])), None)
         if match is not None:
-            reserved.append(match)
-            reserved_ids.add(id(match))
+            reserve(match)
+
+    direct_source_quota = min(6, max(2, top_k // 2))
+    direct_sources = 0
+    for item in enriched:
+        matched_queries = item.get("matched_queries", [])
+        if "domain-lexical" not in matched_queries:
+            continue
+        if routing.active_domains and not any(
+            domain in item.get("knowledge_domains", [])
+            for domain in routing.active_domains
+        ):
+            continue
+        source = Path(str(item.get("file", ""))).name.casefold()
+        if not source or source in reserved_sources:
+            continue
+        reserve(item)
+        direct_sources += 1
+        if direct_sources >= direct_source_quota:
+            break
     return [*reserved, *(item for item in enriched if id(item) not in reserved_ids)][:max(top_k * 3, top_k)]

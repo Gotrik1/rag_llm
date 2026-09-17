@@ -44,6 +44,40 @@ class DomainRoutingTests(unittest.TestCase):
         self.assertEqual(result[0]["file"], "rre.docx")
         self.assertIn("orem.docx", [item["file"] for item in result])
 
+    def test_direct_lexical_source_survives_incomparable_high_scores(self):
+        route = route_query("Почему расчёт договора РРЭ не сформирован?", "rre")
+        ranked = [
+            {
+                "file": "large-manual.docx",
+                "score": 20.0 - index / 100,
+                "text": f"Связанный фрагмент {index}",
+                "matched_queries": ["relationship:section-child"],
+            }
+            for index in range(40)
+        ]
+        ranked.append({
+            "file": "Методика РРЭ.docx",
+            "score": 1.0,
+            "text": "Условия формирования расчёта договора РРЭ.",
+            "matched_queries": ["domain-lexical"],
+        })
+
+        result = apply_domain_routing(
+            ranked,
+            {
+                "large-manual.docx": ("shared",),
+                "методика ррэ.docx": ("rre",),
+            },
+            route,
+            10,
+        )
+
+        self.assertIn("Методика РРЭ.docx", [item["file"] for item in result])
+        self.assertLess(
+            [item["file"] for item in result].index("Методика РРЭ.docx"),
+            6,
+        )
+
     def test_document_tags_are_multi_label_and_explicit_metadata_wins(self):
         self.assertEqual(infer_document_domains("Методика РРЭ и ОРЭМ.docx"), ("rre", "orem"))
         self.assertEqual(

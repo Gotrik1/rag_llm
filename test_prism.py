@@ -516,6 +516,23 @@ class PrismQueryTests(unittest.TestCase):
             question,
         ))
 
+    def test_document_occurrence_intent_covers_natural_source_list_paraphrases(self):
+        questions = (
+            "Какие постановления и методики описывают ценовые категории?",
+            "где в документах есть информация про цк",
+            "Найди документы с правилами выбора или расчёта ценовой категории.",
+            "В каких источниках прямо упоминаются 1–6 ЦК?",
+            "Покажи полный перечень документов о ценовых категориях без отрицательных результатов.",
+            "Какая документация содержит параметр Ценовая категория?",
+        )
+
+        for question in questions:
+            with self.subTest(question=question):
+                self.assertTrue(is_document_occurrence_question(question))
+                self.assertIn("list", deterministic_query_understanding(question).facets)
+
+        self.assertFalse(is_document_occurrence_question("Как рассчитывается 1 ЦК?"))
+
     def test_generic_price_category_alias_lists_only_directly_matching_documents(self):
         questions = (
             "Перечисли все доступные документы, где фигурирует ЦК.",
@@ -889,6 +906,45 @@ class PrismQueryTests(unittest.TestCase):
         )
 
         self.assertEqual([item["file"] for item in results], ["visible.docx"])
+
+    def test_document_occurrence_keeps_current_revision_when_old_upload_is_excluded(self):
+        old_source = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_Методика РРЭ в 1.docx"
+        current_source = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb_Методика РРЭ в 1.docx"
+        agent = object.__new__(RAGAgent)
+        agent._all_nodes = [
+            SimpleNamespace(
+                text="Выбранная ценовая категория задаётся в договорных условиях.",
+                metadata={"file_name": old_source, "section_path": "Договорные условия"},
+            ),
+            SimpleNamespace(
+                text="Выбранная ценовая категория задаётся в договорных условиях.",
+                metadata={"file_name": current_source, "section_path": "Договорные условия"},
+            ),
+        ]
+        agent._refresh_docstore_if_changed = Mock()
+        retriever = Mock()
+        retriever.retrieve.return_value = []
+        agent._build_query_engine = Mock(return_value=SimpleNamespace(retriever=retriever))
+        for method_name in (
+            "_procedural_seed_results",
+            "_exact_section_seed_results",
+            "_price_category_seed_results",
+            "_lexical_section_seed_results",
+            "_section_seed_results",
+            "_formula_clause_seed_results",
+            "_regulation_concept_seed_results",
+        ):
+            setattr(agent, method_name, Mock(return_value=[]))
+
+        results = RAGAgent.retrieve_context(
+            agent,
+            "В каких документах написано про ценовые категории?",
+            top_k=10,
+            excluded_sources={old_source},
+            retrieval_queries=(),
+        )
+
+        self.assertEqual([item["file"] for item in results], [current_source])
 
     def test_document_occurrence_retrieval_keeps_active_normative_history_chunks(self):
         agent = object.__new__(RAGAgent)

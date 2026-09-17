@@ -382,16 +382,25 @@ def mentions_price_category_subject(value: str) -> bool:
     )
 
 
-def is_document_occurrence_question(question: str) -> bool:
+def has_document_occurrence_intent(question: str) -> bool:
+    """Recognize requests for a positive list of documents containing a subject."""
     normalized = (question or "").lower().replace("ё", "е")
-    has_list_intent = bool(re.search(
-        r"\b(?:в\s+каких\s+документ\w*|какие\s+документ\w*|"
-        r"где\s+(?:фигурир\w*|упомина\w*|встреча\w*)|"
-        r"перечисл\w*\s+(?:все\s+)?(?:доступн\w*\s+)?документ\w*|"
-        r"найд\w*\s+(?:все\s+)?(?:доступн\w*\s+)?документ\w*)\b",
+    source_kind = r"(?:документ|документац|источник|постановлен|методик)\w*"
+    return bool(re.search(
+        rf"\b(?:"
+        rf"в\s+каких\s+{source_kind}|"
+        rf"как(?:ие|ая|ую)\s+{source_kind}|"
+        rf"где\s+(?:в\s+документ\w*\s+)?(?:есть|напис|опис|фигур|упомин|встреча|содерж)\w*|"
+        rf"(?:перечисл|найд|покаж|назов)\w*(?:\s+[а-яa-z0-9-]+){{0,4}}\s+{source_kind}|"
+        rf"(?:полный\s+)?перечень\s+{source_kind}"
+        rf")\b",
         normalized,
     ))
-    return has_list_intent and bool(
+
+
+def is_document_occurrence_question(question: str) -> bool:
+    normalized = (question or "").lower().replace("ё", "е")
+    return has_document_occurrence_intent(normalized) and bool(
         price_category_number(normalized)
         or mentions_price_category_subject(normalized)
         or document_occurrence_terms(normalized)
@@ -458,13 +467,7 @@ def deterministic_query_understanding(question: str) -> QueryUnderstanding:
         normalized,
     ):
         facets.append("conditions")
-    if re.search(
-        r"\b(?:в\s+каких\s+документ\w*|какие\s+документ\w*|"
-        r"где\s+(?:фигурир\w*|упомина\w*|встреча\w*)|"
-        r"перечисл\w*\s+(?:все\s+)?(?:доступн\w*\s+)?документ\w*|"
-        r"найд\w*\s+(?:все\s+)?(?:доступн\w*\s+)?документ\w*)\b",
-        normalized,
-    ):
+    if has_document_occurrence_intent(normalized):
         facets.append("list")
     if not facets:
         facets.append("fact")
@@ -3591,7 +3594,11 @@ class RAGAgent:
             if text.lstrip().startswith("[SECTION:"):
                 score += 0.25
             item["score"] = round(score, 4)
-            source_key = user_facing_source_name(item["file"]).casefold()
+            # Keep physical revisions separate until ACL/version filtering has
+            # selected the current document.  Collapsing UUID-prefixed uploads
+            # by their display name here can retain a superseded revision and
+            # then lose the document entirely when that revision is excluded.
+            source_key = Path(str(item["file"])).name.casefold()
             current = best_by_source.get(source_key)
             if current is None or score > current[0]:
                 best_by_source[source_key] = (score, item)

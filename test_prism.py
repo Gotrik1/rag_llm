@@ -262,6 +262,68 @@ class PrismQueryTests(unittest.TestCase):
 
         self.assertIn("small-rre.docx", {item["file"] for item in results})
 
+    def test_domain_lexical_seed_prefers_expanded_governing_clause(self):
+        agent = object.__new__(RAGAgent)
+        agent._all_nodes = [
+            SimpleNamespace(
+                metadata={"file_name": "rre.docx", "section_path": "Введение"},
+                text="Методика расчета стоимости по договору РРЭ.",
+            ),
+            SimpleNamespace(
+                metadata={"file_name": "rre.docx", "section_path": "4.1.3 Договорные величины"},
+                text=(
+                    "В договоре должен быть создан объект потребления или ЭПУ "
+                    "с тарифной схемой и признаком текущий расчет."
+                ),
+            ),
+        ]
+
+        results = agent._domain_lexical_seed_results(
+            "Что настроить перед расчетом договора РРЭ? объект потребления ЭПУ "
+            "тарифная схема признак текущий расчет",
+            ("rre",),
+            {"rre.docx": ("rre",)},
+        )
+
+        self.assertEqual(results[0]["section_path"], "4.1.3 Договорные величины")
+
+    def test_conditions_diversification_reserves_direct_hits_from_multiple_documents(self):
+        ranked = [
+            *[
+                {
+                    "file": "large.docx",
+                    "score": 20.0 - index,
+                    "section_path": f"Раздел {index}",
+                    "text": "Общие сведения о расчете.",
+                    "matched_queries": [],
+                }
+                for index in range(10)
+            ],
+            {
+                "file": "rre-method.docx",
+                "score": 2.0,
+                "section_path": "4.1.3 Договорные величины",
+                "text": "Объект потребления и тарифная схема должны быть настроены.",
+                "matched_queries": ["domain-lexical"],
+            },
+            {
+                "file": "regulation.docx",
+                "score": 1.8,
+                "section_path": "Условия договора",
+                "text": "Установлены обязательные условия договора.",
+                "matched_queries": ["domain-lexical"],
+            },
+        ]
+
+        selected = diversify_context_results(
+            ranked,
+            "Что необходимо настроить перед запуском расчёта договора РРЭ?",
+            10,
+        )
+
+        self.assertIn("rre-method.docx", {item["file"] for item in selected})
+        self.assertIn("regulation.docx", {item["file"] for item in selected})
+
     def test_relevant_project_evidence_gets_bounded_top_k_quota(self):
         shared = [
             {"file": f"shared-{index}.docx", "score": 10 - index, "matched_queries": []}
@@ -632,13 +694,23 @@ class PrismQueryTests(unittest.TestCase):
             "_document_occurrence_seed_results",
         ):
             setattr(agent, method_name, Mock(return_value=[]))
+        agent._domain_lexical_seed_results = Mock(return_value=[])
 
-        result = RAGAgent.retrieve_context(agent, "что такое 6ЦК и ак она рассчитывается", top_k=3)
+        result = RAGAgent.retrieve_context(
+            agent,
+            "что такое 6ЦК и ак она рассчитывается",
+            top_k=3,
+            source_domains={"method.docx": ("rre",)},
+            retrieval_focus="rre",
+        )
 
         agent.understand_query.assert_called_once_with("что такое 6ЦК и ак она рассчитывается")
         searched = [call.args[0].query_str for call in retriever.retrieve.call_args_list]
         self.assertIn("6 ЦК определение", searched)
         self.assertIn("6 ЦК расчет стоимости", searched)
+        domain_seed_query = agent._domain_lexical_seed_results.call_args.args[0]
+        self.assertIn("6 ЦК определение", domain_seed_query)
+        self.assertIn("6 ЦК расчет стоимости", domain_seed_query)
         self.assertEqual(result, [])
 
     def test_price_category_seed_finds_definition_and_calculation_across_documents(self):

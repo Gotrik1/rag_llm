@@ -1106,6 +1106,25 @@ def diversify_context_results(ranked: list[dict], question: str, top_k: int) -> 
         selected.append(item)
         selected_ids.add(id(item))
 
+    understanding = deterministic_query_understanding(question)
+    if {"procedure", "conditions"}.intersection(understanding.facets):
+        # Conditions and procedures are commonly split between a governing
+        # method, a setup manual and a regulation. Keep a bounded strongest
+        # direct lexical hit per document before generic high-scoring chunks
+        # from one large manual consume the whole answer context.
+        selected_sources: set[str] = set()
+        for item in ranked:
+            matched = item.get("matched_queries", [])
+            if "domain-lexical" not in matched:
+                continue
+            source = user_facing_source_name(item.get("file", "")).casefold()
+            if source in selected_sources:
+                continue
+            add(item)
+            selected_sources.add(source)
+            if len(selected) >= min(top_k, 4):
+                break
+
     if generic_category:
         # Generic ЦК questions usually need both normative and implementation
         # evidence.  Reserve one strongest direct hit per document before
@@ -3810,7 +3829,11 @@ class RAGAgent:
             }
             if chunk_meta.get("status") == "deleted":
                 continue
-            score = 1.35 + min(matches, 6) * 0.32
+            # Query expansion adds discriminating business terms (for example,
+            # object, tariff scheme and current-calculation flags). Preserve
+            # enough of that coverage to prefer the governing clause over a
+            # generic introduction from the same document.
+            score = 1.35 + min(matches, 12) * 0.32
             ranked.append((score, {
                 "file": file_name,
                 "score": round(score, 4),
@@ -3918,8 +3941,9 @@ class RAGAgent:
         ):
             key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
             merged[key] = item
+        domain_seed_query = "\n".join((question, *(retrieval_queries or ())))
         for item in self._domain_lexical_seed_results(
-            question,
+            domain_seed_query,
             domain_routing.active_domains,
             source_domains,
             limit=max(top_k * 3, 24),

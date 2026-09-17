@@ -69,7 +69,7 @@ VECTOR_TOP_K     = 12      # кандидатов от вектора
 # A semantic/chunking change must never reuse an older docstore or vector
 # collection: the two indexes must describe precisely the same corpus.
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25_v12"))
-CACHE_VERSION    = "v33-document-occurrence-coverage"
+CACHE_VERSION    = "v34-document-occurrence-selection"
 QUERY_UNDERSTANDING_VERSION = "v1"
 MAX_OUTPUT_TOKENS = 4056
 
@@ -3562,6 +3562,18 @@ class RAGAgent:
             # by a large shared document, while global evidence still remains.
             ranked = prioritize_scoped_results(ranked, top_k)
         diversified = diversify_context_results(ranked, question, top_k)
+        if is_document_occurrence_question(question):
+            # This intent asks for the complete positive set of accessible,
+            # active documents.  ``history`` is normally excluded from an
+            # explanatory answer, but it is also used for normative preambles
+            # and revision clauses that can be a valid direct occurrence (for
+            # example, regulations 1179 and 442).  ACL/source filtering and
+            # prompt-injection checks already ran above; retain every active
+            # direct match instead of applying answer-type exclusions.
+            return [
+                item for item in diversified
+                if item.get("status") != "deleted"
+            ][:top_k]
         selected = select_prism_evidence(diversified, spec, top_k)
         concept_selected = [
             item for item in selected

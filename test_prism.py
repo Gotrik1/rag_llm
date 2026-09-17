@@ -486,6 +486,55 @@ class PrismQueryTests(unittest.TestCase):
 
         self.assertEqual([item["file"] for item in results], ["visible.docx"])
 
+    def test_document_occurrence_retrieval_keeps_active_normative_history_chunks(self):
+        agent = object.__new__(RAGAgent)
+        agent._all_nodes = [
+            SimpleNamespace(
+                text="Упоминаются вторая, третья, четвертая, пятая и шестая ценовые категории.",
+                metadata={
+                    "file_name": "Постановление 1179.docx",
+                    "section_path": "Правила определения нерегулируемых цен",
+                    "chunk_type": "history",
+                    "status": "active",
+                },
+            ),
+            SimpleNamespace(
+                text="Выбор ценовой категории выполняется для объекта потребления.",
+                metadata={
+                    "file_name": "Методика РРЭ.docx",
+                    "section_path": "Объекты потребления",
+                    "chunk_type": "value",
+                    "status": "active",
+                },
+            ),
+        ]
+        agent._refresh_docstore_if_changed = Mock()
+        retriever = Mock()
+        retriever.retrieve.return_value = []
+        agent._build_query_engine = Mock(return_value=SimpleNamespace(retriever=retriever))
+        for method_name in (
+            "_procedural_seed_results",
+            "_exact_section_seed_results",
+            "_price_category_seed_results",
+            "_lexical_section_seed_results",
+            "_section_seed_results",
+            "_formula_clause_seed_results",
+            "_regulation_concept_seed_results",
+        ):
+            setattr(agent, method_name, Mock(return_value=[]))
+
+        results = RAGAgent.retrieve_context(
+            agent,
+            "В каких документах написано про ценовые категории?",
+            top_k=10,
+            retrieval_queries=(),
+        )
+
+        self.assertEqual(
+            {item["file"] for item in results},
+            {"Постановление 1179.docx", "Методика РРЭ.docx"},
+        )
+
     def test_price_category_rerank_penalizes_other_category_heading(self):
         results = [
             {"file": "wrong.docx", "score": 1.0, "section_path": "5.1 Порядок для 1 ЦК", "text": "Общий расчет стоимости."},

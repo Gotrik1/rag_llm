@@ -3814,9 +3814,26 @@ class RAGAgent:
                 "matched_queries": ["domain-lexical"],
                 **chunk_meta,
             }))
+        ordered = sorted(ranked, key=lambda pair: pair[0], reverse=True)
+        # Reserve the strongest lexical hit from each document before allowing
+        # a large manual to consume the remaining quota with near-duplicate
+        # chunks.  This is candidate coverage, not a final ranking decision.
+        reserved: list[dict] = []
+        reserved_ids: set[int] = set()
+        seen_sources: set[str] = set()
+        for _, item in ordered:
+            source_key = Path(str(item.get("file", ""))).name.casefold()
+            if source_key in seen_sources:
+                continue
+            seen_sources.add(source_key)
+            reserved.append(item)
+            reserved_ids.add(id(item))
+            if len(reserved) >= limit:
+                return reserved
         return [
-            item for _, item in sorted(ranked, key=lambda pair: pair[0], reverse=True)[:limit]
-        ]
+            *reserved,
+            *(item for _, item in ordered if id(item) not in reserved_ids),
+        ][:limit]
 
     def retrieve_context(
         self,

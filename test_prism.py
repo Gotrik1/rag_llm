@@ -202,6 +202,41 @@ class PrismQueryTests(unittest.TestCase):
         self.assertTrue(results)
         self.assertTrue(all(item["file"] == "project_pp442.md" for item in results))
 
+    def test_domain_lexical_seed_recovers_small_rre_manual(self):
+        agent = object.__new__(RAGAgent)
+        agent._all_nodes = [
+            SimpleNamespace(
+                metadata={
+                    "file_name": "upload-rre.docx",
+                    "section_path": "Договорные условия на РРЭ",
+                },
+                text=(
+                    "В договоре должен быть создан объект потребления с тарифной "
+                    "схемой и признаком текущий расчет."
+                ),
+            ),
+            SimpleNamespace(
+                metadata={
+                    "file_name": "large-orem.docx",
+                    "section_path": "Оптовый рынок",
+                },
+                text="Участник подает ценовую заявку для проведения расчета.",
+            ),
+        ]
+
+        results = agent._domain_lexical_seed_results(
+            "Какие договорные условия нужны для расчета РРЭ?",
+            ("rre",),
+            {
+                "upload-rre.docx": ("rre",),
+                "large-orem.docx": ("orem",),
+            },
+        )
+
+        self.assertTrue(results)
+        self.assertEqual({item["file"] for item in results}, {"upload-rre.docx"})
+        self.assertTrue(all(item["matched_queries"] == ["domain-lexical"] for item in results))
+
     def test_relevant_project_evidence_gets_bounded_top_k_quota(self):
         shared = [
             {"file": f"shared-{index}.docx", "score": 10 - index, "matched_queries": []}

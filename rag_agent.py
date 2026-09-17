@@ -46,7 +46,7 @@ from llama_index.vector_stores.qdrant import QdrantVectorStore
 import qdrant_client
 from ollama import Client as OllamaClient
 from document_ingestion import ingest_document
-from domain_routing import apply_domain_routing, route_query
+from domain_routing import apply_domain_routing, route_query, source_domains_for
 from llm_providers import ProviderLLM
 from response_cache import ResponseCache
 from reranker import HttpReranker
@@ -3750,6 +3750,74 @@ class RAGAgent:
             item for _, item in sorted(ranked, key=lambda pair: pair[0], reverse=True)[:limit]
         ]
 
+    def _domain_lexical_seed_results(
+        self,
+        question: str,
+        active_domains: tuple[str, ...],
+        source_domains: dict[str, tuple[str, ...]] | None,
+        *,
+        limit: int = 24,
+    ) -> list[dict]:
+        """Seed lexical evidence from the domains selected by soft routing.
+
+        Vector/BM25 retrieval can miss a small but directly relevant manual
+        when a much larger corpus contains the same generic words.  Domain
+        routing is intentionally not an ACL, so this helper only guarantees
+        candidates from the selected business domain; the normal reranking and
+        evidence selection stages still decide whether they survive.
+        """
+        wanted_domains = {str(domain).casefold() for domain in active_domains if domain}
+        if not wanted_domains or not source_domains:
+            return []
+
+        generic_keys = {
+            "каки", "како", "расч", "сист", "долж", "выпо", "необ", "пере",
+            "запу", "пров", "работ", "данн", "инфо",
+        }
+        query_keys = {
+            key for key in lexical_term_keys(" ".join(section_query_terms(question)))
+            if key not in generic_keys
+        }
+        if not query_keys:
+            return []
+
+        ranked: list[tuple[float, dict]] = []
+        for node in self._all_nodes:
+            meta = node.metadata or {}
+            file_name = meta.get("file_name", meta.get("file_path", "?"))
+            domains = set(source_domains_for(file_name, source_domains))
+            if not domains.intersection(wanted_domains):
+                continue
+            text = node.text or ""
+            section_path = str(meta.get("section_path", ""))
+            section_title = str(meta.get("section_title", ""))
+            searchable = f"{section_path}\n{section_title}\n{text}".casefold().replace("ё", "е")
+            searchable_keys = set(lexical_term_keys(searchable))
+            matches = len(query_keys.intersection(searchable_keys))
+            if not matches:
+                continue
+            chunk_meta = {
+                **extract_chunk_metadata(text),
+                **{
+                    key: value for key, value in meta.items()
+                    if key in {"section_path", "section_title", "parent_section", "status", "chunk_type"}
+                    and value
+                },
+            }
+            if chunk_meta.get("status") == "deleted":
+                continue
+            score = 1.35 + min(matches, 6) * 0.32
+            ranked.append((score, {
+                "file": file_name,
+                "score": round(score, 4),
+                "text": text,
+                "matched_queries": ["domain-lexical"],
+                **chunk_meta,
+            }))
+        return [
+            item for _, item in sorted(ranked, key=lambda pair: pair[0], reverse=True)[:limit]
+        ]
+
     def retrieve_context(
         self,
         question: str,
@@ -3829,6 +3897,19 @@ class RAGAgent:
         ):
             key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
             merged[key] = item
+        for item in self._domain_lexical_seed_results(
+            question,
+            domain_routing.active_domains,
+            source_domains,
+            limit=max(top_k * 3, 24),
+        ):
+            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
+            current = merged.get(key)
+            if current is None:
+                merged[key] = item
+            else:
+                current.setdefault("matched_queries", []).extend(item["matched_queries"])
+                current["score"] = max(float(current.get("score", 0.0)), float(item["score"]))
         for query in query_plan:
             nodes = qe.retriever.retrieve(QueryBundle(query_str=query))
             for item in nodes:

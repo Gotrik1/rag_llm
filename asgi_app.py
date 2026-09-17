@@ -32,6 +32,7 @@ from db_store import (
     update_message,
 )
 from document_catalog import annotate_document_versions
+from domain_routing import infer_document_domains
 from jobs import JobQueue
 from legacy_adapter import invoke_legacy
 from local_auth import (
@@ -58,6 +59,7 @@ from runtime_paths import UPLOAD_DIR
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=20_000)
     chat_id: str | None = None
+    retrieval_focus: str = Field(default="auto", pattern="^(auto|rre|orem|both)$")
 
 
 class LoginRequest(BaseModel):
@@ -443,7 +445,7 @@ async def ask(payload: AskRequest, principal: Principal = Depends(current_princi
     with tracer().start_as_current_span("rag.ask") as span:
         span.set_attribute("rag.principal_provider", principal.provider)
         started = time.perf_counter()
-        request_payload = payload.model_dump(exclude_none=True)
+        request_payload = payload.model_dump(exclude_none=True, exclude_defaults=True)
         request_payload["_owner_subject"] = principal.subject
         request_payload["_owner_admin"] = "superadmin" in principal.roles
         assistant_message: dict | None = None
@@ -522,7 +524,7 @@ def _sse(event: str, data: dict) -> str:
 @app.post("/api/ask/stream")
 async def ask_stream(payload: AskRequest, request: Request, principal: Principal = Depends(current_principal)):
     """SSE contract with immediate progress, heartbeats and incremental answer chunks."""
-    request_payload = payload.model_dump(exclude_none=True)
+    request_payload = payload.model_dump(exclude_none=True, exclude_defaults=True)
     request_payload["_owner_subject"] = principal.subject
     request_payload["_owner_admin"] = "superadmin" in principal.roles
     if payload.chat_id and await asyncio.to_thread(get_chat, payload.chat_id) is None:
@@ -660,7 +662,10 @@ async def upload_documents(
                 "source_path": str(target),
                 "mime_type": upload.content_type or "application/octet-stream",
                 "status": "queued",
-                "metadata": {"size_bytes": size},
+                "metadata": {
+                    "size_bytes": size,
+                    "knowledge_domains": list(infer_document_domains(display_name)),
+                },
             },
         )
         try:

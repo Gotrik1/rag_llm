@@ -56,6 +56,7 @@ import { clearCsrfToken, deleteJson, getJson, patchJson, postFormData, postJson,
 
 type Role = "user" | "assistant";
 type UploadTarget = "global" | "project" | "chat";
+type RetrievalFocus = "auto" | "rre" | "orem" | "both";
 
 type ChatEntry = {
   id: string;
@@ -206,6 +207,7 @@ type ChatRecord = {
   id: string;
   project_id: string | null;
   title: string;
+  metadata?: Record<string, unknown>;
 };
 
 type MessageRecord = {
@@ -246,6 +248,8 @@ type ChatSummary = {
   projectId: string | null;
   title: string;
   messages: ChatEntry[];
+  metadata: Record<string, unknown>;
+  retrievalFocus: RetrievalFocus;
 };
 
 const THEME_KEY = "rag-assistant-theme";
@@ -282,8 +286,13 @@ function projectFromRecord(record: ProjectRecord): Project {
   };
 }
 
-function chatFromRecord(record: ChatRecord): ChatSummary {
-  return { id: record.id, projectId: record.project_id, title: record.title, messages: [] };
+export function chatFromRecord(record: ChatRecord): ChatSummary {
+  const metadata = record.metadata ?? {};
+  const rawFocus = metadata.retrieval_focus;
+  const retrievalFocus: RetrievalFocus = rawFocus === "rre" || rawFocus === "orem" || rawFocus === "both"
+    ? rawFocus
+    : "auto";
+  return { id: record.id, projectId: record.project_id, title: record.title, messages: [], metadata, retrievalFocus };
 }
 
 function messageFromRecord(record: MessageRecord): ChatEntry {
@@ -985,6 +994,23 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     }
   }, [chats]);
 
+  const changeRetrievalFocus = useCallback(async (focus: RetrievalFocus) => {
+    const chat = chats.find((item) => item.id === activeChatId);
+    if (!chat || chat.retrievalFocus === focus || isRunning) return;
+    const previous = chats;
+    const metadata = { ...chat.metadata, retrieval_focus: focus };
+    setChats((current) => current.map((item) => item.id === chat.id
+      ? { ...item, metadata, retrievalFocus: focus }
+      : item));
+    try {
+      const record = await patchJson<ChatRecord>(`/api/chats/${chat.id}`, { metadata }, API_TIMEOUT_MS);
+      setChats((current) => current.map((item) => item.id === chat.id ? chatFromRecord(record) : item));
+    } catch (error) {
+      setChats(previous);
+      setWorkspaceError(error instanceof Error ? error.message : "Не удалось изменить фокус поиска");
+    }
+  }, [activeChatId, chats, isRunning]);
+
   const deleteChat = useCallback(async (chatId: string) => {
     const chat = chats.find((item) => item.id === chatId);
     if (!chat || !window.confirm(`Удалить чат «${chat.title}»?`)) return;
@@ -1118,7 +1144,12 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     let shouldClearRunning = false;
     try {
       await postJson<MessageRecord>(`/api/chats/${requestChatId}/messages`, { role: "user", content: question }, API_TIMEOUT_MS);
-      const data = await postJson<AskResponse>("/api/ask", { question, chat_id: requestChatId }, ASK_TIMEOUT_MS);
+      const requestChat = chats.find((chat) => chat.id === requestChatId);
+      const data = await postJson<AskResponse>("/api/ask", {
+        question,
+        chat_id: requestChatId,
+        retrieval_focus: requestChat?.retrievalFocus ?? "auto"
+      }, ASK_TIMEOUT_MS);
       shouldClearRunning = generationResponseIsTerminal(data.status);
 
       const currentChat = chats.find((chat) => chat.id === requestChatId);
@@ -1327,7 +1358,9 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
           models={models}
           result={lastResult}
           selectedModel={selectedModel}
+          retrievalFocus={activeChat?.retrievalFocus ?? "auto"}
           onChangeModel={changeModel}
+          onChangeRetrievalFocus={changeRetrievalFocus}
           onDebug={runDebug}
           error={uploadTarget === "global" ? uploadError : ""}
           documents={documents}
@@ -2147,6 +2180,29 @@ function KnowledgeLoader({
   );
 }
 
+function RetrievalFocusSelector({
+  focus,
+  isRunning,
+  onChange
+}: {
+  focus: RetrievalFocus;
+  isRunning: boolean;
+  onChange: (focus: RetrievalFocus) => void;
+}) {
+  return (
+    <section className="retrieval-focus-selector" aria-label="Фокус поиска по документации">
+      <div className="loader-title"><Database size={15} /><span>Фокус поиска</span></div>
+      <select disabled={isRunning} value={focus} onChange={(event) => onChange(event.target.value as RetrievalFocus)}>
+        <option value="auto">Авто — определить по вопросу</option>
+        <option value="rre">Приоритет РРЭ</option>
+        <option value="orem">Приоритет ОРЭМ</option>
+        <option value="both">РРЭ + ОРЭМ</option>
+      </select>
+      <div className="prompt-description">Это приоритет поиска, а не ограничение доступа. Подходящие документы из другого блока также учитываются.</div>
+    </section>
+  );
+}
+
 function ProjectWorkspacePanel({
   project,
   documents,
@@ -2661,7 +2717,9 @@ function EvidencePanel({
   models,
   result,
   selectedModel,
+  retrievalFocus,
   onChangeModel,
+  onChangeRetrievalFocus,
   onDebug,
   onProviderSettingsChange,
   onRefreshModels,
@@ -2692,7 +2750,9 @@ function EvidencePanel({
   models: string[];
   result: AskResponse | null;
   selectedModel: string;
+  retrievalFocus: RetrievalFocus;
   onChangeModel: (model: string) => void;
+  onChangeRetrievalFocus: (focus: RetrievalFocus) => void;
   onDebug: () => void;
   onProviderSettingsChange: (provider: ProviderName) => void;
   onRefreshModels: () => void;
@@ -2766,6 +2826,7 @@ function EvidencePanel({
           </div>
           <ProviderSettings models={models} onProviderChange={onProviderSettingsChange} />
           <FlowModeSelector isRunning={isRunning} />
+          <RetrievalFocusSelector focus={retrievalFocus} isRunning={isRunning} onChange={onChangeRetrievalFocus} />
           <SystemPromptSelector isRunning={isRunning} />
           {activeProvider === "ollama" ? (
             <ModelSelector

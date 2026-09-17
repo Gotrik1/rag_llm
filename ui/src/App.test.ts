@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { documentUploadedLabel, documentVersionLabel, generationResponseIsTerminal, hasRunningAssistantMessage, normalizeMarkdown, normalizeSourceCitations, panelStateFromMessageRecords, resultFromMessageRecord, sourceLocatorLabel, splitDocumentsByScope, uploadFeedback, uploadScopeFields, visibleNavigationChats } from "./App";
+import { chatFromRecord, documentUploadedLabel, documentVersionLabel, generationResponseIsTerminal, hasRunningAssistantMessage, normalizeMarkdown, normalizeSourceCitations, panelStateFromMessageRecords, resultFromMessageRecord, sourceLocatorLabel, splitDocumentsByScope, uploadFeedback, uploadScopeFields, visibleNavigationChats } from "./App";
 
 
 describe("persisted generation state", () => {
@@ -231,5 +231,20 @@ describe("persisted generation state", () => {
     expect(uploadScopeFields("chat", "project-1", "chat-1")).toEqual({ chat_id: "chat-1" });
     expect(() => uploadScopeFields("project", "", "chat-1")).toThrow("Сначала откройте проект");
     expect(() => uploadScopeFields("chat", "project-1", "")).toThrow("Сначала откройте чат");
+  });
+
+  it("restores the per-chat retrieval focus and falls back safely", () => {
+    expect(chatFromRecord({
+      id: "chat-rre",
+      project_id: "project-1",
+      title: "Розница",
+      metadata: { retrieval_focus: "rre" }
+    }).retrievalFocus).toBe("rre");
+    expect(chatFromRecord({
+      id: "chat-auto",
+      project_id: null,
+      title: "Общий",
+      metadata: { retrieval_focus: "invalid" }
+    }).retrievalFocus).toBe("auto");
   });
 });

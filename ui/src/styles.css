@@ -832,14 +832,16 @@ textarea {
   padding-top: 14px;
 }
 
-.flow-mode-selector {
+.flow-mode-selector,
+.retrieval-focus-selector {
   display: grid;
   gap: 8px;
   border-top: 1px solid #2b333d;
   padding-top: 14px;
 }
 
-.flow-mode-selector select {
+.flow-mode-selector select,
+.retrieval-focus-selector select {
   width: 100%;
   min-height: 38px;
   border: 1px solid #4b5563;
@@ -2446,6 +2448,7 @@ sub {
 
 .evidence-panel .provider-settings,
 .evidence-panel .flow-mode-selector,
+.evidence-panel .retrieval-focus-selector,
 .evidence-panel .system-prompt-selector,
 .evidence-panel .model-selector,
 .evidence-panel .knowledge-loader {
@@ -2466,6 +2469,7 @@ sub {
 .evidence-panel .provider-fields input,
 .evidence-panel .provider-fields select,
 .evidence-panel .flow-mode-selector select,
+.evidence-panel .retrieval-focus-selector select,
 .evidence-panel .system-prompt-selector select,
 .evidence-panel .model-select {
   border-color: var(--border);

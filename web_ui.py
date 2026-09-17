@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -47,6 +48,7 @@ from db_store import (
     update_workspace,
 )
 from document_catalog import build_document_catalog_answer, is_document_catalog_question
+from domain_routing import infer_document_domains, normalize_retrieval_focus
 from llm_providers import DEFAULTS, ProviderLLM
 from rag_agent import CACHE_VERSION, DATA_DIR, GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, format_formula_for_display, is_formula_question, refine_prism_query, source_locator, user_facing_source_name, validate_retrieval
 from runtime_paths import MATHML_CACHE_DIR, STATE_DIR, UPLOAD_DIR
@@ -63,6 +65,30 @@ FLOW_CONFIG_PATH = STATE_DIR / "flow_mode.json"
 FLOW_MODES = {"python", "rust", "hybrid"}
 OPENAPI_SPEC_PATH = Path("openapi.json")
 MAX_LEGACY_UPLOAD_BYTES = 50 * 1024 * 1024
+
+
+def supported_domain_options(callable_obj: object, source_domains: dict, retrieval_focus: str) -> dict:
+    """Keep compatibility with test doubles and external agent adapters."""
+    try:
+        parameters = inspect.signature(callable_obj).parameters.values()
+    except (TypeError, ValueError):
+        return {}
+    names = {parameter.name for parameter in parameters}
+    accepts_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+    if not accepts_kwargs and not {"source_domains", "retrieval_focus"}.issubset(names):
+        return {}
+    return {"source_domains": source_domains, "retrieval_focus": retrieval_focus}
+
+
+def domain_source_map(source_aliases: dict[str, str]) -> dict[str, tuple[str, ...]]:
+    """Map both immutable index ids and display filenames to domain labels."""
+    result: dict[str, tuple[str, ...]] = {}
+    for source, alias in source_aliases.items():
+        domains = infer_document_domains(alias)
+        for key in (Path(source).name.casefold(), Path(alias).name.casefold()):
+            if key:
+                result[key] = tuple(dict.fromkeys((*result.get(key, ()), *domains)))
+    return result
 
 
 def parse_multipart_files(content_type: str, body: bytes) -> list[dict]:
@@ -370,8 +396,10 @@ def select_user_facing_sources(answer: str, sources: list[dict]) -> list[dict]:
     return cited or linked
 
 
-def retrieval_document_scope(scope: dict, chat_id: str) -> tuple[set[str], dict[str, str]]:
-    """Return exact hidden sources and user-visible aliases for the active scope."""
+def retrieval_document_scope_details(
+    scope: dict, chat_id: str
+) -> tuple[set[str], dict[str, str], dict[str, tuple[str, ...]]]:
+    """Return ACL exclusions, aliases and non-security domain metadata."""
     try:
         records = list_all_documents_for_retrieval()
     except Exception as exc:
@@ -384,6 +412,7 @@ def retrieval_document_scope(scope: dict, chat_id: str) -> tuple[set[str], dict[
     excluded: set[str] = set()
     visible_aliases: dict[str, str] = {}
     visible_sources: set[str] = set()
+    source_domains: dict[str, tuple[str, ...]] = {}
     for record in records:
         document_project = str(record.get("project_id") or "")
         document_chat = str(record.get("chat_id") or "")
@@ -416,12 +445,25 @@ def retrieval_document_scope(scope: dict, chat_id: str) -> tuple[set[str], dict[
             continue
         visible_sources.add(source_id)
         visible_aliases[source_id] = file_name or Path(source_path).name
+        domains = infer_document_domains(file_name or Path(source_path).name, record.get("metadata"))
+        source_domains[source_id] = domains
+        display_id = Path(file_name).name.casefold()
+        if display_id:
+            source_domains[display_id] = tuple(dict.fromkeys(
+                (*source_domains.get(display_id, ()), *domains)
+            ))
     # A re-upload/reconciliation can temporarily leave a stale deleted row
     # pointing at the same immutable indexed source as an active visible row.
     # Visibility for that exact UUID-prefixed source must be order-independent;
     # distinct uploads with the same display name still have different source ids
     # and remain isolated.
-    return excluded - visible_sources, visible_aliases
+    return excluded - visible_sources, visible_aliases, source_domains
+
+
+def retrieval_document_scope(scope: dict, chat_id: str) -> tuple[set[str], dict[str, str]]:
+    """Compatibility view of ACL exclusions and user-visible aliases."""
+    excluded, aliases, _ = retrieval_document_scope_details(scope, chat_id)
+    return excluded, aliases
 
 
 def excluded_document_sources(scope: dict, chat_id: str) -> set[str]:
@@ -1381,6 +1423,8 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
         excluded_sources, source_aliases = retrieval_document_scope(scope, chat_id)
+        source_domains = domain_source_map(source_aliases)
+        retrieval_focus = normalize_retrieval_focus(body.get("retrieval_focus"))
         shared_sources = shared_global_document_sources()
         priority_sources = {
             source for source in source_aliases
@@ -1393,6 +1437,8 @@ class Handler(BaseHTTPRequestHandler):
         t0 = time.time()
         profile = get_profile(load_system_prompt_id(), GROUNDED_SYSTEM_PROMPT)
         scoped_prompt = f"{profile['prompt']}\n\n{project_context_prompt(scope)}"
+        ask_domain_options = supported_domain_options(agent.ask, source_domains, retrieval_focus)
+        retrieve_domain_options = supported_domain_options(agent.retrieve_context, source_domains, retrieval_focus)
         if mode == "python":
             ask_options = {
                 "retrieval_query": retrieval_question,
@@ -1400,6 +1446,7 @@ class Handler(BaseHTTPRequestHandler):
                 "shared_system_prompt": profile["prompt"],
                 "source_aliases": source_aliases,
                 "priority_sources": priority_sources,
+                **ask_domain_options,
             }
             if excluded_sources:
                 ask_options["excluded_sources"] = excluded_sources
@@ -1415,6 +1462,7 @@ class Handler(BaseHTTPRequestHandler):
                     excluded_sources=excluded_sources or None,
                     source_aliases=source_aliases,
                     priority_sources=priority_sources,
+                    **retrieve_domain_options,
                 )
         elif mode == "rust":
             python_items = agent.retrieve_context(
@@ -1423,6 +1471,7 @@ class Handler(BaseHTTPRequestHandler):
                 excluded_sources=excluded_sources or None,
                 source_aliases=source_aliases,
                 priority_sources=priority_sources,
+                **retrieve_domain_options,
             )
             rust_items = filter_scoped_context(
                 filter_rust_context(retrieval_question, rust_context(retrieval_question)), excluded_sources
@@ -1453,6 +1502,7 @@ class Handler(BaseHTTPRequestHandler):
                 excluded_sources=excluded_sources or None,
                 source_aliases=source_aliases,
                 priority_sources=priority_sources,
+                **retrieve_domain_options,
             )
             rust_items = filter_scoped_context(
                 filter_rust_context(retrieval_question, rust_context(retrieval_question)), excluded_sources
@@ -1513,6 +1563,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "chat not found"}, 404)
             return
         excluded_sources, source_aliases = retrieval_document_scope(scope, chat_id)
+        source_domains = domain_source_map(source_aliases)
+        retrieval_focus = normalize_retrieval_focus(body.get("retrieval_focus"))
         priority_sources = {
             source for source in source_aliases
             if Path(source).name.casefold() not in shared_global_document_sources()
@@ -1520,12 +1572,17 @@ class Handler(BaseHTTPRequestHandler):
         retrieval_question = contextualize_retrieval_question(question, scope, chat_id)
         with _request_lock:
             mode = load_flow_mode()
-            python_items = get_agent().retrieve_context(
+            agent = get_agent()
+            retrieve_domain_options = supported_domain_options(
+                agent.retrieve_context, source_domains, retrieval_focus
+            )
+            python_items = agent.retrieve_context(
                 retrieval_question,
                 TOP_K,
                 excluded_sources=excluded_sources or None,
                 source_aliases=source_aliases,
                 priority_sources=priority_sources,
+                **retrieve_domain_options,
             )
             rust_items = filter_scoped_context(
                 filter_rust_context(retrieval_question, rust_context(retrieval_question)),

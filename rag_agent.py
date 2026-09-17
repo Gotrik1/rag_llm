@@ -46,6 +46,7 @@ from llama_index.vector_stores.qdrant import QdrantVectorStore
 import qdrant_client
 from ollama import Client as OllamaClient
 from document_ingestion import ingest_document
+from domain_routing import apply_domain_routing, route_query
 from llm_providers import ProviderLLM
 from response_cache import ResponseCache
 from runtime_paths import DATA_DIR
@@ -69,7 +70,7 @@ VECTOR_TOP_K     = 12      # кандидатов от вектора
 # A semantic/chunking change must never reuse an older docstore or vector
 # collection: the two indexes must describe precisely the same corpus.
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25_v12"))
-CACHE_VERSION    = "v35-document-occurrence-intent-verbs"
+CACHE_VERSION    = "v36-soft-domain-routing-2026-09-17-1"
 QUERY_UNDERSTANDING_VERSION = "v1"
 MAX_OUTPUT_TOKENS = 4056
 
@@ -2651,6 +2652,8 @@ class RAGAgent:
         shared_system_prompt: str | None = None,
         source_aliases: dict[str, str] | None = None,
         priority_sources: set[str] | None = None,
+        source_domains: dict[str, tuple[str, ...]] | None = None,
+        retrieval_focus: str = "auto",
     ) -> tuple[str, list[dict], bool]:
         """
         Возвращает (answer, sources, from_cache).
@@ -2688,6 +2691,8 @@ class RAGAgent:
             retrieval_queries=understanding.retrieval_queries,
             source_aliases=source_aliases,
             priority_sources=priority_sources,
+            source_domains=source_domains,
+            retrieval_focus=retrieval_focus,
         )
         if is_document_occurrence_question(understood_question):
             context = [
@@ -3445,6 +3450,8 @@ class RAGAgent:
         retrieval_queries: tuple[str, ...] | list[str] | None = None,
         source_aliases: dict[str, str] | None = None,
         priority_sources: set[str] | None = None,
+        source_domains: dict[str, tuple[str, ...]] | None = None,
+        retrieval_focus: str = "auto",
     ) -> list[dict]:
         """Return chunks after query planning unless a validated plan is supplied."""
         if retrieval_queries is None:
@@ -3453,6 +3460,7 @@ class RAGAgent:
             retrieval_queries = understanding.retrieval_queries
         self._refresh_docstore_if_changed()
         spec = spec or refine_prism_query(question)
+        domain_routing = route_query(question, retrieval_focus)
         explicit_sources = matching_explicit_sources(question, source_aliases)
         candidate_k = max(top_k * (12 if excluded_sources else 5), 100 if excluded_sources else 40)
         qe = self._build_query_engine(candidate_k)
@@ -3484,7 +3492,11 @@ class RAGAgent:
         for item in self._price_category_seed_results(question):
             key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
             merged[key] = item
-        query_candidates = [*(retrieval_queries or ()), *build_targeted_queries(question)]
+        domain_queries = [
+            f"{question} {'РРЭ' if domain == 'rre' else 'ОРЭМ'}"
+            for domain in domain_routing.active_domains
+        ]
+        query_candidates = [*(retrieval_queries or ()), *domain_queries, *build_targeted_queries(question)]
         query_plan: list[str] = []
         seen_queries: set[str] = set()
         for candidate in query_candidates:
@@ -3493,7 +3505,7 @@ class RAGAgent:
             if normalized_query and key not in seen_queries:
                 seen_queries.add(key)
                 query_plan.append(normalized_query)
-            if len(query_plan) >= 6:
+            if len(query_plan) >= 8:
                 break
         scoped_seed_sources = explicit_sources or priority_sources
         for item in self._scoped_lexical_seed_results(
@@ -3555,6 +3567,12 @@ class RAGAgent:
             and not contains_prompt_injection(str(item.get("text", "")))
         ]
         ranked = rerank_context_results(results, question)
+        ranked = apply_domain_routing(
+            ranked,
+            source_domains,
+            domain_routing,
+            top_k,
+        )
         if priority_sources and not explicit_sources:
             # Vector/BM25 scores are backend-specific and can be much larger
             # than lexical seed scores.  Reserve only a bounded top-k quota so

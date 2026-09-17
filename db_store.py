@@ -107,6 +107,26 @@ def db() -> psycopg.Connection:
         return connection
 
 
+@contextmanager
+def read_cursor():
+    """Return a cursor whose read transaction cannot leak between requests.
+
+    Psycopg starts a transaction even for ``SELECT`` when autocommit is off.
+    Closing only the cursor would leave the reused backend connection ``idle in
+    transaction`` and can block schema migrations indefinitely.
+    """
+    connection = db()
+    try:
+        with connection.cursor() as cursor:
+            yield cursor
+    finally:
+        if not connection.closed and connection.info.transaction_status in {
+            psycopg.pq.TransactionStatus.INTRANS,
+            psycopg.pq.TransactionStatus.INERROR,
+        }:
+            connection.rollback()
+
+
 def rollback_transaction() -> None:
     """Clear a failed transaction before returning an HTTP error response."""
     with _db_lock:
@@ -197,7 +217,7 @@ def ensure_default_workspace(default_mode: str, default_provider: str, default_m
 
 def list_projects() -> list[dict]:
     subject = current_subject()
-    with db().cursor() as cur:
+    with read_cursor() as cur:
         query = """
             SELECT p.*,
                 COALESCE((SELECT json_agg(c ORDER BY c.created_at ASC) FROM chats c
@@ -239,7 +259,7 @@ def create_project(payload: dict) -> dict:
 
 def get_project(project_id: str) -> dict | None:
     subject = current_subject()
-    with db().cursor() as cur:
+    with read_cursor() as cur:
         if subject:
             cur.execute(
                 "SELECT * FROM projects WHERE id = %s AND owner_subject = %s AND deleted_at IS NULL",
@@ -292,7 +312,7 @@ def list_chats(project_id: str | None = None) -> list[dict]:
         query += " AND project_id = %s"
         params.append(project_id)
     query += " ORDER BY created_at ASC"
-    with db().cursor() as cur:
+    with read_cursor() as cur:
         cur.execute(query, params)
         return [dict(row) for row in cur.fetchall()]
 
@@ -324,7 +344,7 @@ def create_chat(project_id: str | None, payload: dict, default_mode: str, defaul
 
 def get_chat(chat_id: str) -> dict | None:
     subject = current_subject()
-    with db().cursor() as cur:
+    with read_cursor() as cur:
         if subject:
             cur.execute(
                 "SELECT * FROM chats WHERE id = %s AND owner_subject = %s AND deleted_at IS NULL",
@@ -360,7 +380,7 @@ def delete_chat(chat_id: str) -> bool:
 def list_messages(chat_id: str) -> list[dict]:
     if get_chat(chat_id) is None:
         return []
-    with db().cursor() as cur:
+    with read_cursor() as cur:
         cur.execute("SELECT * FROM messages WHERE chat_id = %s AND deleted_at IS NULL ORDER BY created_at ASC", (chat_id,))
         return [dict(row) for row in cur.fetchall()]
 
@@ -368,7 +388,7 @@ def list_messages(chat_id: str) -> list[dict]:
 def get_project_conversation(chat_id: str, limit: int = 40) -> dict | None:
     """Return project history, or only the active chat history for a free chat."""
     subject = current_subject()
-    with db().cursor() as cur:
+    with read_cursor() as cur:
         ownership = " AND c.owner_subject = %s" if subject else ""
         scope_params: tuple[object, ...] = (chat_id, subject) if subject else (chat_id,)
         cur.execute(
@@ -451,7 +471,7 @@ def create_message(chat_id: str, payload: dict) -> dict:
 
 def get_message(message_id: str) -> dict | None:
     subject = current_subject()
-    with db().cursor() as cur:
+    with read_cursor() as cur:
         if subject:
             cur.execute(
                 """SELECT m.* FROM messages m JOIN chats c ON c.id = m.chat_id
@@ -512,14 +532,14 @@ def list_documents(project_id: str | None = None, chat_id: str | None = None) ->
             params.append(chat_id)
 
     query += " ORDER BY created_at DESC"
-    with db().cursor() as cur:
+    with read_cursor() as cur:
         cur.execute(query, params)
         return [_document_record(row) for row in cur.fetchall()]
 
 
 def list_all_documents_for_retrieval() -> list[dict]:
     """Return active records and tombstones for retrieval access filtering."""
-    with db().cursor() as cur:
+    with read_cursor() as cur:
         cur.execute("SELECT * FROM documents ORDER BY created_at DESC")
         return [_document_record(row) for row in cur.fetchall()]
 
@@ -715,7 +735,7 @@ def create_document(project_id: str | None, chat_id: str | None, payload: dict) 
 
 def get_document(document_id: str) -> dict | None:
     subject = current_subject()
-    with db().cursor() as cur:
+    with read_cursor() as cur:
         if subject and not current_is_admin():
             cur.execute(
                 """SELECT * FROM documents
@@ -810,7 +830,7 @@ def document_sources(source_names: list[str]) -> dict[str, dict]:
     if not names:
         return {}
     subject = current_subject()
-    with db().cursor() as cur:
+    with read_cursor() as cur:
         if subject and not current_is_admin():
             cur.execute(
                 """SELECT * FROM documents WHERE deleted_at IS NULL AND status = 'ready'

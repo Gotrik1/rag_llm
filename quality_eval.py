@@ -8,11 +8,12 @@ import re
 import ssl
 import sys
 import time
+from http.client import RemoteDisconnected
 from http.cookiejar import CookieJar
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import HTTPSHandler, HTTPCookieProcessor, Request, build_opener
 
 
@@ -220,7 +221,14 @@ class ApiClient:
             handlers.append(HTTPSHandler(context=context))
         self.opener = build_opener(*handlers)
 
-    def request(self, path: str, method: str = "GET", payload: dict | None = None) -> dict:
+    def request(
+        self,
+        path: str,
+        method: str = "GET",
+        payload: dict | None = None,
+        *,
+        transport_retries: int = 0,
+    ) -> dict:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
         headers = {"Accept": "application/json"}
         if body is not None:
@@ -229,13 +237,19 @@ class ApiClient:
             headers["Authorization"] = f"Bearer {self.token}"
         if self.csrf_token and method in {"POST", "PUT", "PATCH", "DELETE"}:
             headers["X-CSRF-Token"] = self.csrf_token
-        request = Request(self.base_url + path, data=body, headers=headers, method=method)
-        try:
-            with self.opener.open(request, timeout=180) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:1000]
-            raise RuntimeError(f"{method} {path} returned HTTP {exc.code}: {detail}") from exc
+        for attempt in range(transport_retries + 1):
+            request = Request(self.base_url + path, data=body, headers=headers, method=method)
+            try:
+                with self.opener.open(request, timeout=180) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:1000]
+                raise RuntimeError(f"{method} {path} returned HTTP {exc.code}: {detail}") from exc
+            except (RemoteDisconnected, TimeoutError, ConnectionError, URLError) as exc:
+                if attempt >= transport_retries:
+                    raise RuntimeError(f"{method} {path} transport failure: {exc}") from exc
+                time.sleep(0.5 * (2**attempt))
+        raise RuntimeError(f"{method} {path} transport retry loop exhausted")
 
     def login(self, email: str, password: str) -> None:
         response = self.request(
@@ -305,6 +319,7 @@ def run_retrieval_case(client: ApiClient, chat_id: str, case: QualityCase) -> Re
                 "chat_id": chat_id,
                 "retrieval_focus": case.retrieval_focus,
             },
+            transport_retries=2,
         )
         retrieval = score_retrieval(
             case,

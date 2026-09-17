@@ -1,7 +1,9 @@
 import json
 import tempfile
 import unittest
+from http.client import RemoteDisconnected
 from pathlib import Path
+from unittest.mock import patch
 
 from quality_eval import (
     ApiClient,
@@ -15,6 +17,36 @@ from quality_eval import (
 
 
 class QualityEvaluationTests(unittest.TestCase):
+    def test_api_client_retries_transient_transport_failure(self) -> None:
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"ok": true}'
+
+        class Opener:
+            attempts = 0
+
+            def open(self, *_args, **_kwargs):
+                self.attempts += 1
+                if self.attempts < 3:
+                    raise RemoteDisconnected("connection closed")
+                return Response()
+
+        client = ApiClient("https://example.invalid")
+        opener = Opener()
+        client.opener = opener
+        with patch("quality_eval.time.sleep") as sleep:
+            response = client.request("/api/debug", "POST", {}, transport_retries=2)
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(opener.attempts, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.5, 1.0])
+
     def test_grounded_answer_with_link_formula_and_latency_scores_ten(self) -> None:
         case = QualityCase(
             id="formula",

@@ -383,6 +383,7 @@ def retrieval_document_scope(scope: dict, chat_id: str) -> tuple[set[str], dict[
     include_global = not current_project or str(scope.get("knowledge_scope") or "") != "project_only"
     excluded: set[str] = set()
     visible_aliases: dict[str, str] = {}
+    visible_sources: set[str] = set()
     for record in records:
         document_project = str(record.get("project_id") or "")
         document_chat = str(record.get("chat_id") or "")
@@ -413,8 +414,14 @@ def retrieval_document_scope(scope: dict, chat_id: str) -> tuple[set[str], dict[
             # visible upload when both files have the same human name.
             excluded.add(source_id)
             continue
+        visible_sources.add(source_id)
         visible_aliases[source_id] = file_name or Path(source_path).name
-    return excluded, visible_aliases
+    # A re-upload/reconciliation can temporarily leave a stale deleted row
+    # pointing at the same immutable indexed source as an active visible row.
+    # Visibility for that exact UUID-prefixed source must be order-independent;
+    # distinct uploads with the same display name still have different source ids
+    # and remain isolated.
+    return excluded - visible_sources, visible_aliases
 
 
 def excluded_document_sources(scope: dict, chat_id: str) -> set[str]:

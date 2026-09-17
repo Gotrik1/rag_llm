@@ -282,6 +282,38 @@ class FlowModeTests(unittest.TestCase):
         self.assertEqual(excluded, {"hidden-id_пп 442.md"})
         self.assertEqual(aliases, {"visible-id_пп 442.md": "ПП 442.md"})
 
+    def test_visible_source_wins_over_stale_deleted_duplicate_of_same_upload(self):
+        source_path = "C:/uploads/source-id_Постановление 1179.docx"
+        documents = [
+            {
+                "source_path": source_path,
+                "file_name": "Постановление 1179.docx",
+                "project_id": None,
+                "chat_id": None,
+                "owner_subject": None,
+                "status": "ready",
+                "deleted_at": None,
+            },
+            {
+                "source_path": source_path,
+                "file_name": "Постановление 1179.docx",
+                "project_id": None,
+                "chat_id": None,
+                "owner_subject": None,
+                "status": "deleting",
+                "deleted_at": "2026-09-10",
+            },
+        ]
+        with patch.object(web_ui, "list_all_documents_for_retrieval", return_value=documents):
+            excluded, aliases = web_ui.retrieval_document_scope(
+                {"project_id": None, "owner_subject": "user-1", "knowledge_scope": "project_and_global"},
+                "chat-1",
+            )
+
+        source_id = "source-id_постановление 1179.docx"
+        self.assertNotIn(source_id, excluded)
+        self.assertEqual(aliases[source_id], "Постановление 1179.docx")
+
     def test_scope_registry_failure_is_fail_closed(self):
         with patch.object(
             web_ui,

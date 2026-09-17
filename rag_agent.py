@@ -631,7 +631,14 @@ def ordered_requested_terms(question: str) -> list[str]:
 
 def detect_query_intent(question: str) -> str:
     normalized = normalize_user_question(question)[0].lower()
-    cost_markers = ("стоим", "ставк", "руб", "оплат", "требован", "обязательств", "платеж")
+    cost_markers = (
+        "стоим", "ставк", "руб", "оплат", "требован", "обязательств", "платеж",
+        # Advances and accruals are monetary calculations even when the user
+        # asks only "как рассчитывается".  Classifying them as a generic value
+        # lookup makes PRISM discard the governing cost/rate clauses before
+        # generation, despite an exact lexical heading match.
+        "аванс", "начисл",
+    )
     # Generic verbs such as "определяется" and the noun "порядок" occur in
     # almost every normative question.  Treating them as value intent made the
     # PRISM contract discard whole cost/rate-labelled sections even when the
@@ -1846,6 +1853,13 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
 def formula_sibling_results(nodes: list, merged: dict[str, dict], question: str) -> list[dict]:
     """Add formula chunks from a source already retrieved for a compound query."""
     if not asks_for_calculation(question) or price_category_number(question) or not merged:
+        return []
+    # A broad explanatory request such as "как рассчитываются авансы" does
+    # not authorize arbitrary neighbouring equations.  Formula siblings are
+    # useful only for an explicit formula request or a named formula entity
+    # (ИВ0, ИВ1, ИС, ...); otherwise a high-scoring but unrelated source can
+    # contaminate an otherwise grounded algorithm answer.
+    if not is_formula_question(question) and not requested_formula_terms(question):
         return []
 
     def canonical_source(value: object) -> str:

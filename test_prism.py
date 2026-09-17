@@ -539,6 +539,25 @@ class PrismQueryTests(unittest.TestCase):
         self.assertEqual(seeds[0]["file"], "rrе-method.docx")
         self.assertIn("section-intent-anchored:аван", seeds[0]["matched_queries"])
 
+    def test_advance_calculation_keeps_governing_cost_evidence(self):
+        question = "Как рассчитываются авансы в Системе по РРЭ?"
+
+        self.assertEqual(detect_query_intent(question), "cost")
+        spec = refine_prism_query(question)
+        self.assertEqual(spec.intent, "cost")
+        self.assertNotIn("cost", spec.excluded_chunk_types)
+
+        evidence = [{
+            "file": "Методика расчеты на РРЭ в 1.docx",
+            "section_path": "РРЭ > Авансы > Алгоритмы расчета авансов",
+            "section_title": "Алгоритмы расчета авансов",
+            "status": "active",
+            "chunk_type": "cost",
+            "score": 8.0,
+            "text": "Аванс определяется как процент от стоимости предыдущего периода.",
+        }]
+        self.assertEqual(select_prism_evidence(evidence, spec, 3), evidence)
+
     def test_rare_heading_terms_beat_shared_market_boilerplate(self):
         class Node:
             def __init__(self, text, metadata):
@@ -657,6 +676,36 @@ class PrismQueryTests(unittest.TestCase):
         self.assertEqual(len(siblings), 1)
         self.assertTrue(siblings[0]["file"].endswith("_acceptance.md"))
         self.assertIn("formula-sibling", siblings[0]["matched_queries"])
+
+    def test_explanatory_advance_question_does_not_add_unrelated_formula_sibling(self):
+        class Node:
+            def __init__(self, text, metadata):
+                self.text = text
+                self.metadata = metadata
+
+        merged = {
+            "advance": {
+                "file": "Методика расчеты на РРЭ в 1.docx",
+                "score": 0.7,
+                "text": "Алгоритмы расчета авансов.",
+            },
+            "noise": {
+                "file": "r12_rag.md",
+                "score": 0.8,
+                "text": "Внешняя регулировочная инициатива.",
+            },
+        }
+        nodes = [
+            Node("$$VG = MAX(0, E-F)$$", {"file_name": "r12_rag.md", "section_title": "Формула"}),
+        ]
+
+        siblings = formula_sibling_results(
+            nodes,
+            merged,
+            "Как рассчитываются авансы в Системе по РРЭ?",
+        )
+
+        self.assertEqual(siblings, [])
 
     def test_explicit_section_rejects_other_sections_and_deleted_evidence(self):
         spec = refine_prism_query("дай формулы из пункта 2.1.4")

@@ -376,8 +376,17 @@ PRICE_CATEGORY_STEMS = {
 
 def price_category_number(value: str) -> str | None:
     """Return the explicitly requested numeric price category, if present."""
-    match = re.search(r"(?i)(?<![а-яёa-z0-9])(\d+)\s*цк(?![а-яёa-z0-9])", value or "")
-    return match.group(1) if match else None
+    normalized = (value or "").casefold().replace("ё", "е")
+    match = re.search(r"(?i)(?<![а-яёa-z0-9])(\d+)\s*цк(?![а-яёa-z0-9])", normalized)
+    if match:
+        return match.group(1)
+    return next(
+        (
+            number for number, stem in PRICE_CATEGORY_STEMS.items()
+            if re.search(rf"\b{stem}\w*\s*цк\b", normalized)
+        ),
+        None,
+    )
 
 
 def contains_price_category(value: str, number: str) -> bool:
@@ -605,6 +614,12 @@ def parse_query_understanding(raw: str, question: str) -> QueryUnderstanding:
     missing = [value for key, value in protected_terms.items() if key not in compact_canonical]
     if missing:
         canonical = f"{canonical}. Термины из запроса: {', '.join(missing)}"
+    original_category = price_category_number(fallback.canonical_question)
+    if original_category and price_category_number(canonical) != original_category:
+        # LLM planners sometimes expand colloquial "шестой ЦК" into the
+        # unrelated "шестая часть ГК". Preserve the business identifier while
+        # retaining the useful natural-language reformulation.
+        canonical = f"{canonical}. Ценовая категория из запроса: {original_category} ЦК"
 
     allowed_facets = {"definition", "calculation", "procedure", "conditions", "comparison", "list", "fact"}
     raw_facets = payload.get("facets") if isinstance(payload.get("facets"), list) else []

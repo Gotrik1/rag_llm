@@ -58,6 +58,16 @@ class PrismQueryTests(unittest.TestCase):
 
         self.assertIn("методика расчета стоимости 1-6 ЦК шестая ценовая категория мощность", queries)
 
+    def test_query_planner_cannot_turn_sixth_category_into_civil_code(self):
+        parsed = parse_query_understanding(
+            '{"canonical_question":"Какие услуги входят в расчет по шестой части Гражданского кодекса?",'
+            '"facets":["calculation"],"retrieval_queries":["услуги шестая часть ГК"]}',
+            "какие услуги входят в расчет шестой цк",
+        )
+
+        self.assertEqual(price_category_number(parsed.canonical_question), "6")
+        self.assertIn("6 ЦК", parsed.canonical_question)
+
     def test_topic_coverage_reserves_distinct_governing_source_families(self):
         ranked = [
             {"file": "noise.docx", "score": 9.0, "text": "noise"},

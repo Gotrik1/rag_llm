@@ -2230,7 +2230,15 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
 
 def formula_sibling_results(nodes: list, merged: dict[str, dict], question: str) -> list[dict]:
     """Add formula chunks from a source already retrieved for a compound query."""
-    if not asks_for_calculation(question) or price_category_number(question) or not merged:
+    normalized_question = question.casefold().replace("ё", "е")
+    comparison_needs_formula = bool(requested_formula_terms(question)) and (
+        "отлич" in normalized_question or "разниц" in normalized_question
+    )
+    if (
+        (not asks_for_calculation(question) and not comparison_needs_formula)
+        or price_category_number(question)
+        or not merged
+    ):
         return []
     # A broad explanatory request such as "как рассчитываются авансы" does
     # not authorize arbitrary neighbouring equations.  Formula siblings are

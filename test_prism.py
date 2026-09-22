@@ -1439,6 +1439,25 @@ class PrismQueryTests(unittest.TestCase):
         formulas = extract_formula_lines_from_texts([docs[0].text], "По какой формуле определяется ставка по собственной инициативе?")
         self.assertEqual(formulas, ["= MIN(Ц_i,q^-, Т_i,q)."])
 
+    def test_formula_sibling_is_added_for_named_formula_comparison(self):
+        nodes = [SimpleNamespace(
+            text="[FORMULA]\nV_{ИВ0}=V_{УДГ}-V_{план}",
+            metadata={"file_name": "r12.docx", "section_path": "Внешняя инициатива ИВ0"},
+        )]
+        merged = {
+            "definition": {
+                "file": "r12.docx",
+                "score": 1.0,
+                "text": "ИВ0 — внешняя инициатива",
+                "matched_queries": ["Чем ИВ0 отличается от расчёта стоимости?"],
+            }
+        }
+
+        siblings = formula_sibling_results(nodes, merged, "Чем ИВ0 отличается от расчёта стоимости?")
+
+        self.assertEqual(len(siblings), 1)
+        self.assertIn("V_{ИВ0}", siblings[0]["text"])
+
     def test_removes_hallucinated_regulation_abbreviation_expansions(self):
         answer = sanitize_grounded_answer(
             "ГТП (Группа Технических Условий) и КО (Контролирующий Орган).",

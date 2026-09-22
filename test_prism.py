@@ -17,6 +17,7 @@ from rag_agent import (
     extract_chunk_metadata,
     extract_formula_lines_from_texts,
     ensure_price_category_source_coverage,
+    ensure_requested_formula_coverage,
     formula_sibling_results,
     format_formula_for_display,
     format_formula_for_katex,
@@ -1445,6 +1446,28 @@ class PrismQueryTests(unittest.TestCase):
         )
 
         self.assertEqual(answer, "ГТП и КО.")
+
+    def test_collapses_nested_display_math_delimiters(self):
+        answer = sanitize_grounded_answer(
+            "Расчёт:\n\n$$\n$$V_{ИВ0}=V_{УДГ}-V_{план}$$\n$$",
+            "Как рассчитывается ИВ0?",
+            ["V_{ИВ0}=V_{УДГ}-V_{план}"],
+        )
+
+        self.assertEqual(answer.count("$$"), 2)
+        self.assertIn("V_{ИВ0}=V_{УДГ}-V_{план}", answer)
+
+    def test_comparison_answer_gets_grounded_formula_when_model_omits_it(self):
+        answer = ensure_requested_formula_coverage(
+            "ИВ0 — внешняя инициатива, а не стоимость.",
+            "Чем ИВ0 отличается от расчёта стоимости?",
+            ["V_{ИВ0}=V_{УДГ}-V_{план}"],
+            [{"file": "r12.docx", "section_path": "Внешняя инициатива ИВ0", "text": "ИВ0"}],
+        )
+
+        self.assertIn("$$", answer)
+        self.assertIn("V_", answer)
+        self.assertIn("r12.docx", answer)
 
     def test_legacy_formula_is_safe_for_markdown_display(self):
         displayed = format_formula_for_display(

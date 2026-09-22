@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -856,11 +857,21 @@ def document_sources(source_names: list[str]) -> dict[str, dict]:
             cur.execute("SELECT * FROM documents WHERE deleted_at IS NULL AND status = 'ready'")
         rows = [_document_record(row) for row in cur.fetchall()]
     resolved: dict[str, dict] = {}
+    def lookup_key(value: object) -> str:
+        name = Path(str(value or "")).name
+        while re.match(r"^[0-9a-fA-F]{32}_", name):
+            name = name[33:]
+        return name.casefold()
+
     for row in rows:
         stored_name = Path(str(row.get("source_path", ""))).name
         display_name = str(row.get("file_name", ""))
         for candidate in names:
-            if candidate == stored_name or candidate == display_name:
+            if (
+                candidate == stored_name
+                or candidate == display_name
+                or lookup_key(candidate) in {lookup_key(stored_name), lookup_key(display_name)}
+            ):
                 resolved[candidate] = row
     return resolved
 

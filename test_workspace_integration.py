@@ -230,9 +230,10 @@ class WorkspacePersistenceIntegrationTests(unittest.TestCase):
             self.assertEqual(ready["status"], "ready")
             self.assertEqual(ready["metadata"]["chunks"], 12)
             self.assertEqual([str(item["id"]) for item in db_store.list_documents(project_id)], [document_id])
-            sources = db_store.document_sources([stored_name, "manual.pdf", "other.pdf"])
+            sources = db_store.document_sources([stored_name, "manual.pdf", "MANUAL.PDF", "other.pdf"])
             self.assertEqual(str(sources[stored_name]["id"]), document_id)
             self.assertEqual(str(sources["manual.pdf"]["id"]), document_id)
+            self.assertEqual(str(sources["MANUAL.PDF"]["id"]), document_id)
             self.assertNotIn("other.pdf", sources)
 
             tombstone = db_store.tombstone_document(document_id)

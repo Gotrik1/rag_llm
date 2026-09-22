@@ -2644,8 +2644,52 @@ def sanitize_grounded_answer(answer: str, question: str, allowed_calculations: l
             rendered_lines.append(format_formula_for_katex(candidate, display=True))
         else:
             rendered_lines.append(line)
-    answer = re.sub(r"\n{3,}", "\n\n", "\n".join(rendered_lines)).strip()
+    answer = "\n".join(rendered_lines)
+    # Some models wrap an already delimited display formula in another pair of
+    # $$ lines.  KaTeX treats that as three separate (and usually broken)
+    # blocks.  Collapse only the unambiguous empty-wrapper shape and remove
+    # genuinely empty display blocks; ordinary adjacent formulas stay intact.
+    nested_display = re.compile(
+        r"(?ms)^\s*\$\$\s*\n\s*\$\$(.+?)\$\$\s*\n\s*\$\$\s*$"
+    )
+    while nested_display.search(answer):
+        answer = nested_display.sub(lambda match: f"$$\n{match.group(1).strip()}\n$$", answer)
+    answer = re.sub(r"(?m)^\s*\$\$\s*\$\$\s*$", "", answer)
+    answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
     return answer
+
+
+def ensure_requested_formula_coverage(
+    answer: str,
+    question: str,
+    calculations: list[str],
+    context: list[dict],
+) -> str:
+    """Append one grounded formula when a formula-bearing comparison omitted it."""
+    normalized = question.casefold().replace("ё", "е")
+    formula_sensitive = (
+        "формул" in normalized
+        or "рассчит" in normalized
+        or "расчет" in normalized
+        or ("иво" in normalized and ("отлич" in normalized or "разниц" in normalized))
+    )
+    if not formula_sensitive or not calculations or "$$" in answer:
+        return answer
+
+    calculation = calculations[0]
+    source = next(
+        (
+            item for item in context
+            if "иво" in f"{item.get('section_path', '')}\n{item.get('text', '')}".casefold()
+        ),
+        context[0] if context else None,
+    )
+    citation = f" [Источник: {human_source_reference(source)}]" if source else ""
+    return (
+        f"{answer.rstrip()}\n\n### Формула из источника\n\n"
+        f"{format_formula_for_katex(calculation, display=True)}\n\n"
+        f"Обозначения и смысл величин приведены в указанном разделе.{citation}"
+    )
 
 
 class RAGAgent:
@@ -3197,6 +3241,12 @@ class RAGAgent:
         ) as span:
             response = self.llm.complete(prompt)
             answer = sanitize_grounded_answer(str(response).strip(), question, calculations)
+            answer = ensure_requested_formula_coverage(
+                answer,
+                evidence_question or question,
+                calculations,
+                context,
+            )
             answer = ensure_price_category_source_coverage(answer, evidence_question or question, context)
             if not answer:
                 raise RuntimeError("LLM returned an empty answer")

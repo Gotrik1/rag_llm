@@ -386,6 +386,24 @@ def mentions_price_category_subject(value: str) -> bool:
     )
 
 
+def is_price_composition_question(question: str) -> bool:
+    """Recognise broad retail-price composition questions without pinning a file."""
+    normalized = (question or "").lower().replace("ё", "е")
+    has_price_subject = any(marker in normalized for marker in ("цен", "стоим", "пунц"))
+    implicit_energy_context = (
+        ("структур" in normalized and "цен" in normalized and "систем" in normalized)
+        or ("полный" in normalized and "состав цен" in normalized and "услуг" in normalized)
+    )
+    has_energy_subject = any(marker in normalized for marker in (
+        "электроэнерг", "электрическ", "мощност", "пунц",
+    )) or bool(re.search(r"(?<![а-яa-z0-9])ээ(?![а-яa-z0-9])", normalized)) or implicit_energy_context
+    has_composition_intent = any(marker in normalized for marker in (
+        "состоит", "составля", "складыва", "структур", "част",
+        "входит", "формиру", "покуп", "передач", "сбыт", "иным услуг",
+    ))
+    return has_price_subject and has_energy_subject and has_composition_intent
+
+
 def has_document_occurrence_intent(question: str) -> bool:
     """Recognize requests for a positive list of documents containing a subject."""
     normalized = (question or "").lower().replace("ё", "е")
@@ -1128,13 +1146,22 @@ def diversify_context_results(ranked: list[dict], question: str, top_k: int) -> 
     requested = sorted(requested_formula_terms(question), key=lambda value: (-len(value), value))
     section_numbers = requested_section_numbers(question)
     category = price_category_number(question)
-    generic_category = not category and mentions_price_category_subject(question)
+    generic_category = not category and (
+        mentions_price_category_subject(question)
+        or is_price_composition_question(question)
+    )
     category_matches = [
         item for item in ranked
         if (
             category and price_category_item_matches(item, category)
         ) or (
-            generic_category and document_occurrence_item_matches(item, question)
+            generic_category and (
+                document_occurrence_item_matches(item, question)
+                or any(
+                    str(query).startswith("price-category-exact:generic")
+                    for query in item.get("matched_queries", [])
+                )
+            )
         )
     ]
 
@@ -3475,7 +3502,10 @@ class RAGAgent:
     def _price_category_seed_results(self, question: str, limit: int = 60) -> list[dict]:
         """Seed direct definition and calculation clauses for one price category."""
         category = price_category_number(question)
-        generic_category = mentions_price_category_subject(question)
+        generic_category = (
+            mentions_price_category_subject(question)
+            or is_price_composition_question(question)
+        )
         if not category and not generic_category:
             return []
         source_signals: dict[str, dict[str, bool]] = {}

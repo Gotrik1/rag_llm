@@ -25,6 +25,7 @@ from rag_agent import (
     generate_extractive_value_answer,
     generate_image_transcription_answer,
     is_document_occurrence_question,
+    is_price_composition_question,
     matching_explicit_sources,
     normalize_user_question,
     _question_hash,
@@ -832,6 +833,54 @@ class PrismQueryTests(unittest.TestCase):
         seeds = agent._price_category_seed_results("Что значит ЦК в расчётах электроэнергии?")
 
         self.assertEqual({item["file"] for item in seeds}, {"rules.docx", "method.docx"})
+
+    def test_price_composition_paraphrases_activate_generic_category_coverage(self):
+        questions = (
+            "Из чего состоит цена на электроэнергию?",
+            "Как формируется итоговая стоимость электроэнергии и мощности?",
+            "из чего складывается цена ээ",
+            "Какие части ПУНЦ относятся к покупке, передаче, сбыту и иным услугам?",
+            "Сопоставь законодательную структуру цены и расчёт в системе.",
+            "Дай полный состав цены без подмены услуг составляющими цены.",
+        )
+
+        self.assertTrue(all(is_price_composition_question(question) for question in questions))
+        self.assertFalse(is_price_composition_question("Как рассчитывается ИВ0?"))
+
+    def test_price_composition_seed_keeps_direct_category_documents(self):
+        class Node:
+            def __init__(self, text, metadata):
+                self.text = text
+                self.metadata = metadata
+
+        agent = object.__new__(RAGAgent)
+        agent._all_nodes = [
+            Node(
+                "Общая структура цены за электроэнергию по ценовым категориям.",
+                {"file_name": "method.docx", "section_path": "Структура цены"},
+            ),
+            Node(
+                "Предельные уровни нерегулируемых цен определяются по ценовым категориям.",
+                {"file_name": "1179.docx", "section_path": "Правила"},
+            ),
+            Node(
+                "Потребитель выбирает ценовую категорию с учётом условий договора.",
+                {"file_name": "442.docx", "section_path": "Основные положения"},
+            ),
+            Node(
+                "Стоимость отклонений на балансирующем рынке.",
+                {"file_name": "r12.docx", "section_path": "ОРЭМ"},
+            ),
+        ]
+
+        seeds = agent._price_category_seed_results(
+            "Как формируется итоговая стоимость электроэнергии и мощности?"
+        )
+
+        self.assertEqual(
+            {item["file"] for item in seeds},
+            {"method.docx", "1179.docx", "442.docx"},
+        )
 
     def test_generic_price_category_context_reserves_one_hit_per_document(self):
         ranked = [

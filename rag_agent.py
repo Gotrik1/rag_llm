@@ -97,6 +97,7 @@ RETRIEVAL_TOPIC_PROFILES: tuple[dict[str, object], ...] = (
             "442 1179 первая ценовая категория нерегулируемые цены",
         ),
         "source_families": (("методик", "1-6"), ("442",), ("1179",)),
+        "locator_terms": ("порядок определения стоимости 1 цк",),
     },
     {
         "name": "sixth-price-category",
@@ -107,6 +108,7 @@ RETRIEVAL_TOPIC_PROFILES: tuple[dict[str, object], ...] = (
             "442 1179 шестая ценовая категория нерегулируемые цены",
         ),
         "source_families": (("методик", "1-6"), ("442",), ("1179",)),
+        "locator_terms": ("порядок определения стоимости и цены для 5 и 6 цк",),
     },
     {
         "name": "transmission-calculation",
@@ -941,17 +943,26 @@ def reserve_topic_source_coverage(ranked: list[dict], question: str, top_k: int)
     for profile in profiles:
         for family in profile["source_families"]:
             terms = tuple(str(term).casefold() for term in family)
-            match = next(
-                (
-                    item for item in ranked
-                    if all(
-                        term in user_facing_source_name(item.get("file", "")).casefold().replace("ё", "е")
-                        for term in terms
-                    )
-                    and user_facing_source_name(item.get("file", "")).casefold() not in reserved_documents
+            candidates = [
+                (index, item) for index, item in enumerate(ranked)
+                if all(
+                    term in user_facing_source_name(item.get("file", "")).casefold().replace("ё", "е")
+                    for term in terms
+                )
+                and user_facing_source_name(item.get("file", "")).casefold() not in reserved_documents
+            ]
+            locator_terms = tuple(str(term) for term in profile.get("locator_terms", ()))
+            match = max(
+                candidates,
+                key=lambda pair: (
+                    any(
+                        term in f"{pair[1].get('section_path', '')} {pair[1].get('section_title', '')}".casefold().replace("ё", "е")
+                        for term in locator_terms
+                    ),
+                    -pair[0],
                 ),
-                None,
-            )
+                default=(0, None),
+            )[1]
             if match is None:
                 continue
             reserved.append(match)
@@ -4396,6 +4407,16 @@ class RAGAgent:
             # A narrowly matched governing clause is safer than mixing in
             # similarly-worded exceptions from later chapters.
             return concept_selected[:3]
+        if not explicit_sources:
+            # PRISM can legitimately prefer formula-bearing chunks, but that
+            # must not erase the governing regulation or the exact method
+            # section already found in the broader ranked pool.
+            selected_ids = {id(item) for item in selected}
+            selected = reserve_topic_source_coverage(
+                [*selected, *(item for item in ranked if id(item) not in selected_ids)],
+                selection_question,
+                top_k,
+            )[:top_k]
         normalized = question.lower().replace("ё", "е")
         if "параметр" in normalized and any(
             marker in normalized for marker in ("добав", "созда", "новый", "завест")

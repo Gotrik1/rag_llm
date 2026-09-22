@@ -71,6 +71,26 @@ class PrismQueryTests(unittest.TestCase):
         ranked = [{"file": "manual.docx", "score": 1.0, "text": "x"}]
         self.assertIs(reserve_topic_source_coverage(ranked, "Как создать параметр?", 10), ranked)
 
+    def test_topic_coverage_prefers_exact_price_category_locator(self):
+        ranked = [
+            {
+                "file": "Методика расчета стоимости 1-6ЦК v2.docx",
+                "score": 2.0,
+                "section_path": "Общие положения",
+                "text": "generic",
+            },
+            {
+                "file": "Методика расчета стоимости 1-6ЦК v2.docx",
+                "score": 1.0,
+                "section_path": "5.1 Порядок определения стоимости 1 ЦК",
+                "text": "exact",
+            },
+        ]
+
+        covered = reserve_topic_source_coverage(ranked, "Как рассчитывается 1 ЦК?", 2)
+
+        self.assertEqual(covered[0]["text"], "exact")
+
     def test_latest_document_revision_gets_soft_preference(self):
         ranked = [
             {"file": "old_method_v1.docx", "score": 1.04, "text": "old"},

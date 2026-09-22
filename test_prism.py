@@ -1489,6 +1489,21 @@ class PrismQueryTests(unittest.TestCase):
         self.assertIn("V_", answer)
         self.assertIn("r12.docx", answer)
 
+    def test_comparison_derives_ivo_formula_from_explicit_prose_definition(self):
+        answer = ensure_requested_formula_coverage(
+            "ИВ0 — внешняя инициатива.",
+            "Чем ИВ0 отличается от расчёта стоимости?",
+            [],
+            [{
+                "file": "r12.docx",
+                "section_path": "Внешняя инициатива ИВ0",
+                "text": "ИВ0 равна разнице между объемом по УДГ и объемом планового ДГ.",
+            }],
+        )
+
+        self.assertIn(r"V_{\text{ИВ0}}", answer)
+        self.assertIn(r"V_{\text{УДГ}}", answer)
+
     def test_price_composition_answer_cites_all_governing_source_families(self):
         context = [
             {"file": "Методика расчета стоимости 1-6ЦК v2.docx", "section_path": "5. Порядок"},

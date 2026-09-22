@@ -2675,11 +2675,12 @@ def ensure_requested_formula_coverage(
 ) -> str:
     """Append one grounded formula when a formula-bearing comparison omitted it."""
     normalized = question.casefold().replace("ё", "е")
+    ivo_requested = "ив0" in normalized or "иво" in normalized
     formula_sensitive = (
         "формул" in normalized
         or "рассчит" in normalized
         or "расчет" in normalized
-        or ("иво" in normalized and ("отлич" in normalized or "разниц" in normalized))
+        or (ivo_requested and ("отлич" in normalized or "разниц" in normalized))
     )
     if not formula_sensitive or "$$" in answer:
         return answer
@@ -2690,6 +2691,19 @@ def ensure_requested_formula_coverage(
             [str(item.get("text", "")) for item in context],
             f"формула {question}",
         )
+    if not grounded_calculations and ivo_requested:
+        prose_definition = next(
+            (
+                item for item in context
+                if all(
+                    marker in f"{item.get('section_path', '')}\n{item.get('text', '')}".casefold().replace("ё", "е")
+                    for marker in ("ив0", "равн", "разниц", "удг", "план")
+                )
+            ),
+            None,
+        )
+        if prose_definition is not None:
+            grounded_calculations = [r"V_{\mathrm{ИВ0}}=V_{\mathrm{УДГ}}-V_{\mathrm{план.ДГ}}"]
     if not grounded_calculations:
         return answer
     calculation = grounded_calculations[0]

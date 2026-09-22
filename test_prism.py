@@ -337,6 +337,20 @@ class PrismQueryTests(unittest.TestCase):
 
         self.assertEqual(matched, {"upload-b_method.docx"})
 
+    def test_inflected_method_reference_resolves_category_range_method(self):
+        aliases = {
+            "upload-a_method.docx": "Методика расчета стоимости 1-6ЦК v2.docx",
+            "upload-b_442.md": "Постановление Правительства РФ от 04.05.2012 N 442.md",
+            "upload-c_1179.docx": "Постановление Правительства РФ от 29.12.2011 N 1179.docx",
+        }
+
+        matched = matching_explicit_sources(
+            "Сравни методику 1 ЦК с нормами постановлений 442 и 1179.",
+            aliases,
+        )
+
+        self.assertEqual(matched, set(aliases))
+
     def test_private_scope_lexical_seed_considers_project_document(self):
         agent = object.__new__(RAGAgent)
         agent._all_nodes = [

@@ -1012,6 +1012,8 @@ def matching_explicit_sources(question: str, source_aliases: dict[str, str] | No
     query_tokens = source_reference_tokens(question)
     query_numbers = {token for token in query_tokens if token.isdigit() and len(token) >= 2}
     normalized_question = (question or "").casefold().replace("ё", "е")
+    requested_category = price_category_number(normalized_question)
+    has_method_cue = bool(re.search(r"\bметодик\w*\b", normalized_question))
     has_source_cue = bool(re.search(
         r"\b(?:документ\w*|файл\w*|методик\w*|постановлен\w*|пп|регламент\w*|инструкц\w*)\b",
         normalized_question,
@@ -1036,7 +1038,30 @@ def matching_explicit_sources(question: str, source_aliases: dict[str, str] | No
             len(alpha_overlap) >= 2
             and sum(map(len, alpha_overlap)) >= 8
         )
-        if numeric_anchor or descriptive_anchor:
+        normalized_alias = str(alias or "").casefold().replace("ё", "е")
+        category_range_match = re.search(r"(?<!\d)([1-6])\s*[-–—]\s*([1-6])\s*цк", normalized_alias)
+        alias_covers_category = bool(
+            requested_category
+            and (
+                contains_price_category(normalized_alias, requested_category)
+                or (
+                    category_range_match
+                    and int(category_range_match.group(1))
+                    <= int(requested_category)
+                    <= int(category_range_match.group(2))
+                )
+            )
+        )
+        # Russian inflection makes ``методику`` and ``методика`` different
+        # lexical tokens.  When the query explicitly names a methodology and
+        # a price category, the category/range is a safer anchor than a loose
+        # token overlap and keeps the governing methodology in comparisons.
+        method_category_anchor = bool(
+            has_method_cue
+            and alias_covers_category
+            and re.search(r"\bметодик\w*\b", normalized_alias)
+        )
+        if numeric_anchor or descriptive_anchor or method_category_anchor:
             matches.add(Path(str(source)).name.casefold())
     return matches
 

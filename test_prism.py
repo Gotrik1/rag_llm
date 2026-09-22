@@ -84,6 +84,16 @@ class PrismQueryTests(unittest.TestCase):
 
         self.assertEqual(matching_explicit_sources("Какие формулы применяются для стоимости по 1 ЦК?", aliases), set())
 
+    def test_generic_business_phrase_never_pins_a_similarly_named_method(self):
+        aliases = {
+            "method.docx": "Методика расчета стоимости услуг по передаче.docx",
+        }
+
+        self.assertEqual(
+            matching_explicit_sources("Какие варианты расчета стоимости услуг реализованы?", aliases),
+            set(),
+        )
+
     def test_named_regulation_numbers_resolve_despite_grammatical_form(self):
         aliases = {
             "method.docx": "Методика расчета стоимости 1-6ЦК v2.docx",

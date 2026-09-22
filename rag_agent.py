@@ -1016,9 +1016,10 @@ def matching_explicit_sources(question: str, source_aliases: dict[str, str] | No
         # Such a false positive turns a soft semantic question into a hard
         # single-document filter and hides otherwise exact evidence.
         descriptive_anchor = (
+            has_source_cue
+            and
             len(alpha_overlap) >= 2
             and sum(map(len, alpha_overlap)) >= 8
-            and (has_source_cue or (len(alpha_overlap) >= 3 and sum(map(len, alpha_overlap)) >= 18))
         )
         if numeric_anchor or descriptive_anchor:
             matches.add(Path(str(source)).name.casefold())

@@ -18,6 +18,7 @@ from rag_agent import (
     extract_formula_lines_from_texts,
     ensure_price_category_source_coverage,
     ensure_requested_formula_coverage,
+    ensure_price_composition_source_coverage,
     formula_sibling_results,
     format_formula_for_display,
     format_formula_for_katex,
@@ -1468,6 +1469,23 @@ class PrismQueryTests(unittest.TestCase):
         self.assertIn("$$", answer)
         self.assertIn("V_", answer)
         self.assertIn("r12.docx", answer)
+
+    def test_price_composition_answer_cites_all_governing_source_families(self):
+        context = [
+            {"file": "Методика расчета стоимости 1-6ЦК v2.docx", "section_path": "5. Порядок"},
+            {"file": "Постановление Правительства РФ от 29.12.2011 N 1179.docx", "section_path": "Правила"},
+            {"file": "Постановление Правительства РФ от 04.05.2012 N 442.docx", "section_path": "Основные положения"},
+        ]
+        answer = ensure_price_composition_source_coverage(
+            "Цена включает покупку.",
+            "Из чего состоит цена на электроэнергию?",
+            context,
+        )
+
+        self.assertIn("передаче", answer)
+        self.assertIn("сбытовая надбавка", answer)
+        self.assertIn("иные услуги", answer)
+        self.assertEqual(answer.count("[Источник:"), 3)
 
     def test_legacy_formula_is_safe_for_markdown_display(self):
         displayed = format_formula_for_display(

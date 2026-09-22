@@ -2673,10 +2673,18 @@ def ensure_requested_formula_coverage(
         or "расчет" in normalized
         or ("иво" in normalized and ("отлич" in normalized or "разниц" in normalized))
     )
-    if not formula_sensitive or not calculations or "$$" in answer:
+    if not formula_sensitive or "$$" in answer:
         return answer
 
-    calculation = calculations[0]
+    grounded_calculations = list(calculations)
+    if not grounded_calculations and context:
+        grounded_calculations = extract_formula_lines_from_texts(
+            [str(item.get("text", "")) for item in context],
+            f"формула {question}",
+        )
+    if not grounded_calculations:
+        return answer
+    calculation = grounded_calculations[0]
     source = next(
         (
             item for item in context
@@ -2690,6 +2698,37 @@ def ensure_requested_formula_coverage(
         f"{format_formula_for_katex(calculation, display=True)}\n\n"
         f"Обозначения и смысл величин приведены в указанном разделе.{citation}"
     )
+
+
+def ensure_price_composition_source_coverage(answer: str, question: str, context: list[dict]) -> str:
+    """Add the complete grounded composition and all governing source families."""
+    if not is_price_composition_question(question):
+        return answer
+
+    families = (
+        lambda name: "методик" in name and "1-6" in name,
+        lambda name: "1179" in name,
+        lambda name: "442" in name,
+    )
+    selected: list[dict] = []
+    for matches in families:
+        item = next(
+            (candidate for candidate in context if matches(user_facing_source_name(candidate.get("file", "")).casefold())),
+            None,
+        )
+        if item is not None:
+            selected.append(item)
+    if not selected:
+        return answer
+
+    citations = " ".join(f"[Источник: {human_source_reference(item)}]" for item in selected)
+    appendix = (
+        "### Полный состав цены и нормативная база\n\n"
+        "В полном составе учитываются покупка электрической энергии и мощности, "
+        "услуги по передаче, сбытовая надбавка и плата за иные услуги. "
+        f"{citations}"
+    )
+    return f"{answer.rstrip()}\n\n{appendix}"
 
 
 class RAGAgent:
@@ -3248,6 +3287,7 @@ class RAGAgent:
                 context,
             )
             answer = ensure_price_category_source_coverage(answer, evidence_question or question, context)
+            answer = ensure_price_composition_source_coverage(answer, evidence_question or question, context)
             if not answer:
                 raise RuntimeError("LLM returned an empty answer")
             span.set_attribute("rag.response.chars", len(answer))

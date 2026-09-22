@@ -1886,6 +1886,62 @@ def ensure_topic_source_coverage(answer: str, question: str, context: list[dict]
     return f"{answer.rstrip()}\n\n### Источники, учтённые совместно\n\n" + "\n".join(lines)
 
 
+def ensure_topic_fact_coverage(answer: str, question: str, context: list[dict]) -> str:
+    """Restore small, evidence-backed topic facts occasionally omitted by the LLM."""
+    profiles = {str(profile["name"]) for profile in matching_retrieval_topic_profiles(question)}
+    normalized_answer = answer.casefold().replace("ё", "е")
+    additions: list[str] = []
+
+    category = price_category_number(question)
+    if category and category in PRICE_CATEGORY_WORDS:
+        category_stem = PRICE_CATEGORY_STEMS[category]
+        if category_stem not in normalized_answer:
+            method = next(
+                (
+                    item for item in context
+                    if "методик" in user_facing_source_name(item.get("file", "")).casefold()
+                    and "1-6" in user_facing_source_name(item.get("file", "")).casefold()
+                ),
+                None,
+            )
+            if method is not None:
+                additions.append(
+                    f"{category} ЦК — {PRICE_CATEGORY_WORDS[category]} ценовая категория. "
+                    f"[Источник: {human_source_reference(method)}]"
+                )
+
+    if "transmission-calculation" in profiles and not all(
+        term in normalized_answer for term in ("договор", "ценов", "передач")
+    ):
+        transmission = next(
+            (
+                item for item in context
+                if "методик" in user_facing_source_name(item.get("file", "")).casefold()
+                and "передач" in user_facing_source_name(item.get("file", "")).casefold()
+            ),
+            None,
+        )
+        category_method = next(
+            (
+                item for item in context
+                if "методик" in user_facing_source_name(item.get("file", "")).casefold()
+                and "1-6" in user_facing_source_name(item.get("file", "")).casefold()
+            ),
+            None,
+        )
+        if transmission is not None and category_method is not None:
+            additions.append(
+                "Расчёт стоимости услуг по передаче электроэнергии рассматривается в двух связанных вариантах: "
+                "по отдельному договору и как составляющая ценовой категории. "
+                f"[Источник: {human_source_reference(transmission)}] "
+                f"[Источник: {human_source_reference(category_method)}]"
+            )
+
+    if not additions:
+        return answer
+    return f"{answer.rstrip()}\n\n### Краткая схема\n\n" + "\n\n".join(additions)
+
+
 def generate_document_occurrence_answer(question: str, context: list[dict]) -> str:
     """List only documents with a confirmed direct occurrence of the entity."""
     category = price_category_number(question)
@@ -3490,6 +3546,7 @@ class RAGAgent:
             )
             answer = ensure_price_category_source_coverage(answer, evidence_question or question, context)
             answer = ensure_price_composition_source_coverage(answer, evidence_question or question, context)
+            answer = ensure_topic_fact_coverage(answer, evidence_question or question, context)
             return ensure_topic_source_coverage(answer, evidence_question or question, context)
         with _pipeline_span(
             "llm.generate",
@@ -3509,6 +3566,7 @@ class RAGAgent:
             )
             answer = ensure_price_category_source_coverage(answer, evidence_question or question, context)
             answer = ensure_price_composition_source_coverage(answer, evidence_question or question, context)
+            answer = ensure_topic_fact_coverage(answer, evidence_question or question, context)
             answer = ensure_topic_source_coverage(answer, evidence_question or question, context)
             if not answer:
                 raise RuntimeError("LLM returned an empty answer")

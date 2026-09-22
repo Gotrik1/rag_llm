@@ -894,9 +894,10 @@ def build_targeted_queries(question: str) -> list[str]:
     intent = detect_query_intent(question)
     terms = sorted(requested_formula_terms(question), key=lambda value: (-len(value), value))
     understanding = deterministic_query_understanding(question)
-    queries = list(understanding.retrieval_queries)
+    queries: list[str] = []
     for profile in matching_retrieval_topic_profiles(question):
         queries.extend(str(query) for query in profile["queries"])
+    queries.extend(understanding.retrieval_queries)
     for term in terms:
         if intent == "value":
             queries.extend([
@@ -997,7 +998,7 @@ def matching_explicit_sources(question: str, source_aliases: dict[str, str] | No
     query_numbers = {token for token in query_tokens if token.isdigit() and len(token) >= 2}
     normalized_question = (question or "").casefold().replace("ё", "е")
     has_source_cue = bool(re.search(
-        r"\b(?:документ\w*|файл\w*|методик\w*|постановлен\w*|регламент\w*|инструкц\w*)\b",
+        r"\b(?:документ\w*|файл\w*|методик\w*|постановлен\w*|пп|регламент\w*|инструкц\w*)\b",
         normalized_question,
     ))
     matches: set[str] = set()
@@ -1005,7 +1006,11 @@ def matching_explicit_sources(question: str, source_aliases: dict[str, str] | No
         alias_tokens = source_reference_tokens(alias)
         overlap = query_tokens & alias_tokens
         alpha_overlap = {token for token in overlap if not token.isdigit()}
-        numeric_anchor = bool(query_numbers & alias_tokens and alpha_overlap)
+        # A bare business number ("1 ЦК") is not a document reference.  Once
+        # the user explicitly says "постановление 442/1179", however, the
+        # number is the most stable identifier and must resolve even when the
+        # grammatical form differs ("постановление"/"постановлений").
+        numeric_anchor = bool(has_source_cue and query_numbers & alias_tokens)
         # Two generic words from a business phrase (for example, "расчета
         # стоимости") must not be interpreted as an explicit document name.
         # Such a false positive turns a soft semantic question into a hard

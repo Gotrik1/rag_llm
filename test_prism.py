@@ -53,6 +53,11 @@ class PrismQueryTests(unittest.TestCase):
         self.assertTrue(any("1-6" in query for query in queries))
         self.assertEqual(matching_retrieval_topic_profiles("Что такое ПУНЦЭ?")[0]["name"], "punce")
 
+    def test_topic_probes_precede_generic_price_category_expansions(self):
+        queries = build_targeted_queries("какие услуги входят в расчет шестой цк")
+
+        self.assertIn("методика расчета стоимости 1-6 ЦК шестая ценовая категория мощность", queries)
+
     def test_topic_coverage_reserves_distinct_governing_source_families(self):
         ranked = [
             {"file": "noise.docx", "score": 9.0, "text": "noise"},
@@ -70,6 +75,27 @@ class PrismQueryTests(unittest.TestCase):
     def test_topic_coverage_does_not_reorder_unrelated_question(self):
         ranked = [{"file": "manual.docx", "score": 1.0, "text": "x"}]
         self.assertIs(reserve_topic_source_coverage(ranked, "Как создать параметр?", 10), ranked)
+
+    def test_generic_numbered_category_is_not_an_explicit_document_reference(self):
+        aliases = {
+            "method.docx": "Методика расчета стоимости 1-6ЦК v2.docx",
+            "law442.docx": "Постановление Правительства РФ от 04.05.2012 N 442.docx",
+        }
+
+        self.assertEqual(matching_explicit_sources("Какие формулы применяются для стоимости по 1 ЦК?", aliases), set())
+
+    def test_named_regulation_numbers_resolve_despite_grammatical_form(self):
+        aliases = {
+            "method.docx": "Методика расчета стоимости 1-6ЦК v2.docx",
+            "law442.docx": "Постановление Правительства РФ от 04.05.2012 N 442.docx",
+            "law1179.docx": "Постановление Правительства РФ от 29.12.2011 N 1179.docx",
+        }
+
+        matched = matching_explicit_sources(
+            "Сравни методику расчёта 6 ЦК с постановлениями 442 и 1179.", aliases
+        )
+
+        self.assertEqual(matched, {"method.docx", "law442.docx", "law1179.docx"})
 
     def test_topic_coverage_prefers_exact_price_category_locator(self):
         ranked = [

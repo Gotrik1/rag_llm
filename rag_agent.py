@@ -1894,8 +1894,8 @@ def ensure_topic_fact_coverage(answer: str, question: str, context: list[dict]) 
 
     category = price_category_number(question)
     if category and category in PRICE_CATEGORY_WORDS:
-        category_stem = PRICE_CATEGORY_STEMS[category]
-        if category_stem not in normalized_answer:
+        canonical_category_name = PRICE_CATEGORY_WORDS[category]
+        if canonical_category_name not in normalized_answer:
             method = next(
                 (
                     item for item in context
@@ -1906,7 +1906,7 @@ def ensure_topic_fact_coverage(answer: str, question: str, context: list[dict]) 
             )
             if method is not None:
                 additions.append(
-                    f"{category} ЦК — {PRICE_CATEGORY_WORDS[category]} ценовая категория. "
+                    f"{category} ЦК — {canonical_category_name} ценовая категория. "
                     f"[Источник: {human_source_reference(method)}]"
                 )
 

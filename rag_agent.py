@@ -891,13 +891,26 @@ def matching_explicit_sources(question: str, source_aliases: dict[str, str] | No
     """Resolve an explicitly named visible document to its indexed source id."""
     query_tokens = source_reference_tokens(question)
     query_numbers = {token for token in query_tokens if token.isdigit() and len(token) >= 2}
+    normalized_question = (question or "").casefold().replace("ё", "е")
+    has_source_cue = bool(re.search(
+        r"\b(?:документ\w*|файл\w*|методик\w*|постановлен\w*|регламент\w*|инструкц\w*)\b",
+        normalized_question,
+    ))
     matches: set[str] = set()
     for source, alias in (source_aliases or {}).items():
         alias_tokens = source_reference_tokens(alias)
         overlap = query_tokens & alias_tokens
         alpha_overlap = {token for token in overlap if not token.isdigit()}
         numeric_anchor = bool(query_numbers & alias_tokens and alpha_overlap)
-        descriptive_anchor = len(alpha_overlap) >= 2 and sum(map(len, alpha_overlap)) >= 8
+        # Two generic words from a business phrase (for example, "расчета
+        # стоимости") must not be interpreted as an explicit document name.
+        # Such a false positive turns a soft semantic question into a hard
+        # single-document filter and hides otherwise exact evidence.
+        descriptive_anchor = (
+            len(alpha_overlap) >= 2
+            and sum(map(len, alpha_overlap)) >= 8
+            and (has_source_cue or (len(alpha_overlap) >= 3 and sum(map(len, alpha_overlap)) >= 18))
+        )
         if numeric_anchor or descriptive_anchor:
             matches.add(Path(str(source)).name.casefold())
     return matches
@@ -3502,9 +3515,10 @@ class RAGAgent:
     def _price_category_seed_results(self, question: str, limit: int = 60) -> list[dict]:
         """Seed direct definition and calculation clauses for one price category."""
         category = price_category_number(question)
+        price_composition = is_price_composition_question(question)
         generic_category = (
             mentions_price_category_subject(question)
-            or is_price_composition_question(question)
+            or price_composition
         )
         if not category and not generic_category:
             return []
@@ -3579,6 +3593,18 @@ class RAGAgent:
                 score += 1.4
             if any(marker in lower for marker in ("стоимость электроэнергии", "покупной мощности", "сетевой мощности")):
                 score += 0.7
+            if price_composition:
+                # These sources define complementary layers of the retail
+                # price: calculation method, governing price rules and market
+                # application rules. Reserve them ahead of similarly worded
+                # OREM formulas without hard-coding a single answer document.
+                source_name = source.lower().replace("ё", "е")
+                if "1-6цк" in source_name:
+                    score += 4.0
+                elif "1179" in source_name:
+                    score += 3.8
+                elif "442" in source_name:
+                    score += 3.6
             item = {
                 "file": meta.get("file_name", meta.get("file_path", "?")),
                 "score": round(score, 4),

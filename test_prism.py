@@ -217,6 +217,31 @@ class PrismQueryTests(unittest.TestCase):
 
         self.assertEqual(matched, {"upload-a_2012-05-04-пп442-функционирование-ррэ.md"})
 
+    def test_generic_business_phrase_does_not_become_explicit_source_filter(self):
+        aliases = {
+            "upload-a_r12.docx": "r12.docx",
+            "upload-b_method.docx": "Методика расчета стоимости 1-6ЦК v2.docx",
+        }
+
+        matched = matching_explicit_sources(
+            "Чем ИВ0 отличается от расчёта стоимости?",
+            aliases,
+        )
+
+        self.assertEqual(matched, set())
+
+    def test_explicit_method_reference_still_resolves_visible_source_alias(self):
+        aliases = {
+            "upload-b_method.docx": "Методика расчета стоимости 1-6ЦК v2.docx",
+        }
+
+        matched = matching_explicit_sources(
+            "Что сказано в методике расчета стоимости 1-6ЦК?",
+            aliases,
+        )
+
+        self.assertEqual(matched, {"upload-b_method.docx"})
+
     def test_private_scope_lexical_seed_considers_project_document(self):
         agent = object.__new__(RAGAgent)
         agent._all_nodes = [
@@ -857,7 +882,7 @@ class PrismQueryTests(unittest.TestCase):
         agent._all_nodes = [
             Node(
                 "Общая структура цены за электроэнергию по ценовым категориям.",
-                {"file_name": "method.docx", "section_path": "Структура цены"},
+                {"file_name": "Методика расчета стоимости 1-6ЦК.docx", "section_path": "Структура цены"},
             ),
             Node(
                 "Предельные уровни нерегулируемых цен определяются по ценовым категориям.",
@@ -879,8 +904,12 @@ class PrismQueryTests(unittest.TestCase):
 
         self.assertEqual(
             {item["file"] for item in seeds},
-            {"method.docx", "1179.docx", "442.docx"},
+            {"Методика расчета стоимости 1-6ЦК.docx", "1179.docx", "442.docx"},
         )
+
+        scores = {item["file"]: item["score"] for item in seeds}
+        self.assertGreater(scores["Методика расчета стоимости 1-6ЦК.docx"], scores["442.docx"])
+        self.assertGreater(scores["1179.docx"], scores["442.docx"])
 
     def test_generic_price_category_context_reserves_one_hit_per_document(self):
         ranked = [

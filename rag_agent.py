@@ -3269,7 +3269,15 @@ class RAGAgent:
             self._generation_state.from_cache = True
             with _pipeline_span("cache.hit"):
                 pass
-            return str(cached["answer"])
+            answer = sanitize_grounded_answer(str(cached["answer"]), question, calculations)
+            answer = ensure_requested_formula_coverage(
+                answer,
+                evidence_question or question,
+                calculations,
+                context,
+            )
+            answer = ensure_price_category_source_coverage(answer, evidence_question or question, context)
+            return ensure_price_composition_source_coverage(answer, evidence_question or question, context)
         with _pipeline_span(
             "llm.generate",
             attributes={

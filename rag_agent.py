@@ -75,6 +75,54 @@ CACHE_VERSION    = "v36-soft-domain-routing-2026-09-17-1"
 QUERY_UNDERSTANDING_VERSION = "v2"
 MAX_OUTPUT_TOKENS = 4056
 
+# Soft topic routing never acts as an ACL. It only makes broad business
+# questions probe both implementation manuals and governing regulations.
+RETRIEVAL_TOPIC_PROFILES: tuple[dict[str, object], ...] = (
+    {
+        "name": "punce",
+        "question_patterns": (r"\bпунц[эе]?\b", r"предельн\w*\s+уров\w*\s+нерегулируем\w*\s+цен"),
+        "queries": (
+            "ПУНЦ предельный уровень нерегулируемых цен определение состав расчет",
+            "1179 предельные уровни нерегулируемых цен ценовые категории",
+            "методика расчета стоимости 1-6 ЦК ПУНЦ алгоритм",
+        ),
+        "source_families": (("1179",), ("методик", "1-6")),
+    },
+    {
+        "name": "first-price-category",
+        "question_patterns": (r"\b(?:1|перв\w*)\s*(?:цк|ценов\w*\s+категор)",),
+        "queries": (
+            "порядок определения стоимости 1 ЦК первая ценовая категория",
+            "методика расчета стоимости 1-6 ЦК первая ценовая категория формулы",
+            "442 1179 первая ценовая категория нерегулируемые цены",
+        ),
+        "source_families": (("методик", "1-6"), ("442",), ("1179",)),
+    },
+    {
+        "name": "sixth-price-category",
+        "question_patterns": (r"\b(?:6|шест\w*)\s*(?:цк|ценов\w*\s+категор)",),
+        "queries": (
+            "порядок определения стоимости и цены для 5 и 6 ЦК",
+            "методика расчета стоимости 1-6 ЦК шестая ценовая категория мощность",
+            "442 1179 шестая ценовая категория нерегулируемые цены",
+        ),
+        "source_families": (("методик", "1-6"), ("442",), ("1179",)),
+    },
+    {
+        "name": "transmission-calculation",
+        "question_patterns": (
+            r"(?:расчет\w*|рассчит\w*|стоимост\w*).{0,45}(?:передач\w*)",
+            r"передач\w*.{0,45}(?:договор\w*|цк|ценов\w*\s+категор)",
+        ),
+        "queries": (
+            "методика расчета стоимости услуг по передаче договор",
+            "методика расчета стоимости 1-6 ЦК услуги по передаче",
+            "передача электроэнергии отдельный договор и в составе ценовой категории",
+        ),
+        "source_families": (("методик", "передач"), ("методик", "1-6")),
+    },
+)
+
 PROMPT_INJECTION_MARKERS = (
     "ignore all instructions",
     "ignore previous instructions",
@@ -845,6 +893,8 @@ def build_targeted_queries(question: str) -> list[str]:
     terms = sorted(requested_formula_terms(question), key=lambda value: (-len(value), value))
     understanding = deterministic_query_understanding(question)
     queries = list(understanding.retrieval_queries)
+    for profile in matching_retrieval_topic_profiles(question):
+        queries.extend(str(query) for query in profile["queries"])
     for term in terms:
         if intent == "value":
             queries.extend([
@@ -867,6 +917,49 @@ def build_targeted_queries(question: str) -> list[str]:
             seen.add(normalized)
             deduped.append(query)
     return deduped[:6]
+
+
+def matching_retrieval_topic_profiles(question: str) -> tuple[dict[str, object], ...]:
+    """Return all soft topic profiles that match the user's actual subject."""
+    normalized = normalize_user_question(question)[0].casefold().replace("ё", "е")
+    return tuple(
+        profile
+        for profile in RETRIEVAL_TOPIC_PROFILES
+        if any(re.search(str(pattern), normalized) for pattern in profile["question_patterns"])
+    )
+
+
+def reserve_topic_source_coverage(ranked: list[dict], question: str, top_k: int) -> list[dict]:
+    """Reserve one best chunk from each relevant document family, without filtering."""
+    profiles = matching_retrieval_topic_profiles(question)
+    if not profiles:
+        return ranked
+
+    reserved: list[dict] = []
+    reserved_ids: set[int] = set()
+    reserved_documents: set[str] = set()
+    for profile in profiles:
+        for family in profile["source_families"]:
+            terms = tuple(str(term).casefold() for term in family)
+            match = next(
+                (
+                    item for item in ranked
+                    if all(
+                        term in user_facing_source_name(item.get("file", "")).casefold().replace("ё", "е")
+                        for term in terms
+                    )
+                    and user_facing_source_name(item.get("file", "")).casefold() not in reserved_documents
+                ),
+                None,
+            )
+            if match is None:
+                continue
+            reserved.append(match)
+            reserved_ids.add(id(match))
+            reserved_documents.add(user_facing_source_name(match.get("file", "")).casefold())
+            if len(reserved) >= top_k:
+                return reserved
+    return [*reserved, *(item for item in ranked if id(item) not in reserved_ids)]
 
 
 SOURCE_REFERENCE_STOP_WORDS = {
@@ -4153,7 +4246,14 @@ class RAGAgent:
             f"{question} {'РРЭ' if domain == 'rre' else 'ОРЭМ'}"
             for domain in domain_routing.active_domains
         ]
-        query_candidates = [*(retrieval_queries or ()), *domain_queries, *build_targeted_queries(question)]
+        # Deterministic probes precede free-form LLM expansions. Previously the
+        # eight-query budget could fill before a regulation probe was reached.
+        query_candidates = [
+            question,
+            *build_targeted_queries(question),
+            *(retrieval_queries or ()),
+            *domain_queries,
+        ]
         query_plan: list[str] = []
         seen_queries: set[str] = set()
         for candidate in query_candidates:
@@ -4278,6 +4378,8 @@ class RAGAgent:
             source_versions,
             explicit_sources=explicit_sources,
         )
+        if not explicit_sources:
+            ranked = reserve_topic_source_coverage(ranked, selection_question, top_k)
         if priority_sources and not explicit_sources:
             # Vector/BM25 scores are backend-specific and can be much larger
             # than lexical seed scores.  Reserve only a bounded top-k quota so

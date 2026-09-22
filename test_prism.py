@@ -29,11 +29,13 @@ from rag_agent import (
     is_document_occurrence_question,
     is_price_composition_question,
     matching_explicit_sources,
+    matching_retrieval_topic_profiles,
     normalize_user_question,
     _question_hash,
     parse_query_understanding,
     price_category_number,
     prioritize_scoped_results,
+    reserve_topic_source_coverage,
     relationship_expansion_results,
     refine_prism_query,
     rerank_context_results,
@@ -44,6 +46,31 @@ from rag_agent import (
 
 
 class PrismQueryTests(unittest.TestCase):
+    def test_punce_topic_expands_normative_and_implementation_queries(self):
+        queries = build_targeted_queries("пунцэ что это и как считается")
+
+        self.assertTrue(any("1179" in query for query in queries))
+        self.assertTrue(any("1-6" in query for query in queries))
+        self.assertEqual(matching_retrieval_topic_profiles("Что такое ПУНЦЭ?")[0]["name"], "punce")
+
+    def test_topic_coverage_reserves_distinct_governing_source_families(self):
+        ranked = [
+            {"file": "noise.docx", "score": 9.0, "text": "noise"},
+            {"file": "Постановление 1179.docx", "score": 0.7, "text": "norm"},
+            {"file": "Методика расчета стоимости 1-6ЦК v2.docx", "score": 0.6, "text": "method"},
+            {"file": "other.docx", "score": 8.0, "text": "other"},
+        ]
+
+        covered = reserve_topic_source_coverage(ranked, "Что такое ПУНЦ и как он рассчитывается?", 4)
+
+        self.assertEqual(covered[0]["file"], "Постановление 1179.docx")
+        self.assertEqual(covered[1]["file"], "Методика расчета стоимости 1-6ЦК v2.docx")
+        self.assertEqual({item["file"] for item in covered}, {item["file"] for item in ranked})
+
+    def test_topic_coverage_does_not_reorder_unrelated_question(self):
+        ranked = [{"file": "manual.docx", "score": 1.0, "text": "x"}]
+        self.assertIs(reserve_topic_source_coverage(ranked, "Как создать параметр?", 10), ranked)
+
     def test_latest_document_revision_gets_soft_preference(self):
         ranked = [
             {"file": "old_method_v1.docx", "score": 1.04, "text": "old"},

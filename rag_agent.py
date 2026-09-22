@@ -1844,6 +1844,48 @@ def ensure_price_category_source_coverage(answer: str, question: str, context: l
     return answer
 
 
+def ensure_topic_source_coverage(answer: str, question: str, context: list[dict]) -> str:
+    """Expose every reserved topic-family source as a human-facing citation."""
+    profiles = matching_retrieval_topic_profiles(question)
+    if not profiles:
+        return answer
+
+    normalized_answer = answer.casefold().replace("ё", "е")
+    missing: list[dict] = []
+    seen_documents: set[str] = set()
+    for profile in profiles:
+        for family in profile["source_families"]:
+            terms = tuple(str(term).casefold() for term in family)
+            match = next(
+                (
+                    item for item in context
+                    if all(
+                        term in user_facing_source_name(item.get("file", "")).casefold().replace("ё", "е")
+                        for term in terms
+                    )
+                ),
+                None,
+            )
+            if match is None:
+                continue
+            source_name = user_facing_source_name(match.get("file", ""))
+            source_key = source_name.casefold().replace("ё", "е")
+            if source_key in seen_documents or source_key in normalized_answer:
+                continue
+            seen_documents.add(source_key)
+            missing.append(match)
+
+    if not missing:
+        return answer
+    lines = [
+        f"- **{user_facing_source_name(item.get('file', ''))}** — "
+        f"{source_locator(item.get('section_path', item.get('section', '')), item.get('page_number'))}. "
+        f"[Источник: {human_source_reference(item)}]"
+        for item in missing
+    ]
+    return f"{answer.rstrip()}\n\n### Источники, учтённые совместно\n\n" + "\n".join(lines)
+
+
 def generate_document_occurrence_answer(question: str, context: list[dict]) -> str:
     """List only documents with a confirmed direct occurrence of the entity."""
     category = price_category_number(question)
@@ -3447,7 +3489,8 @@ class RAGAgent:
                 context,
             )
             answer = ensure_price_category_source_coverage(answer, evidence_question or question, context)
-            return ensure_price_composition_source_coverage(answer, evidence_question or question, context)
+            answer = ensure_price_composition_source_coverage(answer, evidence_question or question, context)
+            return ensure_topic_source_coverage(answer, evidence_question or question, context)
         with _pipeline_span(
             "llm.generate",
             attributes={
@@ -3466,6 +3509,7 @@ class RAGAgent:
             )
             answer = ensure_price_category_source_coverage(answer, evidence_question or question, context)
             answer = ensure_price_composition_source_coverage(answer, evidence_question or question, context)
+            answer = ensure_topic_source_coverage(answer, evidence_question or question, context)
             if not answer:
                 raise RuntimeError("LLM returned an empty answer")
             span.set_attribute("rag.response.chars", len(answer))

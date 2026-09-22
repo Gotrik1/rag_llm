@@ -17,6 +17,7 @@ from rag_agent import (
     extract_chunk_metadata,
     extract_formula_lines_from_texts,
     ensure_price_category_source_coverage,
+    ensure_topic_source_coverage,
     ensure_requested_formula_coverage,
     ensure_price_composition_source_coverage,
     formula_sibling_results,
@@ -85,6 +86,34 @@ class PrismQueryTests(unittest.TestCase):
     def test_topic_coverage_does_not_reorder_unrelated_question(self):
         ranked = [{"file": "manual.docx", "score": 1.0, "text": "x"}]
         self.assertIs(reserve_topic_source_coverage(ranked, "Как создать параметр?", 10), ranked)
+
+    def test_topic_source_coverage_exposes_missing_documents_with_locators(self):
+        context = [
+            {
+                "file": "Методика расчета стоимости 1-6ЦК v2.docx",
+                "section_path": "5 > 5.1 Порядок определения стоимости 1 ЦК",
+            },
+            {
+                "file": "Постановление Правительства РФ от 04.05.2012 N 442.md",
+                "section_path": "79. Расчетный период",
+            },
+            {
+                "file": "Постановление Правительства РФ от 29.12.2011 N 1179.docx",
+                "section_path": "2. Предельные уровни цен",
+            },
+        ]
+
+        answer = ensure_topic_source_coverage(
+            "Первая ценовая категория рассчитывается по объёму электроэнергии.",
+            "Как рассчитывается 1 ЦК?",
+            context,
+        )
+
+        self.assertIn("Источники, учтённые совместно", answer)
+        self.assertIn("Методика расчета стоимости 1-6ЦК v2.docx", answer)
+        self.assertIn("04.05.2012 N 442.md", answer)
+        self.assertIn("29.12.2011 N 1179.docx", answer)
+        self.assertIn("5.1 Порядок определения стоимости 1 ЦК", answer)
 
     def test_generic_numbered_category_is_not_an_explicit_document_reference(self):
         aliases = {

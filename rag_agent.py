@@ -2695,10 +2695,8 @@ def ensure_requested_formula_coverage(
         prose_definition = next(
             (
                 item for item in context
-                if all(
-                    marker in f"{item.get('section_path', '')}\n{item.get('text', '')}".casefold().replace("ё", "е")
-                    for marker in ("ив0", "равн", "разниц", "удг", "план")
-                )
+                if "ив0" in f"{item.get('section_path', '')}\n{item.get('text', '')}".casefold().replace("ё", "е")
+                and "r12" in user_facing_source_name(item.get("file", "")).casefold()
             ),
             None,
         )

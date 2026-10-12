@@ -2797,6 +2797,7 @@ def apply_document_version_preference(
     source_versions: dict[str, str] | None,
     *,
     explicit_sources: set[str] | None = None,
+    preserve_order: bool = False,
 ) -> list[dict]:
     """Softly prefer current revisions while keeping historical evidence searchable."""
     if not source_versions:
@@ -2817,7 +2818,10 @@ def apply_document_version_preference(
                 item["score"] = round(float(item.get("score", 0.0)) + adjustment, 4)
                 item["version_adjustment"] = adjustment
         adjusted.append(item)
-    return sorted(adjusted, key=lambda item: float(item.get("score", 0.0)), reverse=True)
+    # After section packing, order expresses applicability and completeness.
+    # A section score and a retriever score have different scales; comparing
+    # them would move the governing section behind individual semantic hits.
+    return adjusted if preserve_order else sorted(adjusted, key=lambda item: float(item.get("score", 0.0)), reverse=True)
 
 
 def sanitize_grounded_answer(answer: str, question: str, allowed_calculations: list[str]) -> str:
@@ -4655,7 +4659,9 @@ class RAGAgent:
         )
         if spec.target_sections:
             packed = select_prism_evidence(packed, spec, max(top_k, len(packed)))
-        packed = apply_document_version_preference(packed, source_versions, explicit_sources=explicit_sources)
+        packed = apply_document_version_preference(
+            packed, source_versions, explicit_sources=explicit_sources, preserve_order=True,
+        )
         return [item for item in packed if not contains_prompt_injection(str(item.get("text", "")))]
 
     def clear_cache(self):

@@ -221,6 +221,7 @@ services:
     environment:
       <<: *app-environment
       RAG_WORKER_CONCURRENCY: ${RAG_WORKER_CONCURRENCY:-1}
+      RAG_INGESTION_EMBED_URL: ${RAG_INGESTION_EMBED_URL:-}
     volumes:
       - ${RAG_DATA_ROOT:-./.data/storage}/app:/app/.data:z
       - ${RAG_DATA_ROOT:-./.data/storage}/model-cache:/app/.fastembed_cache:z
@@ -524,6 +525,38 @@ services:
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+    logging: *common-logging
+
+  index-embedding:
+    profiles: ["ingestion-gpu"]
+    build:
+      context: .
+      dockerfile: deploy/index-embedding/Dockerfile
+    image: rag-index-embedding:${RAG_EMBED_GPU_IMAGE_TAG:-836314277}
+    user: "10001:10001"
+    environment:
+      FASTEMBED_MODEL: ${FASTEMBED_MODEL:-nomic-ai/nomic-embed-text-v1.5}
+      FASTEMBED_GPU_MEMORY_LIMIT: "4294967296"
+      HF_HUB_OFFLINE: "1"
+    volumes:
+      - ${RAG_DATA_ROOT:-./.data/storage}/embeddings:/data/fastembed:ro,z
+    networks: [backend]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:11434/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
     logging: *common-logging
 
   llm-bridge:

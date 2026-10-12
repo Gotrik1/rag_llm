@@ -12,7 +12,7 @@ from runtime_paths import INGESTION_CACHE_DIR
 
 
 CACHE_DIR = INGESTION_CACHE_DIR
-INGESTION_CACHE_VERSION = "v6-section-images"
+INGESTION_CACHE_VERSION = "v7-numbered-headings"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
 
 

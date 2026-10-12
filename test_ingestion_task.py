@@ -20,7 +20,7 @@ class IngestionTaskTests(unittest.TestCase):
         output = io.StringIO()
         with patch("sys.argv", ["ingestion_task", "manual.pdf"]), \
              patch("sys.stdout", output), \
-             patch("web_ui.get_agent", return_value=agent):
+             patch("rag_agent.RAGAgent", return_value=agent):
             status = ingestion_task.main()
         self.assertEqual(status, 0)
         self.assertEqual(json.loads(output.getvalue()), {"chunks": 17})
@@ -32,7 +32,7 @@ class IngestionTaskTests(unittest.TestCase):
         output = io.StringIO()
         with patch("sys.argv", ["ingestion_task", "broken.pdf"]), \
              patch("sys.stdout", output), \
-             patch("web_ui.get_agent", return_value=agent):
+             patch("rag_agent.RAGAgent", return_value=agent):
             status = ingestion_task.main()
         self.assertEqual(status, 1)
         self.assertEqual(json.loads(output.getvalue()), {"error": "parser failed"})

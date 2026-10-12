@@ -108,3 +108,18 @@ def test_action_verb_cannot_hide_exact_subject_heading():
     assert term_keys('Как задаются авансы?') == term_keys('Авансы')
     evidence = index.select('Как задаются авансы?', [{'file': 'manual.docx', 'section_path': 'Расчет электроэнергии', 'text': 'Почасовые объемы.'}])
     assert evidence[0]['section_title'] == 'Авансы'
+
+
+def test_category_number_cannot_be_removed_from_a_short_question_or_heading():
+    assert term_keys('2 ЦК') == term_keys('вторая ценовая категория')
+    assert term_keys('2 ЦК') != term_keys('1 ЦК')
+
+
+def test_short_wrong_category_cannot_displace_long_primary_rule():
+    index = SectionEvidenceIndex([
+        node('Пункт 4', '4. Цена для первой ценовой категории.', 'Постановление 1179.docx'),
+        node('Пункт 5', '5. Предельный уровень нерегулируемых цен для второй ценовой категории определяется гарантирующим поставщиком по зонам суток расчетного периода по формуле с объемом потребления и сбытовой надбавкой.', 'Постановление 1179.docx'),
+    ])
+    selected = index.select('Как рассчитывается 2 ЦК по постановлениям?', [])
+    assert selected and selected[0]['section_title'] == 'Пункт 5'
+    assert all(item['section_title'] != 'Пункт 4' for item in selected)

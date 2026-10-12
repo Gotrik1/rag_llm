@@ -43,10 +43,12 @@ async def ingest_document_job(ctx: dict, job_id: str, payload: dict | None = Non
             {"status": "processing", "processing_state": {"job_id": job_id, "progress": 10}},
         )
     process = None
+    output_task = None
     try:
         path = str(payload.get("path", "")).strip()
         if not path: raise ValueError("ingestion path is required")
         process = await asyncio.create_subprocess_exec(sys.executable, "-m", "ingestion_task", path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        output_task = asyncio.create_task(process.communicate())
         progress = 20
         while process.returncode is None:
             try: await asyncio.wait_for(process.wait(), timeout=1)
@@ -66,7 +68,7 @@ async def ingest_document_job(ctx: dict, job_id: str, payload: dict | None = Non
                     document_id,
                     {"processing_state": {"job_id": job_id, "progress": progress}},
                 )
-        stdout, stderr = await process.communicate()
+        stdout, stderr = await output_task
         lines = stdout.decode("utf-8", errors="replace").splitlines()
         result = json.loads(lines[-1]) if lines else {"error": stderr.decode("utf-8", errors="replace")[-1000:]}
         if process.returncode != 0: raise RuntimeError(str(result.get("error", "ingestion failed")))
@@ -98,6 +100,12 @@ async def ingest_document_job(ctx: dict, job_id: str, payload: dict | None = Non
                 {"status": "failed", "processing_state": {"job_id": job_id, "progress": 100, "error": str(exc)[:1000]}},
             )
         raise
+    finally:
+        if process and process.returncode is None:
+            process.terminate()
+            await process.wait()
+        if output_task:
+            await output_task
 
 
 async def delete_document_job(ctx: dict, job_id: str, payload: dict | None = None) -> dict:
@@ -115,6 +123,7 @@ async def delete_document_job(ctx: dict, job_id: str, payload: dict | None = Non
 
     await asyncio.to_thread(store.update_job, job_id, status="running", progress=10, started_at=time.time())
     process = None
+    output_task = None
     try:
         raw_path = str(payload.get("path", "")).strip()
         if not raw_path:
@@ -131,6 +140,7 @@ async def delete_document_job(ctx: dict, job_id: str, payload: dict | None = Non
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        output_task = asyncio.create_task(process.communicate())
         while process.returncode is None:
             try:
                 await asyncio.wait_for(process.wait(), timeout=1)
@@ -150,7 +160,7 @@ async def delete_document_job(ctx: dict, job_id: str, payload: dict | None = Non
                 return {"cancelled": True}
             await asyncio.to_thread(store.update_job, job_id, progress=70)
 
-        stdout, stderr = await process.communicate()
+        stdout, stderr = await output_task
         lines = stdout.decode("utf-8", errors="replace").splitlines()
         result = json.loads(lines[-1]) if lines else {
             "error": stderr.decode("utf-8", errors="replace")[-1000:]
@@ -188,6 +198,12 @@ async def delete_document_job(ctx: dict, job_id: str, payload: dict | None = Non
             finished_at=time.time(),
         )
         raise
+    finally:
+        if process and process.returncode is None:
+            process.terminate()
+            await process.wait()
+        if output_task:
+            await output_task
 
 
 async def purge_expired_audit_events(ctx: dict) -> int:

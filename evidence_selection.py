@@ -28,11 +28,14 @@ _GENERIC_STEMS = frozenset(_STEMMER.stem(word) for word in (
     "задать", "задаются", "задавать", "настроить", "настраиваются", "создать", "создаются",
     "рассчитать", "рассчитывать", "начислить", "начисляются", "применяются", "используются",
 ))
+_CATEGORY_STEMS = frozenset(_STEMMER.stem(word) for word in ('первой', 'второй', 'третьей', 'четвертой', 'пятой', 'шестой'))
 
 
 @lru_cache(maxsize=8192)
 def term_keys(text: str) -> frozenset[str]:
-    text = re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s+", "", text)
+    # Leading section numbers are not topics, but "2 ЦК" is a topic with an
+    # essential category number. Never normalize it to the ambiguous "ЦК".
+    text = re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s+(?!цк\b)", "", text, flags=re.I)
     category_words = {"1": "первой", "2": "второй", "3": "третьей", "4": "четвертой", "5": "пятой", "6": "шестой"}
     text = re.sub(r"([1-6])\s+и\s+([1-6])\s*цк", lambda m: f"{category_words[m[1]]} ценовой категории и {category_words[m[2]]} ценовой категории", text, flags=re.I)
     text = re.sub(r"(?<!\d)([1-6])\s*цк", lambda m: f"{category_words[m[1]]} ценовой категории", text, flags=re.I)
@@ -124,11 +127,14 @@ class SectionEvidenceIndex:
             ) and item.get("status") != "deleted"
 
         keys = term_keys(question)
+        categories = keys & _CATEGORY_STEMS
         headings = []
         for section in self.sections:
             if not visible(section):
                 continue
             heading_keys = section["heading_keys"]
+            if categories and not (categories & heading_keys):
+                continue
             overlap = keys & heading_keys
             if not keys or not overlap:
                 continue
@@ -137,7 +143,9 @@ class SectionEvidenceIndex:
             coverage = len(overlap) / len(keys)
             if coverage < 0.65:
                 continue
-            score = coverage * 4 + len(overlap) * 0.3 - len(heading_keys - keys) * 0.15
+            # Long normative opening paragraphs contain definitions and
+            # notation. Extra words must not outweigh matching the subject.
+            score = coverage * 8 + len(overlap) * 0.3 - min(6, len(heading_keys - keys)) * 0.15
             if heading_keys == keys:
                 score += 2
             if evidence_role(section) == "exception" and not _EXCEPTION.search(question):

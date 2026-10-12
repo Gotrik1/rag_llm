@@ -415,11 +415,16 @@ def _paragraph_style_id(paragraph: ET.Element) -> str:
 def _heading_level(style_id: str, style_name: str, text: str) -> int:
     style = f"{style_id} {style_name}".lower()
     match = re.search(r"(heading|заголовок)\s*([1-6])?", style)
+    number = re.match(r"^(\d+(?:\.\d+)*)(?:[.)]\s*|\s+)(?=\S)", text)
+    structured_number = number and ('.' in number.group(0) or ')' in number.group(0))
+    if match and structured_number:
+        # Authors frequently reuse the wrong Word Heading style. A visible
+        # 5.3 section belongs to chapter 5, not to the preceding regional case.
+        return min(number.group(1).count('.') + 1, 6)
     if match:
         return int(match.group(2) or 1)
 
-    number = re.match(r"^(\d+(?:\.\d+)*)\.?\s+\S", text)
-    if number and len(text) <= 160:
+    if structured_number and len(text) <= 160:
         return min(number.group(1).count(".") + 1, 6)
 
     return 0

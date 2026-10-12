@@ -3023,7 +3023,7 @@ def ensure_price_composition_source_coverage(answer: str, question: str, context
 
 
 class RAGAgent:
-    def __init__(self, llm_model: str = LLM_MODEL):
+    def __init__(self, llm_model: str = LLM_MODEL, *, embedding_base_url: str | None = None):
         # ── LLM ──────────────────────────────────────────────
         self.llm_model = llm_model
         self.llm = self._create_ollama_llm(self.llm_model)
@@ -3031,7 +3031,7 @@ class RAGAgent:
         # ── Embeddings (через Ollama) ─────────────────────────
         self.embed_model = OllamaEmbedding(
             model_name=EMBED_MODEL,
-            base_url=OLLAMA_BASE_URL,
+            base_url=embedding_base_url or OLLAMA_BASE_URL,
             client_kwargs={"trust_env": False},
         )
 

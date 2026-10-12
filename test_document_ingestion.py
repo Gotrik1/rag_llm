@@ -12,6 +12,37 @@ import docx_parser
 
 
 class DocumentIngestionTests(unittest.TestCase):
+    def test_short_docx_is_ingested_and_cached_without_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "short.docx"
+            document = Document()
+            document.add_paragraph("Код проекта: A17")
+            document.save(source)
+            with patch.object(document_ingestion, "CACHE_DIR", root / "cache"), \
+                 patch.object(document_ingestion, "_read_with_docling") as fallback:
+                result = document_ingestion.ingest_document(source)
+                cached = document_ingestion.ingest_document(source)
+            self.assertEqual(result.backend, "xml")
+            self.assertEqual(result.text, "Код проекта: A17")
+            self.assertEqual(cached.text, result.text)
+            fallback.assert_not_called()
+
+    def test_empty_docx_is_not_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "empty.docx"
+            Document().save(source)
+            with patch.object(document_ingestion, "CACHE_DIR", root / "cache"), \
+                 patch.object(document_ingestion, "_read_with_docling", return_value=""), \
+                 patch.object(document_ingestion, "_read_with_unstructured", return_value=""):
+                with self.assertRaisesRegex(RuntimeError, "no readable content"):
+                    document_ingestion.ingest_document(source)
+
+    def test_location_and_unread_image_markers_are_not_content(self):
+        self.assertFalse(document_ingestion.has_extracted_content("[SECTION: Chapter 1]\n[IMAGE_UNREAD: media/image1.png]"))
+        self.assertTrue(document_ingestion.has_extracted_content("[SECTION: Chapter 1]\nA"))
+
     def test_normative_long_clause_keeps_own_number_and_body(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "Постановление 1179.docx"

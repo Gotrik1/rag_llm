@@ -41,27 +41,27 @@ def ingest_document(path: str | Path) -> IngestedDocument:
             ("unstructured", _read_with_unstructured),
             ("mammoth", _read_with_mammoth),
         ]
-        minimum_text_length = 100
+        minimum_text_length = 1
     else:
         backends = [
             ("docling", _read_with_docling),
             ("unstructured", _read_with_unstructured),
             ("xml", _read_with_xml),
         ]
-        minimum_text_length = 100
+        minimum_text_length = 1
 
     for name, reader in backends:
         try:
             text = reader(path)
             text = normalize_ingested_text(text)
-            if len(text.strip()) >= minimum_text_length:
+            if has_extracted_content(text, minimum_text_length):
                 unread_images = len(re.findall(r"\[IMAGE_UNREAD:", text))
                 if unread_images:
                     warnings.append(f"{unread_images} embedded images were not recognized; image equations are not text formulas")
                 result = IngestedDocument(text=text, backend=name, warnings=warnings)
                 _write_cache(path, result)
                 return result
-            warnings.append(f"{name}: extracted too little text")
+            warnings.append(f"{name}: no readable content extracted")
         except Exception as exc:
             warnings.append(f"{name}: {type(exc).__name__}: {exc}")
 
@@ -98,6 +98,12 @@ def normalize_ingested_text(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{4,}", "\n\n\n", text)
     return text.strip()
+
+
+def has_extracted_content(text: str, minimum_chars: int = 1) -> bool:
+    """Accept short text while excluding unread-image and location markers."""
+    content = re.sub(r"\[(?:SECTION|IMAGE_UNREAD):[^\]]*\]", "", text)
+    return sum(character.isalnum() for character in content) >= minimum_chars
 
 
 def _read_with_docling(path: Path) -> str:
@@ -151,6 +157,8 @@ def _read_cache(path: Path) -> IngestedDocument | None:
     if not cache_path.exists():
         return None
     data = json.loads(cache_path.read_text(encoding="utf-8"))
+    if not has_extracted_content(data["text"], 3 if path.suffix.lower() in IMAGE_SUFFIXES else 1):
+        return None
     return IngestedDocument(
         text=data["text"],
         backend=data.get("backend", "cache"),

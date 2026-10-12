@@ -98,3 +98,13 @@ def test_overview_requires_explanation_sections_not_intro_name_mentions():
 def test_requested_normative_source_includes_pp_markdown_alias():
     index = SectionEvidenceIndex([node('Пункт 5', '5. Цена для второй ценовой категории.', '2012-05-04-пп442.md')])
     assert index.select('Как рассчитывается 2 ЦК по постановлениям?', [])
+
+
+def test_action_verb_cannot_hide_exact_subject_heading():
+    index = SectionEvidenceIndex([
+        node('Договорные условия > Авансы', 'Задаются число авансов, срок оплаты, процент и смещение по месяцам.'),
+        node('Расчет электроэнергии', 'Почасовые объемы.'),
+    ])
+    assert term_keys('Как задаются авансы?') == term_keys('Авансы')
+    evidence = index.select('Как задаются авансы?', [{'file': 'manual.docx', 'section_path': 'Расчет электроэнергии', 'text': 'Почасовые объемы.'}])
+    assert evidence[0]['section_title'] == 'Авансы'

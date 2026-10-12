@@ -20,6 +20,7 @@ def main() -> None:
     parser.add_argument("--collection", required=True)
     parser.add_argument("--bm25-dir", type=Path, required=True)
     parser.add_argument("--inventory-only", action="store_true")
+    parser.add_argument("--resume", action="store_true", help="Resume only a verified incomplete checkpoint; writers must be stopped")
     args = parser.parse_args()
     from db_store import list_documents
     records = list_documents()
@@ -41,22 +42,41 @@ def main() -> None:
         return
     if args.collection == os.environ.get("QDRANT_COLLECTION"):
         raise RuntimeError("Refusing live collection")
-    if args.bm25_dir.exists():
+    if args.bm25_dir.exists() and not args.resume:
         raise RuntimeError("Target directory must not exist: no overwrite/resume")
     import qdrant_client
     client = qdrant_client.QdrantClient(url=os.environ["QDRANT_URL"], trust_env=False)
-    if client.collection_exists(args.collection):
+    exists = client.collection_exists(args.collection)
+    if exists and not args.resume:
         raise RuntimeError("Target collection already exists: no overwrite/resume")
+    checkpoint = None
+    if args.resume:
+        checkpoint = json.loads((args.bm25_dir / 'manifest.json').read_text(encoding='utf-8'))
+        if not exists or checkpoint.get('complete') or checkpoint.get('collection') != args.collection or checkpoint.get('bm25_dir') != str(args.bm25_dir):
+            raise RuntimeError('Not a matching incomplete checkpoint')
+        for saved in checkpoint['sources']:
+            source = sources.get(saved['path'])
+            if not source or source['sha256'] != saved['sha256'] or sorted(source['document_ids']) != sorted(saved['document_ids']):
+                raise RuntimeError('Checkpoint source changed or lost registration')
+        expected = sum(source['chunks'] for source in checkpoint['sources'])
+        if client.count(args.collection, exact=True).count != expected:
+            raise RuntimeError('Vector checkpoint has partial writes; refusing duplicate ingestion')
     os.environ["QDRANT_COLLECTION"] = args.collection
     os.environ["BM25_PERSIST_DIR"] = str(args.bm25_dir)
     from rag_agent import RAGAgent
     agent = RAGAgent()
     # A shadow build must not invalidate live user response caches per source.
     agent.clear_cache = lambda: None
-    manifest = {"collection": args.collection, "bm25_dir": str(args.bm25_dir),
-                "sources": [], "complete": False}
+    manifest = checkpoint or {"collection": args.collection, "bm25_dir": str(args.bm25_dir),
+                              "sources": [], "complete": False}
+    if checkpoint and len(agent.docstore.docs) != expected:
+        raise RuntimeError('Docstore and vector checkpoints disagree')
+    completed = {source['path'] for source in manifest['sources']}
     manifest_path = args.bm25_dir / "manifest.json"
     for index, source in enumerate(sources.values(), 1):
+        if source['path'] in completed:
+            print(f'CHECKPOINT {index}/{len(sources)} already complete', flush=True)
+            continue
         print(f"SOURCE {index}/{len(sources)} {source['path']}", flush=True)
         source["chunks"] = agent.ingest(source["path"])
         manifest["sources"].append(source)

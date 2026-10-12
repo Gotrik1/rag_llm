@@ -31,7 +31,12 @@ GIGACHAT_CA_ARCHIVES = (
     Path.home() / "Downloads" / "windows_russian_trusted_root_ca.zip",
 )
 GIGACHAT_CA_BUNDLE = CERTIFICATES_DIR / "gigachat-russian-ca.pem"
-MAX_OUTPUT_TOKENS = 4056
+MAX_OUTPUT_TOKENS = int(os.getenv("RAG_MAX_OUTPUT_TOKENS", "-1"))
+
+
+def output_limit(field: str = "max_tokens") -> dict[str, Any]:
+    """Omit the application cap by default; the provider's model window remains."""
+    return {field: MAX_OUTPUT_TOKENS} if MAX_OUTPUT_TOKENS > 0 else {}
 
 
 def gigachat_ca_bundle() -> str | bool:
@@ -71,13 +76,13 @@ class ProviderLLM(CustomLLM):
     folder_id: str = ""
     auth_type: str = "api_key"
     temperature: float = 0.0
-    timeout: float = 120.0
+    timeout: float = Field(default_factory=lambda: float(os.getenv("LLM_REQUEST_TIMEOUT", "900")))
     _giga_token: str = ""
     _giga_token_expires: float = 0.0
 
     @property
     def metadata(self) -> LLMMetadata:
-        return LLMMetadata(context_window=32768, num_output=MAX_OUTPUT_TOKENS, is_chat_model=True, model_name=self.model)
+        return LLMMetadata(context_window=32768, num_output=max(MAX_OUTPUT_TOKENS, 2048), is_chat_model=True, model_name=self.model)
 
     def _post(self, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
         response = requests.post(
@@ -96,7 +101,7 @@ class ProviderLLM(CustomLLM):
         data = self._post(
             "/chat/completions",
             {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-            {"model": self.model, "messages": [{"role": "user", "content": prompt}], "temperature": self.temperature, "max_tokens": MAX_OUTPUT_TOKENS},
+            {"model": self.model, "messages": [{"role": "user", "content": prompt}], "temperature": self.temperature, **output_limit()},
         )
         return str(data["choices"][0]["message"]["content"])
 
@@ -132,7 +137,7 @@ class ProviderLLM(CustomLLM):
         data = self._post(
             "/v1/chat/completions",
             {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            {"model": self.model, "messages": [{"role": "user", "content": prompt}], "temperature": self.temperature, "max_tokens": MAX_OUTPUT_TOKENS},
+            {"model": self.model, "messages": [{"role": "user", "content": prompt}], "temperature": self.temperature, **output_limit()},
         )
         return str(data["choices"][0]["message"]["content"])
 
@@ -144,7 +149,7 @@ class ProviderLLM(CustomLLM):
         data = self._post(
             "/completion",
             {"Authorization": f"{scheme} {self.api_key}", "Content-Type": "application/json"},
-            {"modelUri": model_uri, "completionOptions": {"stream": False, "temperature": self.temperature, "maxTokens": str(MAX_OUTPUT_TOKENS)}, "messages": [{"role": "user", "text": prompt}]},
+            {"modelUri": model_uri, "completionOptions": {"stream": False, "temperature": self.temperature, **output_limit("maxTokens")}, "messages": [{"role": "user", "text": prompt}]},
         )
         return str(data["result"]["alternatives"][0]["message"]["text"])
 

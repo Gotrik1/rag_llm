@@ -15,6 +15,13 @@ SPEC.loader.exec_module(bridge)
 
 
 class LlmBridgeTests(unittest.TestCase):
+    def test_unlimited_ollama_output_does_not_become_invalid_vllm_limit(self):
+        for options in ({}, {"num_predict": -1}, {"num_predict": 0}):
+            self.assertNotIn("max_tokens", bridge._openai_payload({"prompt": "test", "options": options}, False))
+
+    def test_explicit_operator_output_limit_is_preserved(self):
+        self.assertEqual(bridge._openai_payload({"options": {"num_predict": 9000}}, False)["max_tokens"], 9000)
+
     def test_qwen38_disables_thinking_even_when_client_omits_flag(self):
         payload = bridge._openai_payload({"prompt": "test", "options": {}}, False)
         self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})

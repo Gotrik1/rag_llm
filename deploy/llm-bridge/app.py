@@ -38,9 +38,11 @@ def _openai_payload(payload: dict[str, Any], stream: bool) -> dict[str, Any]:
         "messages": _messages(payload),
         "stream": stream,
         "temperature": float(options.get("temperature", 0.0)),
-        "max_tokens": int(options.get("num_predict", 2048)),
         "seed": int(options.get("seed", 42)),
     }
+    output_tokens = int(options.get("num_predict", -1))
+    if output_tokens > 0:
+        result["max_tokens"] = output_tokens
     # This bridge serves the latency-sensitive RAG path. Qwen3.8 can otherwise
     # spend the entire output budget on reasoning and return empty content.
     if payload.get("think") is False or LLM_MODEL.startswith("Qwen/Qwen3.8"):

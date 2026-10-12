@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import html
+import io
+import os
 import re
+import shutil
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +34,7 @@ def read_docx_text(path: Path | str) -> str:
     with zipfile.ZipFile(path) as archive:
         document_xml = archive.read("word/document.xml")
         styles = _read_styles(archive)
+        image_text = _read_embedded_images(archive)
 
     root = ET.fromstring(document_xml)
     body = root.find("w:body", NS)
@@ -38,14 +42,26 @@ def read_docx_text(path: Path | str) -> str:
         return ""
 
     blocks: list[DocxBlock] = []
-    for child in list(body):
+    legal_document = bool(re.search(r"постановлен|регламент|правила", path.name, re.I))
+    def body_blocks(container: ET.Element):
+        for child in list(container):
+            if _local_name(child.tag) in {"p", "tbl"}:
+                yield child
+            elif _local_name(child.tag) in {"sdt", "sdtContent", "customXml"}:
+                yield from body_blocks(child)
+
+    for child in body_blocks(body):
         tag = _local_name(child.tag)
         if tag == "p":
-            block = _parse_paragraph(child, styles)
+            block = _parse_paragraph(child, styles, image_text)
+            if legal_document and re.match(r"^\d+(?:\.\d+)*\.\s+", block.text):
+                block.kind = "clause"
+            elif legal_document and re.match(r"^(?:ПРАВИЛА|ИЗМЕНЕНИЯ|ПРИЛОЖЕНИЕ|ОСНОВНЫЕ ПОЛОЖЕНИЯ)\b", block.text) and block.text == block.text.upper():
+                block.kind, block.level = "legal-part", 1
             if block.text:
                 blocks.append(block)
         elif tag == "tbl":
-            block = _parse_table(child, styles)
+            block = _parse_table(child, styles, image_text)
             if block.text:
                 blocks.append(block)
 
@@ -68,10 +84,10 @@ def _read_styles(archive: zipfile.ZipFile) -> dict[str, str]:
     return styles
 
 
-def _parse_paragraph(paragraph: ET.Element, styles: dict[str, str]) -> DocxBlock:
+def _parse_paragraph(paragraph: ET.Element, styles: dict[str, str], image_text: dict[str, str] | None = None) -> DocxBlock:
     style_id = _paragraph_style_id(paragraph)
     style_name = styles.get(style_id, "")
-    text = _normalize_text(_extract_inline_text(paragraph))
+    text = _normalize_text(_extract_inline_text(paragraph, image_text))
     if not text:
         return DocxBlock("paragraph", "")
 
@@ -81,14 +97,14 @@ def _parse_paragraph(paragraph: ET.Element, styles: dict[str, str]) -> DocxBlock
     return DocxBlock("paragraph", text, style=style_name or style_id)
 
 
-def _parse_table(table: ET.Element, styles: dict[str, str]) -> DocxBlock:
+def _parse_table(table: ET.Element, styles: dict[str, str], image_text: dict[str, str] | None = None) -> DocxBlock:
     rows: list[list[str]] = []
     for row in table.findall(".//w:tr", NS):
         cells: list[str] = []
         for cell in row.findall("w:tc", NS):
             parts = []
             for paragraph in cell.findall("w:p", NS):
-                text = _normalize_text(_extract_inline_text(paragraph))
+                text = _normalize_text(_extract_inline_text(paragraph, image_text))
                 if text:
                     parts.append(text)
             cells.append(" ".join(parts))
@@ -104,11 +120,23 @@ def _parse_table(table: ET.Element, styles: dict[str, str]) -> DocxBlock:
     return DocxBlock("table", "\n".join(rendered))
 
 
-def _extract_inline_text(element: ET.Element) -> str:
+def _extract_inline_text(element: ET.Element, image_text: dict[str, str] | None = None) -> str:
     parts: list[str] = []
 
     def visit(node: ET.Element) -> None:
         local = _local_name(node.tag)
+        if local in {"drawing", "pict"}:
+            references = []
+            for descendant in node.iter():
+                for attribute, value in descendant.attrib.items():
+                    if attribute in {
+                        "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed",
+                        "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id",
+                    } and value in (image_text or {}):
+                        references.append(value)
+            for reference in dict.fromkeys(references):
+                parts.append(f"\n{image_text[reference]}\n")
+            return
         if local in {"oMath", "oMathPara"}:
             math_text = _omml_plain_text(node)
             mathml = _omml_to_mathml(node)
@@ -138,6 +166,43 @@ def _extract_inline_text(element: ET.Element) -> str:
 
     visit(element)
     return "".join(parts)
+
+
+def _read_embedded_images(archive: zipfile.ZipFile) -> dict[str, str]:
+    """Keep drawing content and explicitly mark images that could not be read.
+
+    OCR is text evidence, never a claim that a mathematical image has been
+    converted into an exact editable equation.
+    """
+    try:
+        root = ET.fromstring(archive.read("word/_rels/document.xml.rels"))
+    except KeyError:
+        return {}
+    result, by_target = {}, {}
+    ocr_enabled = os.getenv("RAG_DOCX_IMAGE_OCR", "true").lower() == "true" and bool(shutil.which("tesseract"))
+    for relationship in root:
+        if not relationship.attrib.get("Type", "").endswith("/image") or relationship.attrib.get("TargetMode") == "External":
+            continue
+        target = relationship.attrib.get("Target", "")
+        archive_target = "word/" + target.lstrip("/") if not target.startswith("/") else target.lstrip("/")
+        if archive_target not in by_target:
+            value = f"[IMAGE_UNREAD: {target}]"
+            if ocr_enabled:
+                try:
+                    from PIL import Image
+                    import pytesseract
+                    with Image.open(io.BytesIO(archive.read(archive_target))) as image:
+                        # Tiny icons and individual formula glyphs are not
+                        # whole equations; retain the unread marker for them.
+                        if image.width >= 80 and image.height >= 20:
+                            recognized = pytesseract.image_to_string(image, lang=os.getenv("RAG_OCR_LANGUAGES", "rus+eng"), config="--psm 6", timeout=20).strip()
+                            if len(recognized) >= 3:
+                                value = f"[IMAGE_OCR: {target}]\n{recognized}\n[/IMAGE_OCR]"
+                except Exception:
+                    pass
+            by_target[archive_target] = value
+        result[relationship.attrib.get("Id", "")] = by_target[archive_target]
+    return result
 
 
 def _omml_to_mathml(node: ET.Element) -> str:
@@ -312,13 +377,24 @@ def _normalize_field(value: str) -> str:
 def _render_blocks(blocks: list[DocxBlock]) -> str:
     rendered: list[str] = []
     section_stack: list[str] = []
+    legal_part = ""
 
     for block in blocks:
+        if block.kind == "legal-part":
+            legal_part = block.text
+            section_stack = [legal_part]
+            rendered.append(f"[SECTION: {legal_part}]\n# {legal_part}")
+            continue
+        if block.kind == "clause":
+            number = re.match(r"^(\d+(?:\.\d+)*)\.", block.text).group(1)
+            section_stack = ([legal_part] if legal_part else []) + [f"Пункт {number}"]
+            rendered.append(f"[SECTION: {' > '.join(section_stack)}]\n{block.text}")
+            continue
         if block.kind == "heading":
             level = max(1, min(block.level, 6))
             section_stack = section_stack[: level - 1]
             section_stack.append(block.text)
-            rendered.append(f"{'#' * level} {block.text}")
+            rendered.append(f"[SECTION: {' > '.join(section_stack)}]\n{'#' * level} {block.text}")
             continue
 
         if section_stack and block.kind == "paragraph":
@@ -342,8 +418,9 @@ def _heading_level(style_id: str, style_name: str, text: str) -> int:
     if match:
         return int(match.group(2) or 1)
 
-    if re.match(r"^\d+(?:\.\d+)*\.?\s+\S", text) and len(text) <= 160:
-        return min(text.count(".") + 1, 6)
+    number = re.match(r"^(\d+(?:\.\d+)*)\.?\s+\S", text)
+    if number and len(text) <= 160:
+        return min(number.group(1).count(".") + 1, 6)
 
     return 0
 

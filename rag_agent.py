@@ -47,6 +47,7 @@ import qdrant_client
 from ollama import Client as OllamaClient
 from document_ingestion import ingest_document
 from domain_routing import apply_domain_routing, route_query, source_domains_for
+from evidence_selection import SectionEvidenceIndex, generation_evidence_prompt
 from llm_providers import ProviderLLM
 from response_cache import ResponseCache
 from reranker import HttpReranker
@@ -71,9 +72,9 @@ VECTOR_TOP_K     = 12      # кандидатов от вектора
 # A semantic/chunking change must never reuse an older docstore or vector
 # collection: the two indexes must describe precisely the same corpus.
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25_v12"))
-CACHE_VERSION    = "v36-soft-domain-routing-2026-09-17-1"
+CACHE_VERSION    = "v37-section-evidence-2026-10-12"
 QUERY_UNDERSTANDING_VERSION = "v2"
-MAX_OUTPUT_TOKENS = 4056
+MAX_OUTPUT_TOKENS = int(os.environ.get("RAG_MAX_OUTPUT_TOKENS", "-1"))
 
 # Soft topic routing never acts as an ACL. It only makes broad business
 # questions probe both implementation manuals and governing regulations.
@@ -199,8 +200,8 @@ OLLAMA_MODEL_PROFILES: dict[str, dict] = {
     "Qwen/Qwen3.8-27B": {
         "context_window": 32768,
         "thinking": False,
-        "num_predict": 2048,
-        "request_timeout": 180.0,
+        "num_predict": MAX_OUTPUT_TOKENS,
+        "request_timeout": float(os.environ.get("LLM_REQUEST_TIMEOUT", "900")),
     },
     "qwen3.5:9b": {
         "context_window": 8192,
@@ -2156,6 +2157,7 @@ def build_section_documents(text: str, source_path: Path, backend: str) -> list[
             # semantic section.  Keep it in the preceding clause so retrieval
             # can never return a rate description without its exact formula.
             section_units: list[dict[str, str]] = []
+            markdown_stack: list[str] = []
             for index, match in enumerate(markdown_matches):
                 section_path = match.group(2).strip()
                 end = markdown_matches[index + 1].start() if index + 1 < len(markdown_matches) else len(cleaned)
@@ -2169,6 +2171,10 @@ def build_section_documents(text: str, source_path: Path, backend: str) -> list[
                         formula += f"\n{body}"
                     section_units[-1]["formula"] = "\n\n[FORMULA]\n" + formula
                     continue
+                level = len(match.group(1))
+                markdown_stack = markdown_stack[:level - 1]
+                markdown_stack.append(section_path)
+                section_path = " > ".join(markdown_stack)
                 section_units.append({"title": section_path, "body": body, "formula": ""})
 
             for index, unit in enumerate(section_units):
@@ -2304,13 +2310,14 @@ def derive_worded_formula(question: str, text: str) -> str | None:
     normalized_question = question.casefold().replace("ё", "е")
     normalized_text = text.casefold().replace("ё", "е")
     is_ivo_request = bool(re.search(r"(?<![а-яa-z0-9])ив\s*0(?![а-яa-z0-9])", normalized_question))
-    has_difference_rule = bool(re.search(r"равн\w*\s+разност", normalized_text))
+    has_difference_rule = bool(re.search(r"равн\w*\s+(?:разност|разниц)", normalized_text))
     if (
         is_formula_question(question)
         and is_ivo_request
         and has_difference_rule
-        and "согласно удг" in normalized_text
-        and "плановом дг" in normalized_text
+        and re.search(r"\bудг\b", normalized_text)
+        and re.search(r"планов\w*\s+дг\b", normalized_text)
+        and normalized_text.find("удг") < normalized_text.find("планов")
     ):
         return r"\mathrm{ИВ0} = V_{\mathrm{УДГ}} - V_{\mathrm{план.\,ДГ}}"
     return None
@@ -2949,17 +2956,32 @@ def ensure_requested_formula_coverage(
             None,
         )
         if prose_definition is not None:
-            grounded_calculations = [r"V_{\mathrm{ИВ0}}=V_{\mathrm{УДГ}}-V_{\mathrm{план.ДГ}}"]
+            derived = derive_worded_formula(f"формула {question}", str(prose_definition.get("text", "")))
+            if derived:
+                grounded_calculations = [derived]
     if not grounded_calculations:
         return answer
     calculation = grounded_calculations[0]
+    def confirms_calculation(item: dict) -> bool:
+        text = str(item.get("text", ""))
+        if re.sub(r"\s+", "", calculation) in re.sub(r"\s+", "", text):
+            return True
+        formula_key = re.sub(r"\s+", "", format_formula_for_katex(calculation))
+        candidates = extract_formula_lines_from_texts([text], f"формула {question}")
+        derived = derive_worded_formula(f"формула {question}", text)
+        if derived:
+            candidates.append(derived)
+        return any(re.sub(r"\s+", "", format_formula_for_katex(candidate)) == formula_key for candidate in candidates)
+
     source = next(
         (
             item for item in context
-            if "иво" in f"{item.get('section_path', '')}\n{item.get('text', '')}".casefold()
+            if confirms_calculation(item)
         ),
-        context[0] if context else None,
+        None,
     )
+    if source is None:
+        return answer
     citation = f" [Источник: {human_source_reference(source)}]" if source else ""
     return (
         f"{answer.rstrip()}\n\n### Формула из источника\n\n"
@@ -3067,7 +3089,7 @@ class RAGAgent:
     @staticmethod
     def _create_ollama_llm(model: str) -> Ollama:
         profile = {**DEFAULT_OLLAMA_PROFILE, **OLLAMA_MODEL_PROFILES.get(model, {})}
-        timeout = float(profile["request_timeout"])
+        timeout = float(os.environ.get("LLM_REQUEST_TIMEOUT", "900"))
         return Ollama(
             model=model,
             base_url=OLLAMA_BASE_URL,
@@ -3130,6 +3152,7 @@ class RAGAgent:
                 node_id = getattr(d, "doc_id", None) or getattr(d, "id_", None) or getattr(d, "id", None)
                 nodes.append(TextNode(text=d.text, metadata=normalized_meta, id_=node_id))
             self._all_nodes = nodes
+        self._section_evidence_index = SectionEvidenceIndex(self._all_nodes)
 
     def _refresh_docstore_if_changed(self) -> None:
         """Reload BM25/docstore state written by the dedicated ingestion worker."""
@@ -3404,6 +3427,7 @@ class RAGAgent:
             source_domains=source_domains,
             source_versions=source_versions,
             retrieval_focus=retrieval_focus,
+            subject_question=search_question,
         )
         if is_document_occurrence_question(understood_question):
             context = [
@@ -3502,11 +3526,17 @@ class RAGAgent:
                 f"{evidence_question.strip()}\n"
                 "Ответь на все части этой интерпретации, но не упоминай исправление опечаток.\n"
             )
+        evidence_plan = generation_evidence_prompt(context)
         prompt = f"""{system_prompt or GROUNDED_SYSTEM_PROMPT}
 
 Ниже приведены данные для ответа. Используй их как единственный фактический контекст: не выдумывай сведения, которых в нём нет. Всегда отвечай на русском языке.
 После каждого самостоятельного факта или группы пунктов ставь ровно одну цитату из соответствующего блока контекста в формате [Источник: имя файла — точный раздел или пункт]. Не заменяй точный раздел названием документа и не повторяй одну и ту же цитату подряд.
 Если вопрос о расчете, объясни порядок и используй все относящиеся к нему документы. Каждую формулу выводи отдельным блоком только в корректном LaTeX между $$ и $$; никогда не помещай формулу в обратные кавычки и не показывай служебную запись вида S(...), W(...), T(...).
+Сначала изложи основное правило или определение из раздела, непосредственно соответствующего вопросу. Частные случаи и исключения описывай после него с явным указанием условий; не подменяй ими общее правило. Для обзорного вопроса охвати представленные подразделы, а не только первый найденный фрагмент. В сравнении раскрой каждую сторону отдельно. Различай цену за единицу и итоговую стоимость, виды услуг и составляющие цены. Если запрошен нормативный источник, не заменяй его методикой системы.
+Цитируй только факты, которые подтверждаются текстом фрагмента. Название файла само по себе ничего не доказывает. Не заявляй отсутствие сведений во всём документе на основании неполного фрагмента. Метки IMAGE_UNREAD означают недоступное содержимое рисунка: не выдумывай его формулу. IMAGE_OCR содержит распознанный текст изображения и может искажать индексы и математические знаки; точную формулу по нему не заявляй без подтверждения текстом или MATH из документа.
+
+НАЗНАЧЕНИЕ ФРАГМЕНТОВ:
+{evidence_plan}
 
 КОНТЕКСТ:
 {context_text}
@@ -3544,10 +3574,7 @@ class RAGAgent:
                 calculations,
                 context,
             )
-            answer = ensure_price_category_source_coverage(answer, evidence_question or question, context)
-            answer = ensure_price_composition_source_coverage(answer, evidence_question or question, context)
-            answer = ensure_topic_fact_coverage(answer, evidence_question or question, context)
-            return ensure_topic_source_coverage(answer, evidence_question or question, context)
+            return answer
         with _pipeline_span(
             "llm.generate",
             attributes={
@@ -3564,10 +3591,6 @@ class RAGAgent:
                 calculations,
                 context,
             )
-            answer = ensure_price_category_source_coverage(answer, evidence_question or question, context)
-            answer = ensure_price_composition_source_coverage(answer, evidence_question or question, context)
-            answer = ensure_topic_fact_coverage(answer, evidence_question or question, context)
-            answer = ensure_topic_source_coverage(answer, evidence_question or question, context)
             if not answer:
                 raise RuntimeError("LLM returned an empty answer")
             span.set_attribute("rag.response.chars", len(answer))
@@ -4343,6 +4366,7 @@ class RAGAgent:
         source_domains: dict[str, tuple[str, ...]] | None = None,
         source_versions: dict[str, str] | None = None,
         retrieval_focus: str = "auto",
+        subject_question: str | None = None,
     ) -> list[dict]:
         """Return chunks after query planning unless a validated plan is supplied."""
         original_question = question
@@ -4359,11 +4383,7 @@ class RAGAgent:
             if is_document_occurrence_question(original_question)
             else question
         )
-        selection_question = (
-            occurrence_question
-            if is_document_occurrence_question(occurrence_question)
-            else question
-        )
+        selection_question = subject_question or original_question
         self._refresh_docstore_if_changed()
         spec = spec or refine_prism_query(question)
         domain_routing = route_query(question, retrieval_focus)
@@ -4481,6 +4501,7 @@ class RAGAgent:
         results = [
             item for item in merged.values()
             if Path(str(item.get("file", ""))).name.casefold() not in excluded
+            and (source_aliases is None or Path(str(item.get("file", ""))).name.casefold() in source_aliases)
             and (
                 not explicit_sources
                 or Path(str(item.get("file", ""))).name.casefold() in explicit_sources
@@ -4554,7 +4575,7 @@ class RAGAgent:
         if concept_selected:
             # A narrowly matched governing clause is safer than mixing in
             # similarly-worded exceptions from later chapters.
-            return concept_selected[:3]
+            selected = [*concept_selected, *(item for item in selected if item not in concept_selected)]
         if not explicit_sources:
             # PRISM can legitimately prefer formula-bearing chunks, but that
             # must not erase the governing regulation or the exact method
@@ -4583,8 +4604,26 @@ class RAGAgent:
                 )
             ]
             if operation_evidence:
-                return operation_evidence[:top_k]
-        return selected
+                selected = operation_evidence
+        section_index = getattr(self, "_section_evidence_index", None)
+        if section_index is None or getattr(self, "_section_evidence_nodes", None) is not self._all_nodes:
+            section_index = SectionEvidenceIndex(self._all_nodes)
+            self._section_evidence_index = section_index
+            self._section_evidence_nodes = self._all_nodes
+        evidence_pool = [*selected, *(item for item in ranked if item not in selected)]
+        packed = section_index.select(
+            selection_question, evidence_pool, excluded_sources=excluded_sources,
+            allowed_sources=explicit_sources or (set(source_aliases) if source_aliases is not None else None), top_k=top_k,
+            max_chars=min(
+                int(os.environ.get("RAG_EVIDENCE_MAX_CHARS", "36000")),
+                max(2000, (int(self.llm.metadata.context_window) - 4096) * 2)
+                if getattr(self, "llm", None) is not None else 36000,
+            ),
+        )
+        if spec.target_sections:
+            packed = select_prism_evidence(packed, spec, max(top_k, len(packed)))
+        packed = apply_document_version_preference(packed, source_versions, explicit_sources=explicit_sources)
+        return [item for item in packed if not contains_prompt_injection(str(item.get("text", "")))]
 
     def clear_cache(self):
         self.response_cache.clear()

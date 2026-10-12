@@ -1,4 +1,7 @@
-"""Deterministic end-to-end quality gate for a deployed RAG corpus."""
+"""Heuristic regression checks plus raw evidence for human semantic assessment.
+
+Word coverage and citation counts are not a measure of factual correctness.
+"""
 from __future__ import annotations
 
 import argparse
@@ -69,6 +72,9 @@ class CaseResult:
     checks: dict[str, float]
     failures: tuple[str, ...]
     retrieval: RetrievalResult
+    answer: str = ""
+    sources: tuple[dict, ...] = ()
+    status: str = ""
 
 
 def load_cases(path: Path) -> list[QualityCase]:
@@ -296,6 +302,8 @@ def run_case(client: ApiClient, chat_id: str, case: QualityCase) -> CaseResult:
         }
     answer = score_response(case, response, time.perf_counter() - started)
     failures = list(answer.failures)
+    if response.get("status") in {"running", "error"} or not str(response.get("answer", "")).strip():
+        failures.append("incomplete_generation")
     if retrieval.error:
         failures.append("retrieval_error")
     return CaseResult(
@@ -305,6 +313,9 @@ def run_case(client: ApiClient, chat_id: str, case: QualityCase) -> CaseResult:
         checks=answer.checks,
         failures=tuple(failures),
         retrieval=retrieval,
+        answer=str(response.get("answer", "")),
+        sources=tuple(response.get("sources", [])),
+        status=str(response.get("status", "complete")),
     )
 
 
@@ -407,6 +418,8 @@ def main(argv: list[str] | None = None) -> int:
     results = [run_case(client, args.chat_id, case) for case in cases]
     summary = retrieval_summary([result.retrieval for result in results])
     report = {
+        "score_kind": "heuristic_word_and_link_checks_not_semantic_quality",
+        "semantic_review_required": True,
         "minimum": args.minimum,
         "minimum_retrieval_recall": args.minimum_retrieval_recall,
         "passed": all(

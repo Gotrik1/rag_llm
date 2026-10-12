@@ -62,6 +62,25 @@ def context_item(prefix):
 
 
 class FlowModeTests(unittest.TestCase):
+    def test_rust_flow_does_not_silently_ignore_selected_cloud_provider(self):
+        agent = FakeAgent()
+        with patch.object(web_ui, "load_provider_config", return_value={"provider": "gigachat", "model": "GigaChat"}), patch.object(web_ui, "get_agent", return_value=agent), patch.object(web_ui, "_run_rust_json") as rust:
+            answer, cached = web_ui._rust_generate("Вопрос", [context_item("python")])
+        self.assertEqual(answer, "hybrid answer")
+        self.assertFalse(cached)
+        rust.assert_not_called()
+
+    def test_hybrid_fusion_keeps_full_primary_section_pack(self):
+        primary = [{**context_item(f"p{index}"), "selection_reason": "subject-child"} for index in range(12)]
+        fused = web_ui._fuse_contexts(primary, [context_item("rust")], 12)
+        self.assertEqual([item["file"] for item in fused], [item["file"] for item in primary])
+
+    def test_new_subject_does_not_inherit_previous_indicator_question(self):
+        scope = {"messages": [{"role": "user", "chat_id": "chat-1", "content": "Дай формулу ИВ0"}]}
+        for question in ("Какие бывают модели?", "Как найти график?", "Как рассчитываются авансы?"):
+            with self.subTest(question=question):
+                self.assertEqual(web_ui.contextualize_retrieval_question(question, scope, "chat-1"), question)
+
     def invoke(self, mode, include_chat=True):
         handler = object.__new__(web_ui.Handler)
         captured = {}

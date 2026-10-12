@@ -12,6 +12,27 @@ import docx_parser
 
 
 class DocumentIngestionTests(unittest.TestCase):
+    def test_normative_long_clause_keeps_own_number_and_body(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Постановление 1179.docx"
+            document = Document()
+            document.add_paragraph("1. Утвердить правила.")
+            document.add_paragraph("5. Цена второй категории определяется по формуле. " + "Подробное условие. " * 15)
+            document.add_paragraph("Формула и расшифровка величин.")
+            document.save(path)
+            text = docx_parser.read_docx_text(path)
+            self.assertIn("[SECTION: Пункт 5]", text)
+            self.assertIn("Формула и расшифровка", text)
+            self.assertNotIn("Пункт 1 > Пункт 5", text)
+
+    def test_heading_level_depends_only_on_number_prefix(self):
+        self.assertEqual(docx_parser._heading_level("", "", "2. Настоящее постановление вступает в силу с 1-го числа. Условие."), 1)
+        self.assertEqual(docx_parser._heading_level("", "", "5.4.7 Работа с графиками"), 3)
+
+    def test_unread_embedded_image_is_not_silently_removed(self):
+        xml = parse_xml('<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:r><w:drawing><a:blip r:embed="rId5"/></w:drawing></w:r></w:p>')
+        self.assertIn("IMAGE_UNREAD", docx_parser._extract_inline_text(xml, {"rId5": "[IMAGE_UNREAD: formula.gif]"}))
+
     def test_image_uses_local_ocr_and_accepts_short_meaningful_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

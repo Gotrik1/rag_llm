@@ -1651,7 +1651,7 @@ class PrismQueryTests(unittest.TestCase):
             "ИВ0 — внешняя инициатива, а не стоимость.",
             "Чем ИВ0 отличается от расчёта стоимости?",
             ["V_{ИВ0}=V_{УДГ}-V_{план}"],
-            [{"file": "r12.docx", "section_path": "Внешняя инициатива ИВ0", "text": "ИВ0"}],
+            [{"file": "r12.docx", "section_path": "Внешняя инициатива ИВ0", "text": "V_{ИВ0}=V_{УДГ}-V_{план}"}],
         )
 
         self.assertIn("$$", answer)
@@ -1670,8 +1670,15 @@ class PrismQueryTests(unittest.TestCase):
             }],
         )
 
-        self.assertIn(r"V_{\text{ИВ0}}", answer)
         self.assertIn(r"V_{\text{УДГ}}", answer)
+        self.assertIn("ИВ0", answer)
+
+    def test_formula_is_not_invented_from_file_name_and_indicator_mention(self):
+        answer = "ИВ0 упоминается в документе."
+        self.assertEqual(ensure_requested_formula_coverage(
+            answer, "Чем ИВ0 отличается от расчёта стоимости?", [],
+            [{"file": "r12.docx", "section_path": "ИВ0", "text": "ИВ0"}],
+        ), answer)
 
     def test_price_composition_answer_cites_all_governing_source_families(self):
         context = [

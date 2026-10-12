@@ -34,8 +34,9 @@ async fn main() -> Result<()> {
     println!("  <вопрос>          — задать вопрос базе знаний");
     println!();
 
-    let agent = agent::Agent::new().await?;
-    info!("Агент инициализирован");
+    // Machine retrieval/generation uses the canonical corpus and must not
+    // initialise an unrelated vector store or download an embedding model.
+    let mut agent = None;
 
     let stdin = io::stdin();
     loop {
@@ -43,7 +44,7 @@ async fn main() -> Result<()> {
         io::stdout().flush()?;
 
         let mut line = String::new();
-        stdin.lock().read_line(&mut line)?;
+        if stdin.lock().read_line(&mut line)? == 0 { break; }
         let input = line.trim();
 
         if input.is_empty() {
@@ -73,6 +74,7 @@ async fn main() -> Result<()> {
 
         // Диагностика: прямой BM25 поиск
         if let Some(query) = input.strip_prefix(":bm25 ") {
+            let agent = initialized_agent(&mut agent).await?;
             match agent.bm25_search(query) {
                 Ok(results) => {
                     println!("BM25 топ-10 для «{}»:", query);
@@ -88,7 +90,7 @@ async fn main() -> Result<()> {
 
         // Машинный retrieval-контракт для Python orchestration
         if let Some(query) = input.strip_prefix(":retrieve-json ") {
-            match agent.retrieve_evidence(query).await {
+            match retrieval::retrieve_canonical(query) {
                 Ok(results) => println!("{}", serde_json::to_string(&results)?),
                 Err(e) => eprintln!("✗ {}", e),
             }
@@ -98,6 +100,7 @@ async fn main() -> Result<()> {
         // Машинный контракт полного Rust flow.  JSON печатается одной строкой,
         // поэтому его безопасно вызывает Python backend.
         if let Some(query) = input.strip_prefix(":ask-json ") {
+            let agent = initialized_agent(&mut agent).await?;
             match agent.ask(query).await {
                 Ok(response) => println!("{}", serde_json::to_string(&response)?),
                 Err(e) => eprintln!("✗ {}", e),
@@ -107,16 +110,16 @@ async fn main() -> Result<()> {
 
         if let Some(payload) = input.strip_prefix(":generate-json ") {
             match serde_json::from_str::<GenerateRequest>(payload) {
-                Ok(request) => match agent
-                    .generate_from_context(
-                        &request.question,
-                        &request.context,
-                        request.model.as_deref(),
-                    )
-                    .await
-                {
+                Ok(request) => {
+                    let client = llm::OllamaClient::new();
+                    let result = match request.model.as_deref() {
+                        Some(model) => client.generate_with_model(&request.context, &request.question, model).await,
+                        None => client.generate(&request.context, &request.question).await,
+                    };
+                    match result {
                     Ok(answer) => println!("{}", serde_json::json!({ "answer": answer })),
                     Err(e) => eprintln!("✗ {}", e),
+                    }
                 },
                 Err(e) => eprintln!("✗ Некорректный generate-json: {}", e),
             }
@@ -124,11 +127,13 @@ async fn main() -> Result<()> {
         }
 
         if let Some(path) = input.strip_prefix(":load ") {
+            let agent = initialized_agent(&mut agent).await?;
             match agent.ingest(path).await {
                 Ok(n) => println!("✓ Проиндексировано {} чанков из {}", n, path),
                 Err(e) => eprintln!("✗ Ошибка: {}", e),
             }
         } else {
+            let agent = initialized_agent(&mut agent).await?;
             let t0 = std::time::Instant::now();
             match agent.ask(input).await {
                 Ok(response) => {
@@ -155,4 +160,12 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn initialized_agent(slot: &mut Option<agent::Agent>) -> Result<&agent::Agent> {
+    if slot.is_none() {
+        *slot = Some(agent::Agent::new().await?);
+        info!("Агент инициализирован");
+    }
+    Ok(slot.as_ref().expect("agent initialized"))
 }

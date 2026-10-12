@@ -49,6 +49,7 @@ from db_store import (
 )
 from document_catalog import annotate_document_versions, build_document_catalog_answer, is_document_catalog_question
 from domain_routing import infer_document_domains, normalize_retrieval_focus
+from evidence_selection import term_keys
 from llm_providers import DEFAULTS, ProviderLLM
 from rag_agent import CACHE_VERSION, DATA_DIR, GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, format_formula_for_display, is_document_occurrence_question, is_formula_question, refine_prism_query, source_locator, user_facing_source_name, validate_retrieval
 from runtime_paths import MATHML_CACHE_DIR, STATE_DIR, UPLOAD_DIR
@@ -302,6 +303,11 @@ def contextualize_retrieval_question(question: str, scope: dict, chat_id: str) -
     )
     if explicit_subject:
         return question
+    # Question words alone do not make a follow-up. "Какие бывают модели?"
+    # names a new subject and must never inherit e.g. the preceding ИВ0 turn.
+    referential_keys = term_keys("формула расчет условия ограничения переменные источник порядок подробнее это он она они его ее их как какой какая какие сколько почему где когда зачем")
+    if term_keys(normalized) - referential_keys:
+        return question
     follow_up = len(normalized) <= 140 and bool(re.match(
         r"^(?:а\s+|и\s+|но\s+)?(?:по\s+)?(?:како(?:й|е|я|ие)|как|где|когда|почему|зачем|сколько|"
         r"что\s+(?:с|насч[её]т)|это|он|она|они|его|е[её]|их)\b",
@@ -540,12 +546,13 @@ def context_is_shared_global(context: list[dict], shared_sources: set[str]) -> b
     )
 
 
-def filter_scoped_context(items: list[dict], excluded_sources: set[str]) -> list[dict]:
+def filter_scoped_context(items: list[dict], excluded_sources: set[str], allowed_sources: set[str] | None = None) -> list[dict]:
     if not excluded_sources:
         return items
     return [
         item for item in items
         if Path(str(item.get("file", ""))).name.casefold() not in excluded_sources
+        and (allowed_sources is None or Path(str(item.get("file", ""))).name.casefold() in allowed_sources)
     ]
 
 
@@ -573,7 +580,9 @@ def _run_rust_json(command: str, question: str, *, flow: str = "rust") -> dict |
         try:
             result = subprocess.run(
                 _rust_command(), input=f":{command} {question}\n:exit\n".encode("utf-8"),
-                capture_output=True, cwd=Path.cwd(), timeout=180, check=False,
+                capture_output=True, cwd=Path.cwd(),
+                timeout=float(os.getenv("LLM_REQUEST_TIMEOUT", "900")) if command == "generate-json" else 180,
+                check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise RuntimeError(f"Rust flow недоступен: {exc}") from exc
@@ -587,7 +596,8 @@ def _run_rust_json(command: str, question: str, *, flow: str = "rust") -> dict |
                     return json.loads(line)
                 except ValueError:
                     pass
-        raise RuntimeError("Rust flow завершился с ошибкой")
+        detail = (stderr.strip() or stdout.strip())[-1200:]
+        raise RuntimeError(f"Rust flow завершился с ошибкой (код {result.returncode}): {detail}")
 
 
 def rust_context(question: str, *, flow: str = "rust") -> list[dict]:
@@ -641,7 +651,8 @@ def _fuse_contexts(python_items: list[dict], rust_items: list[dict], top_k: int 
             selected.append(item)
 
     if python_items:
-        python_slots = min(len(python_items), max(1, top_k - 2))
+        complete_section_pack = any("selection_reason" in item for item in python_items)
+        python_slots = min(len(python_items), top_k if complete_section_pack else max(1, top_k - 2))
         add(python_items, "python", python_slots)
         add(rust_items, "rust", top_k)
         add(python_items[python_slots:], "python", top_k)
@@ -712,6 +723,19 @@ def _rust_generate(
     if project_context:
         context_text = f"{context_text}\n\n---\n\n{project_context}"
     config = load_provider_config()
+    if config.get("provider", "ollama") != "ollama":
+        # Rust candidates may be used with any provider. Its native generator
+        # only speaks Ollama, so honour a cloud selection through that provider's
+        # existing adapter instead of silently answering with the local model.
+        agent = get_agent()
+        prompt = GROUNDED_SYSTEM_PROMPT
+        if project_context:
+            prompt += "\n\n" + project_context
+        answer = agent._generate_grounded_answer(
+            question, context, extract_formula_lines(context, question),
+            refine_prism_query(question), prompt, cache_enabled=cache_enabled,
+        )
+        return answer, bool(getattr(agent, "last_generation_from_cache", False))
     model = str(config.get("model", "")).strip() if config.get("provider", "ollama") == "ollama" else ""
     cache_key = hashlib.sha256(
         f"{CACHE_VERSION}\nrust-generation\n{model}\n{question}\n{context_text}".encode("utf-8")
@@ -1525,9 +1549,9 @@ class Handler(BaseHTTPRequestHandler):
                 **retrieve_domain_options,
             )
             rust_items = filter_scoped_context(
-                filter_rust_context(retrieval_question, rust_context(retrieval_question)), excluded_sources
+                filter_rust_context(retrieval_question, rust_context(retrieval_question)), excluded_sources, set(source_aliases)
             )
-            context = fuse_contexts(python_items, rust_items, TOP_K)
+            context = fuse_contexts(python_items, rust_items, max(TOP_K, len(python_items)))
             cache_enabled = (
                 retrieval_question == question
                 and context_is_shared_global(context, shared_sources)
@@ -1556,9 +1580,9 @@ class Handler(BaseHTTPRequestHandler):
                 **retrieve_domain_options,
             )
             rust_items = filter_scoped_context(
-                filter_rust_context(retrieval_question, rust_context(retrieval_question)), excluded_sources
+                filter_rust_context(retrieval_question, rust_context(retrieval_question)), excluded_sources, set(source_aliases)
             )
-            context = fuse_contexts(python_items, rust_items, TOP_K)
+            context = fuse_contexts(python_items, rust_items, max(TOP_K, len(python_items)))
             spec = refine_prism_query(question)
             calculations = extract_formula_lines(context, question)
             cache_enabled = (
@@ -1643,8 +1667,9 @@ class Handler(BaseHTTPRequestHandler):
             rust_items = filter_scoped_context(
                 filter_rust_context(retrieval_question, rust_context(retrieval_question)),
                 excluded_sources,
+                set(source_aliases),
             ) if mode != "python" else []
-            context = python_items if mode == "python" else fuse_contexts(python_items, rust_items, TOP_K)
+            context = python_items if mode == "python" else fuse_contexts(python_items, rust_items, max(TOP_K, len(python_items)))
         formulas = requested_response_formulas(context, question)
         warnings = validate_retrieval(question, context)
         self.send_json({

@@ -12,7 +12,7 @@ from runtime_paths import INGESTION_CACHE_DIR
 
 
 CACHE_DIR = INGESTION_CACHE_DIR
-INGESTION_CACHE_VERSION = "v4-ocr-images"
+INGESTION_CACHE_VERSION = "v6-section-images"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
 
 
@@ -55,6 +55,9 @@ def ingest_document(path: str | Path) -> IngestedDocument:
             text = reader(path)
             text = normalize_ingested_text(text)
             if len(text.strip()) >= minimum_text_length:
+                unread_images = len(re.findall(r"\[IMAGE_UNREAD:", text))
+                if unread_images:
+                    warnings.append(f"{unread_images} embedded images were not recognized; image equations are not text formulas")
                 result = IngestedDocument(text=text, backend=name, warnings=warnings)
                 _write_cache(path, result)
                 return result

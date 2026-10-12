@@ -56,6 +56,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --upgrade "setuptools>=80.9.0" && \
     python -m pip check
 
+RUN apt-get update && apt-get install --yes --no-install-recommends \
+        inkscape fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --gid 10001 rag && \
     useradd --uid 10001 --gid rag --create-home --shell /usr/sbin/nologin rag
 

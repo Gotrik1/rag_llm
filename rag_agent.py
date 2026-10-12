@@ -3242,6 +3242,7 @@ class RAGAgent:
         print(f"  Парсим {p.name}...")
 
         ingested = ingest_document(p)
+        self.last_ingestion_report = {'parsing_backend': ingested.backend, 'warnings': list(ingested.warnings)}
         text = _cleanup_formula_noise(ingested.text)
         if not text.strip():
             raise ValueError(f"Не удалось извлечь текст из документа: {path}")

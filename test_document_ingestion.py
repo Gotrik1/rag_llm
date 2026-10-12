@@ -42,6 +42,7 @@ class DocumentIngestionTests(unittest.TestCase):
     def test_location_and_unread_image_markers_are_not_content(self):
         self.assertFalse(document_ingestion.has_extracted_content("[SECTION: Chapter 1]\n[IMAGE_UNREAD: media/image1.png]"))
         self.assertTrue(document_ingestion.has_extracted_content("[SECTION: Chapter 1]\nA"))
+        self.assertFalse(document_ingestion.has_extracted_content('[IMAGE_UNREAD: drawing.wmf] [IMAGE_WARNING: extraction failed]'))
 
     def test_normative_long_clause_keeps_own_number_and_body(self):
         with tempfile.TemporaryDirectory() as directory:

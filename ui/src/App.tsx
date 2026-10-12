@@ -138,7 +138,7 @@ type DocumentRecord = {
   file_name: string;
   status: "queued" | "processing" | "ready" | "failed" | "cancelled";
   processing_state?: { job_id?: string; progress?: number; error?: string };
-  metadata?: { chunks?: number; size_bytes?: number };
+  metadata?: { chunks?: number; size_bytes?: number; parsing_backend?: string; warnings?: string[] };
   created_at?: string;
   document_family?: string;
   version_label?: string | null;
@@ -1553,7 +1553,7 @@ function NavigationSidebar({
             href={`/api/documents/${document.id}/content`}
             rel="noreferrer"
             target="_blank"
-            title={`${document.file_name}. ${documentUploadedLabel(document.created_at)}. ${documentVersionLabel(document)}`}
+            title={`${document.file_name}. ${documentUploadedLabel(document.created_at)}. ${documentVersionLabel(document)}${document.metadata?.warnings?.length ? '. Часть изображений распознана с предупреждениями. Проверьте оригинал.' : ''}`}
           >
             {/\.(?:png|jpe?g|webp|tiff?|bmp)$/i.test(document.file_name) ? <ImageIcon size={15} /> : <FileText size={15} />}
             <span className="nav-document-copy">
@@ -1564,7 +1564,7 @@ function NavigationSidebar({
             </span>
             <span className={`nav-document-status ${document.status}`}>
               {document.status === "ready"
-                ? "Готов"
+                ? (document.metadata?.warnings?.length ? "Готов ⚠" : "Готов")
                 : document.status === "processing"
                   ? `${document.processing_state?.progress ?? 0}%`
                   : document.status}

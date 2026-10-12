@@ -13,7 +13,8 @@ def main() -> int:
         from rag_agent import RAGAgent
         agent = RAGAgent(embedding_base_url=os.getenv('RAG_INGESTION_EMBED_URL') or None)
         chunks = agent.ingest(sys.argv[1])
-        print(json.dumps({"chunks": chunks}, ensure_ascii=False)); return 0
+        report = getattr(agent, 'last_ingestion_report', {})
+        print(json.dumps({"chunks": chunks, **(report if isinstance(report, dict) else {})}, ensure_ascii=False)); return 0
     except Exception as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False)); return 1
 

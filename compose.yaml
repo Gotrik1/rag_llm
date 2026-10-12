@@ -31,6 +31,10 @@ x-app-environment: &app-environment
   RAG_AUTH_MODE: ${RAG_AUTH_MODE:-local}
   RAG_SESSION_COOKIE_SECURE: ${RAG_SESSION_COOKIE_SECURE:-true}
   RAG_QUERY_UNDERSTANDING: ${RAG_QUERY_UNDERSTANDING:-true}
+  RAG_VISION_BASE_URL: ${RAG_VISION_BASE_URL:-}
+  RAG_VISION_MODEL: ${RAG_VISION_MODEL:-Qwen/Qwen3.8-27B}
+  RAG_FORMULA_OCR_URL: ${RAG_FORMULA_OCR_URL:-}
+  RAG_VISION_TIMEOUT_SECONDS: ${RAG_VISION_TIMEOUT_SECONDS:-180}
   RAG_RERANKER_MODE: ${RAG_RERANKER_MODE:-off}
   RAG_RERANKER_URL: ${RAG_RERANKER_URL:-http://llm-bridge:11434/api/rerank}
   RAG_RERANKER_MODEL: ${RAG_RERANKER_MODEL:-BAAI/bge-reranker-base}
@@ -525,6 +529,40 @@ services:
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+    logging: *common-logging
+
+  document-vision:
+    profiles: ["document-vision"]
+    build:
+      context: .
+      dockerfile: deploy/document-vision/Dockerfile
+    image: rag-document-vision:${RAG_VISION_IMAGE_TAG:-latest}
+    user: "10001:10001"
+    environment:
+      HF_HOME: /data/models
+      HF_HUB_OFFLINE: "1"
+      VISION_GPU_MEMORY_FRACTION: ${VISION_GPU_MEMORY_FRACTION:-0.065}
+    volumes:
+      - ${RAG_DATA_ROOT:-./.data/storage}/vision-models:/data/models:ro,z
+    networks: [backend]
+    mem_limit: 12g
+    cpus: 4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=30)"]
+      interval: 30s
+      timeout: 35s
+      retries: 5
+      start_period: 180s
+    restart: unless-stopped
     logging: *common-logging
 
   index-embedding:

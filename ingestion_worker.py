@@ -80,7 +80,11 @@ async def ingest_document_job(ctx: dict, job_id: str, payload: dict | None = Non
                 {
                     "status": "ready",
                     "processing_state": {"job_id": job_id, "progress": 100},
-                    "metadata": {"chunks": int(result.get("chunks", 0))},
+                    "metadata": {
+                        "chunks": int(result.get("chunks", 0)),
+                        "parsing_backend": str(result.get('parsing_backend', '')),
+                        "warnings": result.get('warnings', []),
+                    },
                 },
             )
         return result

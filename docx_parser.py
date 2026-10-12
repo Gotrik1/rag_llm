@@ -187,7 +187,19 @@ def _read_embedded_images(archive: zipfile.ZipFile) -> dict[str, str]:
         archive_target = "word/" + target.lstrip("/") if not target.startswith("/") else target.lstrip("/")
         if archive_target not in by_target:
             value = f"[IMAGE_UNREAD: {target}]"
-            if ocr_enabled:
+            from image_parsing import parse_image_bytes, visual_parser_enabled
+            if visual_parser_enabled():
+                try:
+                    recognized = parse_image_bytes(archive.read(archive_target), target)
+                    # Illustration headings must not replace Word's native
+                    # chapter hierarchy or turn a formula into a new chapter.
+                    image_body = re.sub(r'(?m)^#{1,6}\s+', '', recognized.text)
+                    value = f"[IMAGE_OCR: {target}; engine={recognized.engine}]\n{image_body}\n[/IMAGE_OCR]"
+                    if recognized.warnings:
+                        value += '\n[IMAGE_WARNING: ' + '; '.join(recognized.warnings) + ']'
+                except Exception as exc:
+                    value += f" [IMAGE_WARNING: visual extraction failed ({type(exc).__name__})]"
+            elif ocr_enabled:
                 try:
                     from PIL import Image
                     import pytesseract

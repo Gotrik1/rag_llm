@@ -12,7 +12,7 @@ from runtime_paths import INGESTION_CACHE_DIR
 
 
 CACHE_DIR = INGESTION_CACHE_DIR
-INGESTION_CACHE_VERSION = "v7-numbered-headings"
+INGESTION_CACHE_VERSION = "v8-visual-extraction"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
 
 
@@ -32,8 +32,26 @@ def ingest_document(path: str | Path) -> IngestedDocument:
     warnings: list[str] = []
     suffix = path.suffix.lower()
     if suffix in IMAGE_SUFFIXES:
+        from image_parsing import parse_image_file, visual_parser_enabled
+        if visual_parser_enabled():
+            parsed = parse_image_file(path)
+            result = IngestedDocument(parsed.text, parsed.engine, parsed.warnings)
+            if not has_extracted_content(result.text, 3):
+                raise RuntimeError('Image contains no readable content')
+            if not result.warnings:
+                _write_cache(path, result)
+            return result
         backends = [("tesseract-ocr", _read_image_with_tesseract)]
         minimum_text_length = 3
+    elif suffix == ".pdf":
+        from image_parsing import read_pdf
+        parsed = read_pdf(path)
+        result = IngestedDocument(parsed.text, parsed.engine, parsed.warnings)
+        if not has_extracted_content(result.text):
+            raise RuntimeError('PDF contains no readable content')
+        if not result.warnings:
+            _write_cache(path, result)
+        return result
     elif suffix == ".docx":
         backends = [
             ("xml", _read_with_xml),
@@ -58,6 +76,7 @@ def ingest_document(path: str | Path) -> IngestedDocument:
                 unread_images = len(re.findall(r"\[IMAGE_UNREAD:", text))
                 if unread_images:
                     warnings.append(f"{unread_images} embedded images were not recognized; image equations are not text formulas")
+                warnings.extend(dict.fromkeys(re.findall(r'\[IMAGE_WARNING: ([^\]]+)\]', text)))
                 result = IngestedDocument(text=text, backend=name, warnings=warnings)
                 _write_cache(path, result)
                 return result
@@ -102,7 +121,7 @@ def normalize_ingested_text(text: str) -> str:
 
 def has_extracted_content(text: str, minimum_chars: int = 1) -> bool:
     """Accept short text while excluding unread-image and location markers."""
-    content = re.sub(r"\[(?:SECTION|IMAGE_UNREAD):[^\]]*\]", "", text)
+    content = re.sub(r"\[(?:SECTION|IMAGE_UNREAD|IMAGE_WARNING):[^\]]*\]", "", text)
     return sum(character.isalnum() for character in content) >= minimum_chars
 
 
@@ -144,7 +163,8 @@ def _read_with_xml(path: Path) -> str:
 
 def _cache_key(path: Path) -> str:
     stat = path.stat()
-    payload = f"{INGESTION_CACHE_VERSION}|{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+    from image_parsing import parser_signature
+    payload = f"{INGESTION_CACHE_VERSION}|{parser_signature()}|{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -157,6 +177,8 @@ def _read_cache(path: Path) -> IngestedDocument | None:
     if not cache_path.exists():
         return None
     data = json.loads(cache_path.read_text(encoding="utf-8"))
+    if any(any(marker in warning.lower() for marker in ('unavailable', 'not recognized', 'failed', 'fallback', 'incomplete')) for warning in data.get('warnings', [])):
+        return None
     if not has_extracted_content(data["text"], 3 if path.suffix.lower() in IMAGE_SUFFIXES else 1):
         return None
     return IngestedDocument(

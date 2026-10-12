@@ -1,7 +1,7 @@
 """Regression tests for the semantic omissions reported by human testers."""
 from types import SimpleNamespace
 
-from evidence_selection import SectionEvidenceIndex, term_keys
+from evidence_selection import SectionEvidenceIndex, term_keys, overview_sections, missing_overview_sections
 
 
 def node(path, text, file="manual.docx"):
@@ -81,3 +81,20 @@ def test_input_budget_never_slices_an_equation():
     evidence = index.select("Цена", [], max_chars=500)
     assert evidence[0]["evidence_truncated"]
     assert evidence[0]["text"] == "Definition."
+
+
+def test_overview_requires_explanation_sections_not_intro_name_mentions():
+    context = SectionEvidenceIndex([
+        node('Договорные условия', 'Настройки.'),
+        node('Договорные условия > Авансы', 'Процент аванса.'),
+        node('Договорные условия > Корректировочный', 'Требуются утвержденный УПД и фактические цены.'),
+    ]).select('Что ведется в договорных условиях?', [])
+    sections = overview_sections('Что ведется в договорных условиях?', context)
+    missing = missing_overview_sections('Есть авансы и корректировочный расчет.\n### Авансы\nПроцент аванса.', sections)
+    assert [item['section_title'] for item in missing] == ['Корректировочный']
+    assert overview_sections('Что такое договорные условия?', context) == []
+
+
+def test_requested_normative_source_includes_pp_markdown_alias():
+    index = SectionEvidenceIndex([node('Пункт 5', '5. Цена для второй ценовой категории.', '2012-05-04-пп442.md')])
+    assert index.select('Как рассчитывается 2 ЦК по постановлениям?', [])

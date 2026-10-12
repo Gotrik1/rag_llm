@@ -118,6 +118,7 @@ class SectionEvidenceIndex:
             key = source_key(item.get("file"))
             return key not in excluded and (allowed_sources is None or key in allowed) and (
                 not kind or kind in str(item.get("file", "")).casefold()
+                or (kind == 'постановлен' and bool(re.search(r'(?:^|[\W_])пп[\W_]*\d', str(item.get('file', '')).casefold())))
             ) and item.get("status") != "deleted"
 
         keys = term_keys(question)
@@ -205,3 +206,28 @@ def generation_evidence_prompt(context: list[dict]) -> str:
         f"{roles.get(item.get('evidence_role'), 'подтверждающий фрагмент')}"
         for item in context
     )
+
+
+def overview_sections(question: str, context: list[dict]) -> list[dict]:
+    """Plan an overview from immediate children, not from domain-specific facts."""
+    value = question.casefold()
+    if not re.search(r"что|какие|обзор|опиши|расскажи", value) or re.search(r"что\s+такое", value):
+        return []
+    roots = [item for item in context if item.get('selection_reason') == 'subject-heading']
+    if not roots:
+        return []
+    root = roots[0]
+    prefix = root['section_path'] + ' > '
+    children = [item for item in context if source_key(item.get('file')) == source_key(root.get('file'))
+                and str(item.get('section_path', '')).startswith(prefix)
+                and ' > ' not in item['section_path'][len(prefix):]
+                and item.get('evidence_role') != 'exception']
+    return children if len(children) >= 2 else []
+
+
+def missing_overview_sections(answer: str, sections: list[dict]) -> list[dict]:
+    headings = re.findall(r'(?m)^\s*(?:#{1,6}\s+|\*\*)([^\n]+)', answer)
+    heading_keys = [term_keys(heading.strip('* ')) for heading in headings]
+    return [item for item in sections if not any(
+        term_keys(str(item.get('section_title', ''))) <= keys for keys in heading_keys
+    )]

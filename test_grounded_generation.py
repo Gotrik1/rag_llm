@@ -20,3 +20,19 @@ def test_source_names_do_not_create_facts_or_uncited_source_lists():
     assert "6 ЦК — шестая" not in answer
     prompt = agent.llm.complete.call_args.args[0]
     assert "Название файла само по себе ничего не доказывает" in prompt
+
+
+def test_omitted_overview_child_is_repaired_from_its_own_evidence():
+    agent = object.__new__(RAGAgent)
+    agent._generation_state = SimpleNamespace(from_cache=False)
+    agent.llm_model = 'test'
+    agent.llm = Mock()
+    agent.llm.complete.side_effect = ['### Авансы\nЗадаются проценты.', '### Корректировочный\nТребуется утвержденный УПД.']
+    context = [
+        {'file': 'manual.docx', 'section_path': 'Условия', 'section_title': 'Условия', 'text': 'Параметры.', 'selection_reason': 'subject-heading'},
+        {'file': 'manual.docx', 'section_path': 'Условия > Авансы', 'section_title': 'Авансы', 'text': 'Задаются проценты.'},
+        {'file': 'manual.docx', 'section_path': 'Условия > Корректировочный', 'section_title': 'Корректировочный', 'text': 'Требуется утвержденный УПД.'},
+    ]
+    answer = agent._generate_grounded_answer('Что ведется в условиях?', context, [])
+    assert 'Требуется утвержденный УПД' in answer
+    assert 'Задаются проценты.' not in agent.llm.complete.call_args.args[0]

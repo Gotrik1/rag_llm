@@ -47,7 +47,8 @@ import qdrant_client
 from ollama import Client as OllamaClient
 from document_ingestion import ingest_document
 from domain_routing import apply_domain_routing, route_query, source_domains_for
-from evidence_selection import SectionEvidenceIndex, generation_evidence_prompt
+from evidence_selection import (SectionEvidenceIndex, generation_evidence_prompt,
+                                overview_sections, missing_overview_sections)
 from llm_providers import ProviderLLM
 from response_cache import ResponseCache
 from reranker import HttpReranker
@@ -3527,6 +3528,13 @@ class RAGAgent:
                 "Ответь на все части этой интерпретации, но не упоминай исправление опечаток.\n"
             )
         evidence_plan = generation_evidence_prompt(context)
+        required_sections = overview_sections(evidence_question or question, context)
+        if required_sections:
+            evidence_plan += "\n\nОБЯЗАТЕЛЬНЫЙ ПЛАН ОБЗОРНОГО ОТВЕТА:\n" + "\n".join(
+                f"- Отдельный раздел ### {item['section_title']}: раскрой содержание, условия и настройки; поставь его цитату."
+                for item in required_sections
+            )
+            evidence_plan += "\nНе ограничивайся упоминанием названия в общем перечне. Не пропускай ни один пункт плана."
         prompt = f"""{system_prompt or GROUNDED_SYSTEM_PROMPT}
 
 Ниже приведены данные для ответа. Используй их как единственный фактический контекст: не выдумывай сведения, которых в нём нет. Всегда отвечай на русском языке.
@@ -3593,6 +3601,31 @@ class RAGAgent:
             )
             if not answer:
                 raise RuntimeError("LLM returned an empty answer")
+            missing = missing_overview_sections(answer, required_sections)
+            if missing:
+                repair_context = "\n\n".join(
+                    f"### {item['section_title']}\n[Источник: {human_source_reference(item)}]\n{item['text']}"
+                    for item in missing
+                )
+                repair = self.llm.complete(
+                    "На русском напиши только недостающие разделы обзорного ответа. "
+                    "Каждый раздел начни точным заголовком ### из источника; объясни его содержание "
+                    "и условия, а не только название. Используй только приведенный текст. "
+                    "После каждого раздела сохрани его точную цитату. Не добавляй вступления, "
+                    "новые факты или сведения о других разделах.\nВОПРОС:\n" + question
+                    + "\nИСТОЧНИКИ НЕДОСТАЮЩИХ РАЗДЕЛОВ:\n" + repair_context
+                )
+                addition = sanitize_grounded_answer(str(repair).strip(), question, [])
+                if addition and not missing_overview_sections(addition, missing):
+                    answer += "\n\n" + addition
+                else:
+                    # Do not label a partial overview complete or invent its
+                    # absent details based on titles. Preserve useful content
+                    # and make the known omission and original source explicit.
+                    answer += "\n\nНе удалось полноценно изложить следующие разделы; проверьте их в источнике:\n" + "\n".join(
+                        f"- {item['section_title']}. [Источник: {human_source_reference(item)}]"
+                        for item in missing
+                    )
             span.set_attribute("rag.response.chars", len(answer))
         if cache_enabled:
             self.response_cache.set(generation_key, {"answer": answer})

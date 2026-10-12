@@ -34,6 +34,20 @@ def main():
     draw.text((400, 580), '= 3 А', font=large, fill='black')
     draw.text((50, 750), 'Не путать напряжение (В) и сопротивление (Ом).', font=small, fill='black')
     image.save(args.output / 'russian_table_formula.png')
+    # Container-format fixtures share exactly the same visible evidence.
+    from docx import Document
+    from docx.shared import Inches
+    import fitz
+    document = Document()
+    document.add_heading('Visual ingestion acceptance', level=1)
+    document.add_picture(str(args.output / 'russian_table_formula.png'), width=Inches(6))
+    document.save(args.output / 'embedded_image.docx')
+    pdf = fitz.open()
+    page = pdf.new_page(width=625, height=425)
+    page.insert_image(page.rect, filename=str(args.output / 'russian_table_formula.png'))
+    pdf.save(args.output / 'scanned_image.pdf')
+    pdf.close()
+    image.save(args.output / 'multipage_image.tiff', save_all=True, append_images=[image.copy()])
     image.crop((70, 520, 650, 715)).save(args.output / 'fraction_formula.png')
     image = Image.new('RGB', (1200, 420), 'white')
     draw = ImageDraw.Draw(image)

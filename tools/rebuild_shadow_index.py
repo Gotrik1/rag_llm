@@ -31,7 +31,7 @@ def main() -> None:
             raise FileNotFoundError(f"Registered ready source missing: {path}")
         sources[str(path)] = {
             "path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            "document_ids": sources.get(str(path), {}).get("document_ids", []) + [record["id"]],
+            "document_ids": sources.get(str(path), {}).get("document_ids", []) + [str(record["id"])],
         }
     if not sources:
         raise RuntimeError("No registered ready sources")
@@ -62,8 +62,8 @@ def main() -> None:
         manifest["sources"].append(source)
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     # Detect an unexpected active writer or deleted/replaced registry source.
-    current = sorted((r["id"], r["source_path"]) for r in list_documents() if r.get("status") == "ready")
-    initial = sorted((r["id"], r["source_path"]) for r in ready)
+    current = sorted((str(r["id"]), r["source_path"]) for r in list_documents() if r.get("status") == "ready")
+    initial = sorted((str(r["id"]), r["source_path"]) for r in ready)
     if current != initial:
         raise RuntimeError("Registry changed during rebuild; do not switch this index")
     for source in sources.values():

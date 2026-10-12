@@ -4,6 +4,7 @@ import json
 import os
 from collections.abc import AsyncIterator
 from functools import lru_cache
+from threading import Lock
 from typing import Any
 
 import httpx
@@ -21,6 +22,9 @@ RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base")
 RERANKER_CACHE = os.getenv("RERANKER_CACHE_PATH", EMBED_CACHE)
 RERANKER_MAX_DOCUMENTS = max(1, int(os.getenv("RERANKER_MAX_DOCUMENTS", "64")))
 RERANKER_TEXT_LIMIT = max(256, int(os.getenv("RERANKER_TEXT_LIMIT", "6000")))
+EMBED_THREADS = max(1, int(os.getenv("FASTEMBED_THREADS", "4")))
+EMBED_BATCH_SIZE = max(1, int(os.getenv("FASTEMBED_BATCH_SIZE", "8")))
+_embedding_lock = Lock()
 
 
 def _messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -148,7 +152,7 @@ async def chat(payload: dict[str, Any]):
 def _embedder():
     from fastembed import TextEmbedding
 
-    return TextEmbedding(model_name=EMBED_MODEL, cache_dir=EMBED_CACHE)
+    return TextEmbedding(model_name=EMBED_MODEL, cache_dir=EMBED_CACHE, threads=EMBED_THREADS)
 
 
 def _embed_texts(value: Any) -> list[str]:
@@ -158,14 +162,19 @@ def _embed_texts(value: Any) -> list[str]:
 
 
 @app.post("/api/embed")
-async def embed(payload: dict[str, Any]) -> dict[str, Any]:
-    vectors = list(_embedder().embed(_embed_texts(payload.get("input"))))
+def embed(payload: dict[str, Any]) -> dict[str, Any]:
+    # CPU inference belongs in FastAPI's worker pool, not its event loop.
+    # Serialize model access and bound ONNX threads/batch memory independently
+    # of request concurrency; health and generation remain responsive.
+    with _embedding_lock:
+        vectors = list(_embedder().embed(_embed_texts(payload.get("input")), batch_size=EMBED_BATCH_SIZE))
     return {"model": EMBED_MODEL, "embeddings": [vector.tolist() for vector in vectors]}
 
 
 @app.post("/api/embeddings")
-async def embeddings(payload: dict[str, Any]) -> dict[str, Any]:
-    vectors = list(_embedder().embed(_embed_texts(payload.get("prompt"))))
+def embeddings(payload: dict[str, Any]) -> dict[str, Any]:
+    with _embedding_lock:
+        vectors = list(_embedder().embed(_embed_texts(payload.get("prompt")), batch_size=EMBED_BATCH_SIZE))
     return {"model": EMBED_MODEL, "embedding": vectors[0].tolist()}
 
 

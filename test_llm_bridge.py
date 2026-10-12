@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import unittest
+import inspect
 from unittest.mock import Mock, patch
 
 from fastapi import HTTPException
@@ -15,6 +16,19 @@ SPEC.loader.exec_module(bridge)
 
 
 class LlmBridgeTests(unittest.TestCase):
+    def test_cpu_embeddings_are_not_event_loop_handlers(self):
+        self.assertFalse(inspect.iscoroutinefunction(bridge.embed))
+        self.assertFalse(inspect.iscoroutinefunction(bridge.embeddings))
+
+    def test_embedding_batch_memory_is_bounded(self):
+        vector = Mock()
+        vector.tolist.return_value = [0.1, 0.2]
+        model = Mock()
+        model.embed.return_value = iter([vector])
+        with patch.object(bridge, '_embedder', return_value=model):
+            self.assertEqual(bridge.embed({'input': ['text']})['embeddings'], [[0.1, 0.2]])
+        model.embed.assert_called_once_with(['text'], batch_size=bridge.EMBED_BATCH_SIZE)
+
     def test_unlimited_ollama_output_does_not_become_invalid_vllm_limit(self):
         for options in ({}, {"num_predict": -1}, {"num_predict": 0}):
             self.assertNotIn("max_tokens", bridge._openai_payload({"prompt": "test", "options": options}, False))

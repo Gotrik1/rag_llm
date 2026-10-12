@@ -1041,6 +1041,12 @@ def matching_explicit_sources(question: str, source_aliases: dict[str, str] | No
             and sum(map(len, alpha_overlap)) >= 8
         )
         normalized_alias = str(alias or "").casefold().replace("ё", "е")
+        # A complete filename is an explicit reference even when its stem is
+        # one common word. Requiring two descriptive tokens loses short files.
+        filename_anchor = bool(
+            Path(normalized_alias).suffix in {".docx", ".pdf", ".md", ".txt", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
+            and re.search(r"(?<!\w)" + re.escape(normalized_alias) + r"(?!\w)", normalized_question)
+        )
         category_range_match = re.search(r"(?<!\d)([1-6])\s*[-–—]\s*([1-6])\s*цк", normalized_alias)
         alias_covers_category = bool(
             requested_category
@@ -1063,7 +1069,7 @@ def matching_explicit_sources(question: str, source_aliases: dict[str, str] | No
             and alias_covers_category
             and re.search(r"\bметодик\w*\b", normalized_alias)
         )
-        if numeric_anchor or descriptive_anchor or method_category_anchor:
+        if filename_anchor or numeric_anchor or descriptive_anchor or method_category_anchor:
             matches.add(Path(str(source)).name.casefold())
     return matches
 
@@ -4424,7 +4430,7 @@ class RAGAgent:
         self._refresh_docstore_if_changed()
         spec = spec or refine_prism_query(question)
         domain_routing = route_query(question, retrieval_focus)
-        explicit_sources = matching_explicit_sources(question, source_aliases)
+        explicit_sources = matching_explicit_sources(selection_question, source_aliases)
         candidate_k = max(top_k * (12 if excluded_sources else 5), 100 if excluded_sources else 40)
         qe = self._build_query_engine(candidate_k)
         merged: dict[str, dict] = {}

@@ -36,6 +36,13 @@ _LOOKUP_WORDS = frozenset(_STEMMER.stem(word) for word in (
 ))
 
 
+@lru_cache(maxsize=65536)
+def _stem_word(word: str) -> str:
+    # Regulations repeat the same vocabulary across thousands of passages.
+    # Cache word morphology, not only whole passages, to bound cold CPU work.
+    return _STEMMER.stem(word)
+
+
 @lru_cache(maxsize=8192)
 def term_keys(text: str) -> frozenset[str]:
     # Leading section numbers are not topics, but "2 ЦК" is a topic with an
@@ -45,7 +52,7 @@ def term_keys(text: str) -> frozenset[str]:
     text = re.sub(r"([1-6])\s+и\s+([1-6])\s*цк", lambda m: f"{category_words[m[1]]} ценовой категории и {category_words[m[2]]} ценовой категории", text, flags=re.I)
     text = re.sub(r"(?<!\d)([1-6])\s*цк", lambda m: f"{category_words[m[1]]} ценовой категории", text, flags=re.I)
     words = re.findall(r"[а-яёa-z]+|\d+", text.casefold().replace("ё", "е"))
-    return frozenset(_STEMMER.stem(word) for word in words if word not in _STOP) - _GENERIC_STEMS
+    return frozenset(_stem_word(word) for word in words if word not in _STOP) - _GENERIC_STEMS
 
 
 def source_key(value: object) -> str:

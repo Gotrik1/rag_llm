@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
+import evidence_selection
 
 from evidence_selection import SectionEvidenceIndex
 from rag_agent import RAGAgent
@@ -58,3 +59,14 @@ def test_original_question_reaches_retriever_and_headingless_body_reaches_final_
     )
     assert context and context[0]['file'] == 'price.docx'
     assert retriever.retrieve.call_args_list[0].args[0].query_str == 'сколько стоит ящик водки?'
+
+
+def test_repeated_vocabulary_does_not_repeat_slow_morphology(monkeypatch):
+    evidence_selection._stem_word.cache_clear()
+    evidence_selection.term_keys.cache_clear()
+    original = evidence_selection._STEMMER.stem
+    stem = Mock(side_effect=original)
+    monkeypatch.setattr(evidence_selection._STEMMER, 'stem', stem)
+    evidence_selection.term_keys('электроэнергии ' * 100)
+    evidence_selection.term_keys('электроэнергии договор')
+    assert sum(call.args[0] == 'электроэнергии' for call in stem.call_args_list) == 1

@@ -73,7 +73,7 @@ VECTOR_TOP_K     = 12      # кандидатов от вектора
 # A semantic/chunking change must never reuse an older docstore or vector
 # collection: the two indexes must describe precisely the same corpus.
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25_v12"))
-CACHE_VERSION    = "v37-section-evidence-2026-10-12"
+CACHE_VERSION    = "v38-body-lexical-2026-10-13"
 QUERY_UNDERSTANDING_VERSION = "v2"
 MAX_OUTPUT_TOKENS = int(os.environ.get("RAG_MAX_OUTPUT_TOKENS", "-1"))
 
@@ -4429,12 +4429,21 @@ class RAGAgent:
         )
         selection_question = subject_question or original_question
         self._refresh_docstore_if_changed()
+        section_index = getattr(self, "_section_evidence_index", None)
+        if section_index is None or getattr(self, "_section_evidence_nodes", None) is not self._all_nodes:
+            section_index = SectionEvidenceIndex(self._all_nodes)
+            self._section_evidence_index = section_index
+            self._section_evidence_nodes = self._all_nodes
         spec = spec or refine_prism_query(question)
         domain_routing = route_query(question, retrieval_focus)
         explicit_sources = matching_explicit_sources(selection_question, source_aliases)
         candidate_k = max(top_k * (12 if excluded_sources else 5), 100 if excluded_sources else 40)
         qe = self._build_query_engine(candidate_k)
         merged: dict[str, dict] = {}
+        for seed_question in dict.fromkeys((selection_question, question)):
+            for item in section_index.body_seeds(seed_question, limit=max(top_k * 3, 24)):
+                key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
+                merged[key] = item
         for item in self._procedural_seed_results(question):
             key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
             merged[key] = item
@@ -4472,6 +4481,7 @@ class RAGAgent:
         # Deterministic probes precede free-form LLM expansions. Previously the
         # eight-query budget could fill before a regulation probe was reached.
         query_candidates = [
+            selection_question,
             question,
             *build_targeted_queries(question),
             *(retrieval_queries or ()),
@@ -4485,7 +4495,9 @@ class RAGAgent:
             if normalized_query and key not in seen_queries:
                 seen_queries.add(key)
                 query_plan.append(normalized_query)
-            if len(query_plan) >= 8:
+            # Reserve an additional slot for the original wording rather than
+            # displacing an existing intent/semantic probe from the budget.
+            if len(query_plan) >= (9 if selection_question.casefold() != question.casefold() else 8):
                 break
         scoped_seed_sources = explicit_sources or priority_sources
         for item in self._scoped_lexical_seed_results(
@@ -4649,11 +4661,6 @@ class RAGAgent:
             ]
             if operation_evidence:
                 selected = operation_evidence
-        section_index = getattr(self, "_section_evidence_index", None)
-        if section_index is None or getattr(self, "_section_evidence_nodes", None) is not self._all_nodes:
-            section_index = SectionEvidenceIndex(self._all_nodes)
-            self._section_evidence_index = section_index
-            self._section_evidence_nodes = self._all_nodes
         evidence_pool = [*selected, *(item for item in ranked if item not in selected)]
         packed = section_index.select(
             selection_question, evidence_pool, excluded_sources=excluded_sources,

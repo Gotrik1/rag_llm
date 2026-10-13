@@ -6,6 +6,7 @@ Source visibility is enforced before heading lookup or relationship expansion.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from collections import OrderedDict
 from functools import lru_cache
@@ -29,6 +30,10 @@ _GENERIC_STEMS = frozenset(_STEMMER.stem(word) for word in (
     "рассчитать", "рассчитывать", "начислить", "начисляются", "применяются", "используются",
 ))
 _CATEGORY_STEMS = frozenset(_STEMMER.stem(word) for word in ('первой', 'второй', 'третьей', 'четвертой', 'пятой', 'шестой'))
+_LOOKUP_WORDS = frozenset(_STEMMER.stem(word) for word in (
+    'сколько', 'какова', 'каков', 'каковы', 'стоит', 'стоить', 'стоимость', 'цена',
+    'нужно', 'нужен', 'нужна', 'равен', 'равна', 'укажи', 'сообщи',
+))
 
 
 @lru_cache(maxsize=8192)
@@ -76,6 +81,20 @@ class SectionEvidenceIndex:
     """Group split paragraphs by physical document and complete section path."""
 
     def __init__(self, nodes: list):
+        # An inverted body index also covers documents with no headings.
+        # Russian stemming avoids losing a fact when ящик becomes ящика.
+        self.body_items = []
+        self.body_postings: dict[str, set[int]] = {}
+        for node in nodes:
+            metadata = node.metadata or {}
+            text = node.text or ''
+            file = str(metadata.get('file_name', metadata.get('file_path', '')))
+            if not file or not text.strip() or metadata.get('status') == 'deleted':
+                continue
+            position = len(self.body_items)
+            self.body_items.append({**metadata, 'file': file, 'text': text})
+            for key in term_keys(re.sub(r'\[SECTION:[^\]]*\]', '', text)):
+                self.body_postings.setdefault(key, set()).add(position)
         groups: OrderedDict[tuple[str, str], dict] = OrderedDict()
         for position, node in enumerate(nodes):
             metadata = node.metadata or {}
@@ -110,6 +129,33 @@ class SectionEvidenceIndex:
             if re.fullmatch(r"Пункт \d+(?:\.\d+)*", group["section_path"].rsplit(" > ", 1)[-1]):
                 group["heading_keys"] = term_keys(group["text"].split("\n\n", 1)[0][:500])
             self.sections.append(group)
+
+    def body_seeds(self, question: str, limit: int = 24) -> list[dict]:
+        """Find positive subject matches, independently of vector similarity.
+
+        Generic price/action words cannot anchor a match. Require at least two
+        subject words and a rare anchor, so incidental mentions in a large
+        manual do not swamp an exact fact in a small document.
+        """
+        keys = term_keys(question) - _LOOKUP_WORDS
+        if len(keys) < 2:
+            return []
+        count = max(1, len(self.body_items))
+        weights = {key: math.log1p(count / (1 + len(self.body_postings.get(key, ())))) for key in keys}
+        positions = set().union(*(self.body_postings.get(key, set()) for key in keys))
+        results = []
+        for position in positions:
+            item = self.body_items[position]
+            matched = {key for key in keys if position in self.body_postings.get(key, ())}
+            rare_anchor = any(len(self.body_postings[key]) <= max(2, count * 0.1) for key in matched)
+            if len(matched) < 2 or len(matched) / len(keys) < 0.75 or not rare_anchor:
+                continue
+            coverage = len(matched) / len(keys)
+            score = 3.0 + coverage + min(2.0, sum(weights[key] for key in matched) / len(keys))
+            results.append({**item, 'score': round(score, 4),
+                            'matched_queries': ['body-lexical'],
+                            'lexical_subject_keys': sorted(keys), 'lexical_coverage': coverage})
+        return sorted(results, key=lambda item: (-item['score'], len(item['text']), source_key(item['file'])))[:limit]
 
     def select(
         self, question: str, ranked: list[dict], *, excluded_sources: set[str] | None = None,
@@ -166,12 +212,18 @@ class SectionEvidenceIndex:
                     children.append({**section, "score": 0.9, "selection_reason": "subject-child"})
         children.sort(key=lambda item: (item["section_path"].count(">"), item["position"]))
         candidates.extend(children)
+        # Preserve strong full-subject body matches when no governing heading
+        # was found. Do not fill the evidence with unrelated price/cost hits.
+        direct = [item for item in ranked if visible(item) and item.get('lexical_coverage') == 1.0]
+        if not roots and direct:
+            candidates.extend(direct)
+        subject_keys = set(direct[0].get('lexical_subject_keys', ())) if direct and not roots else set()
         candidates.extend(
             item for item in ranked if visible(item) and (
                 not roots or keys.issubset(term_keys(
                     str(item.get("section_path", "")) + " " + str(item.get("text", ""))
                 ))
-            )
+            ) and (not subject_keys or subject_keys.issubset(term_keys(str(item.get('text', '')))))
         )
         selected, seen, used = [], set(), 0
         limit = max(top_k, min(24, len(roots) + len(children)))

@@ -3,7 +3,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from evidence_selection import SectionEvidenceIndex, category_ids, overview_sections, _focused_excerpt, _query_groups, _positive_query
+from evidence_selection import (SectionEvidenceIndex, category_ids, overview_sections, _focused_excerpt,
+                                _query_groups, _positive_query, _content_blocks, _formula_dependencies,
+                                _math_expressions)
 
 
 def node(path, text, file='novel-manual.md', **metadata):
@@ -722,3 +724,209 @@ def test_ordinary_topic_words_are_not_globally_removed_as_envelope_labels():
     question = 'Какие условия и уточнения пользователя сохраняет диалог?'
     positive, _ = _positive_query(question)
     assert positive == question
+
+
+@pytest.mark.parametrize('leading_pipe', [False, True])
+def test_definition_closure_packs_native_legend_rows_without_unrelated_table_cells(leading_pipe):
+    formula = '[MATH: A=B+C]'
+    correction = '[MATH: C] | Поправка на вязкость | л/ч\nТолько при ненулевой температуре раствора.'
+    legend = '\n'.join([
+        '[TABLE]', 'Обозначение | Описание | Единицы',
+        '[MATH: A] | Скорость нейтрализации | л/ч',
+        '[MATH: X] | Посторонняя настройка упаковки: ' + 'описание упаковки; ' * 120 + ' | шт',
+        '[MATH: B] | Эталонная скорость | л/ч',
+        '[MATH: Y] | Посторонняя настройка перевозки: ' + 'описание перевозки; ' * 120 + ' | шт',
+        correction,
+    ])
+    if leading_pipe:
+        legend = '\n'.join('| ' + line if '|' in line else line for line in legend.splitlines())
+    text = '\n\n'.join([legend, 'Скорость нейтрализации:', formula, 'Сведения об упаковке. ' * 100])
+    question = 'Скорость нейтрализации'
+    signals = {}
+    excerpt, _ = _focused_excerpt(text, 800, _query_groups(question), {}, question=question, diagnostics=signals)
+    assert formula in excerpt and correction in excerpt
+    assert '[MATH: A] | Скорость нейтрализации | л/ч' in excerpt
+    assert '[MATH: B] | Эталонная скорость | л/ч' in excerpt
+    assert 'Посторонняя настройка' not in excerpt
+    assert signals['definition_closure_incomplete'] is False
+    assert signals['missing_definition_symbols'] == []
+    assert len(excerpt) <= 800
+
+
+def test_dependency_uses_full_native_run_chain_and_defining_chain_of_rhs_symbol():
+    formula = '[MATH: A=B] [[MATHML_REF:root]] + [MATH: C]'
+    dependency = '[MATH: C=D] [[MATHML_REF:support]] + [MATH: E]'
+    legend = '\n'.join([
+        '[TABLE]', 'Обозначение | Описание',
+        '[MATH: A] | Коэффициент катализа', '[MATH: B] | Базовый коэффициент',
+        '[MATH: C] | Поправка на температуру', '[MATH: D] | Лабораторная поправка',
+        '[MATH: E] | Поправка датчика',
+    ])
+    text = '\n\n'.join([legend, 'Коэффициент катализа:', formula,
+                         'Сведения о перевозке. ' * 100, 'Поправка на температуру:', dependency])
+    question = 'Коэффициент катализа'
+    blocks = _content_blocks(text)
+    packages, _ = _formula_dependencies(blocks, question, _query_groups(question))
+    root = next(package for package in packages if package['symbol'] == 'a')
+    support = next(package for package in packages if package['symbol'] == 'c')
+    assert root['rhs'] == {'b', 'c'}
+    assert support['rhs'] == {'d', 'e'}
+    signals = {}
+    excerpt, _ = _focused_excerpt(text, 800, _query_groups(question), {}, question=question, diagnostics=signals)
+    assert formula in excerpt and dependency in excerpt
+    assert '[MATH: C] | Поправка на температуру' in excerpt
+    assert set(signals['formula_dependency_blocks']) == {root['block'], support['block']}
+    assert not signals['definition_closure_incomplete']
+
+
+def test_native_run_dependency_parser_does_not_join_separate_paragraphs_or_equalities():
+    text = '[MATH: A=B]\n\n+ [MATH: C]\n\n[MATH: D=E]\n[MATH: F=G]'
+    assert _math_expressions(text) == ['A=B', 'C', 'D=E', 'F=G']
+    assert _content_blocks(text) == ['[MATH: A=B]', '+ [MATH: C]', '[MATH: D=E]\n[MATH: F=G]']
+
+
+@pytest.mark.parametrize('line_break', ['\n', '\n\n'])
+def test_word_math_line_break_and_sum_remain_one_native_equation(line_break):
+    formula = '[MATH: A=∑_sub(j=1)^(N)' + line_break + '(B_sub(j)+C_sub(j))]'
+    legend = ('[TABLE]\nОбозначение | Описание\n[MATH: A] | Скорость осаждения\n'
+              '[MATH: B_sub(j)] | Эталонная скорость\n[MATH: C_sub(j)] | Поправка датчика')
+    text = '\n\n'.join([legend, 'Скорость осаждения:', formula, 'Сведения о перевозке. ' * 100])
+    question = 'Скорость осаждения'
+    assert formula in _content_blocks(text)
+    assert len(_math_expressions(formula)) == 1
+    signals = {}
+    excerpt, _ = _focused_excerpt(text, 700, _query_groups(question), {}, question=question, diagnostics=signals)
+    assert formula in excerpt
+    assert '[MATH: C_sub(j)] | Поправка датчика' in excerpt
+    assert not signals['definition_closure_incomplete']
+
+
+def test_multiline_native_notation_cell_preserves_its_exact_row_and_conditions():
+    definition = '[MATH: C_sub(\nactive)] | Поправка датчика\nТолько для режима R7.'
+    legend = '\n'.join(['[TABLE]', 'Обозначение | Описание', '[MATH: A] | Показатель осаждения',
+                        '[MATH: X] | ' + 'Посторонняя настройка. ' * 100, definition])
+    formula = '[MATH: A=B+C_sub(active)]'
+    text = '\n\n'.join([legend, 'Показатель осаждения:', formula, 'Описание прибора. ' * 100])
+    question = 'Показатель осаждения'
+    signals = {}
+    excerpt, _ = _focused_excerpt(text, 650, _query_groups(question), {}, question=question, diagnostics=signals)
+    assert formula in excerpt and definition in excerpt
+    assert 'Посторонняя настройка.' not in excerpt
+    assert not signals['definition_closure_incomplete']
+
+
+@pytest.mark.parametrize('oversized', ['row', 'condition'])
+def test_oversized_required_definition_is_reported_without_slicing_its_conditions(oversized):
+    definition = '[MATH: C] | Поправка датчика.'
+    condition = 'Только после выполнения всех обязательных проверок.'
+    if oversized == 'row':
+        definition += ' Обязательная проверка; ' * 90
+    else:
+        condition += ' Обязательная проверка; ' * 90
+    text = '\n\n'.join([
+        '[TABLE]\nОбозначение | Описание\n[MATH: A] | Скорость осаждения\n[MATH: B] | Эталонная скорость\n' + definition,
+        condition, 'Скорость осаждения:', '[MATH: A=B+C]',
+    ])
+    selected = SectionEvidenceIndex([node('Метод осаждения', text)]).select_v2(
+        'Скорость осаждения', [], max_chars=600,
+    )
+    assert selected and '[MATH: A=B+C]' in selected[0]['text']
+    assert '[MATH: C] | Поправка датчика.' not in selected[0]['text']
+    signals = selected[0]['selection_signals']
+    assert signals['definition_closure_incomplete'] is True
+    assert signals['missing_definition_symbols'] == ['c']
+    assert len(selected[0]['text']) <= 600
+
+
+@pytest.mark.parametrize('fits', [False, True])
+def test_ascii_definition_delimiter_is_not_a_dangling_equation_operator(fits):
+    correction = '[MATH: C_sub(active)] - Поправка датчика.'
+    if not fits:
+        correction += ' Обязательная проверка; ' * 90
+    text = '\n\n'.join([
+        '[MATH: A] | Скорость осаждения\n[MATH: B] | Эталонная скорость', correction,
+        'Скорость осаждения:', '[MATH: A=B+C_sub(active)]', 'Описание упаковки. ' * 100,
+    ])
+    question = 'Скорость осаждения'
+    _, definitions = _formula_dependencies(_content_blocks(text), question, _query_groups(question))
+    assert 'c_sub(active)' in definitions
+    signals = {}
+    excerpt, _ = _focused_excerpt(text, 650, _query_groups(question), {}, question=question, diagnostics=signals)
+    assert '[MATH: A=B+C_sub(active)]' in excerpt
+    assert (correction in excerpt) is fits
+    assert signals['definition_closure_incomplete'] is not fits
+    assert signals['missing_definition_symbols'] == ([] if fits else ['c_sub(active)'])
+
+
+@pytest.mark.parametrize('fits', [False, True])
+def test_independent_notation_labels_share_a_definition_without_becoming_an_equation(fits):
+    definition = '[MATH: B] [[MATHML_REF:label]] [MATH: C] | Эталонная скорость и поправка датчика.'
+    if not fits:
+        definition += ' Обязательная проверка; ' * 90
+    text = '\n\n'.join([
+        '[TABLE]\nОбозначение | Описание\n[MATH: A] | Скорость осаждения\n' + definition,
+        'Скорость осаждения:', '[MATH: A=B] + [MATH: C]', 'Описание упаковки. ' * 100,
+    ])
+    question = 'Скорость осаждения'
+    _, definitions = _formula_dependencies(_content_blocks(text), question, _query_groups(question))
+    assert definitions['b'] == definitions['c']
+    assert _math_expressions('[MATH: B] [MATH: C]') == []
+    signals = {}
+    excerpt, _ = _focused_excerpt(text, 650, _query_groups(question), {}, question=question, diagnostics=signals)
+    assert '[MATH: A=B] + [MATH: C]' in excerpt
+    assert (definition in excerpt) is fits
+    assert signals['definition_closure_incomplete'] is not fits
+    assert signals['missing_definition_symbols'] == ([] if fits else ['b', 'c'])
+
+
+def test_split_notation_rows_are_structural_boundaries_not_formula_lead_ins():
+    legend = ('[TABLE]\nОбозначение | Описание\n'
+              '[MATH: A] | Скорость осаждения\n[MATH: B] | Эталонная скорость\n'
+              '[MATH: C] | Поправка датчика\n')
+    legend += '\n'.join('[MATH: ' + symbol + '] | Посторонняя настройка ' + 'продолжение; ' * 18
+                        for symbol in ('X', 'Y', 'Z'))
+    formula = '[MATH: A=B+C]'
+    text = legend + '\n\n' + formula + '\n\n' + 'Посторонний материал. ' * 100
+    question = 'Скорость осаждения'
+    signals = {}
+    excerpt, _ = _focused_excerpt(text, 800, _query_groups(question), {}, question=question, diagnostics=signals)
+    assert formula in excerpt
+    assert '[MATH: C] | Поправка датчика' in excerpt
+    assert signals['formula_dependency_blocks'] == [_content_blocks(text).index(formula)]
+    assert not signals['definition_closure_incomplete']
+
+
+def test_all_contiguous_definition_conditions_are_atomic_even_after_second_paragraph():
+    conditions = ['Только для режима R7.', 'Если датчик прошел калибровку.',
+                  'При выполнении всех проверок: ' + 'обязательная проверка; ' * 90]
+    text = '\n\n'.join([
+        '[TABLE]\nОбозначение | Описание\n[MATH: A] | Скорость осаждения\n'
+        '[MATH: B] | Эталонная скорость\n[MATH: C] | Поправка датчика',
+        *conditions, 'Скорость осаждения:', '[MATH: A=B+C]',
+    ])
+    question = 'Скорость осаждения'
+    signals = {}
+    excerpt, _ = _focused_excerpt(text, 650, _query_groups(question), {}, question=question, diagnostics=signals)
+    assert '[MATH: A=B+C]' in excerpt
+    assert '[MATH: C] | Поправка датчика' not in excerpt
+    assert signals['definition_closure_incomplete']
+    assert signals['missing_definition_symbols'] == ['c']
+
+
+@pytest.mark.parametrize('fits', [False, True])
+def test_empty_markdown_notation_cell_continues_previous_definition_conditions(fits):
+    condition = '| | Только для режима R7.' + ('' if fits else ' Обязательная проверка; ' * 90) + ' |'
+    definition = '| [MATH: C] | Поправка датчика |\n' + condition
+    text = '\n\n'.join([
+        '[TABLE]\n| Обозначение | Описание |\n| [MATH: A] | Скорость осаждения |\n'
+        '| [MATH: B] | Эталонная скорость |\n' + definition,
+        'Скорость осаждения:', '[MATH: A=B+C]', 'Описание упаковки. ' * 100,
+    ])
+    question = 'Скорость осаждения'
+    assert definition in _content_blocks(text)
+    signals = {}
+    excerpt, _ = _focused_excerpt(text, 650, _query_groups(question), {}, question=question, diagnostics=signals)
+    assert '[MATH: A=B+C]' in excerpt
+    assert (definition in excerpt) is fits
+    assert signals['definition_closure_incomplete'] is not fits
+    assert signals['missing_definition_symbols'] == ([] if fits else ['c'])

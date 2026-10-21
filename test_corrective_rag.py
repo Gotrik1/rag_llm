@@ -76,6 +76,30 @@ def test_valid_quote_coverage_stops_search_early_and_assesses_claims():
     assert result.answer == FACT + " [E1]"
 
 
+def test_missing_definition_cannot_be_certified_by_real_quote_or_model_review():
+    model = Model()
+    source = fragment(selection_signals={
+        'definition_closure_incomplete':True,'missing_definition_symbols':['c']})
+    result = run_corrective(QUESTION,QUESTION,retrieve=Retrieval([source]),complete=model)
+    assert result.trace['coverage_complete'] is False
+    assert any('определения' in text for text in result.trace['rounds'][0]['coverage']['conflicts'])
+    assert 'definition_closure_incomplete' in next(p for s,p in model.calls if s=='answer')
+
+
+def test_changed_definition_limits_invalidate_request_local_assessment_reuse():
+    calls = []
+    model = Model(reviews=[coverage(queries=['Расшифровка обозначений']), coverage()])
+    def select(question,pool,requirements):
+        calls.append(1)
+        return [{**pool[0], 'selection_signals':{
+            'definition_closure_incomplete':len(calls)==1,
+            'missing_definition_symbols':['c'] if len(calls)==1 else []}}]
+    result = run_corrective(QUESTION,QUESTION,retrieve=Retrieval(),complete=model,select=select)
+    assert len(result.trace['rounds']) == 2
+    assert [row['assessment_reused'] for row in result.trace['rounds']] == [False,False]
+    assert result.trace['coverage_complete'] is True
+
+
 def test_planner_json_contract_is_not_user_answer_style():
     model = Model(plan={'requirements':['Этапы контроля'],'queries':[QUESTION],'style':'JSON'})
     result = run_corrective(QUESTION,QUESTION,retrieve=Retrieval(),complete=model)

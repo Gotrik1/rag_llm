@@ -835,3 +835,66 @@ def test_non_neutral_extra_or_missing_continuation_is_still_rejected(tail):
         assert formula_check(report).status == "unsupported"
         assert report.needs_repair
         assert answer_formula not in safe_partial_answer(answer, report)
+
+
+@pytest.mark.parametrize("line_break", ["\n", "\n\n", "\r\n", "\r\n\r\n"])
+def test_word_line_breaks_inside_one_math_marker_preserve_the_whole_formula(line_break):
+    raw = "H_sub(batch)=∑_sub(k=1)^(N)" + line_break + "(a_sub(k)-b_sub(k))"
+    original = "[MATH: " + raw + "]"
+    source = evidence(original)
+    catalogue = native_formula_catalogue([source])
+    expected = r"H_{batch}=\sum_{k=1}^{N}(a_k-b_k)"
+    assert len(catalogue) == 1 and catalogue[0]["source_formula"] == raw
+    assert normalize_formula(catalogue[0]["latex"]) == normalize_formula(expected)
+    report = verify_grounding("$$" + expected + "$$ [E1]", [source])
+    assert formula_check(report).status == "source_matched"
+    assert not report.needs_repair
+    assert source["text"] == original
+
+
+@pytest.mark.parametrize("line_break", ["\n", "\n\n"])
+def test_selected_raw_multiline_word_formula_remains_available_to_catalogue(line_break):
+    from types import SimpleNamespace
+    from evidence_selection import SectionEvidenceIndex
+
+    raw = "H=∑_sub(k=1)^(N)" + line_break + "a_sub(k)"
+    text = "Расчет нагрузки выполняется по правилу.\n\n[MATH: " + raw + "]"
+    file = "Лаборатория-Альфа.md"
+    node = SimpleNamespace(text=text, metadata={"file_name": file, "section_path": "Расчет нагрузки"})
+    selected = SectionEvidenceIndex([node]).select_v2(
+        "Как рассчитывается нагрузка?", [{"file": file, "text": text, "section_path": "Расчет нагрузки"}],
+    )
+    assert len(selected) == 1 and selected[0]["text"] == text
+    catalogue = native_formula_catalogue([evidence(selected[0]["text"])])
+    assert len(catalogue) == 1 and catalogue[0]["source_formula"] == raw
+    answer = r"$$H=\sum_{k=1}^{N}a_k$$ [E1]"
+    assert formula_check(verify_grounding(answer, [evidence(selected[0]["text"])])).status == "source_matched"
+
+
+def test_multiline_native_math_keeps_numeric_terms_and_external_paragraph_boundaries():
+    source = evidence("[MATH: F=A+\n\nB] - [MATH: C]\n\n[MATH: G=D]")
+    assert [row["source_formula"] for row in native_formula_catalogue([source])] == ["F=A+\n\nB - C", "G=D"]
+    rules, _ = build_numeric_rules("A=7, B=3, C=2, D=4", [source])
+    assert next(rule for rule in rules if rule["formula"].startswith("F="))["expected_numeric_result"] == "8"
+    answer = "$$F=7+3-2=8$$ [E1]"
+    report = verify_grounding(answer, [source], question="A=7, B=3, C=2, D=4", calculation_rules=rules)
+    assert formula_check(report).status == "calculated"
+    assert formula_check(verify_grounding("$$F=A$$ [E1]", [source])).status == "unsupported"
+    assert formula_check(verify_grounding("$$F=A+B-C+D$$ [E1]", [source])).status == "unsupported"
+
+
+@pytest.mark.parametrize("text,answer_formula", [
+    ("[MATH: F=A+\n\n]", "F=A"),
+    ("[MATH: F=A\n+B] ± [MATH: C]", "F=A+B"),
+    ("[MATH: F=A\n\n+B] [MATH: C]", "F=A+B"),
+])
+def test_multiline_math_does_not_complete_dangling_or_ambiguous_continuations(text, answer_formula):
+    source = evidence(text)
+    assert native_formula_catalogue([source]) == []
+    rules, diagnostics = build_numeric_rules("A=7, B=3, C=2", [source])
+    assert rules == [] and diagnostics[0]["reason"] == "ambiguous_native_formula_boundary"
+    answer = "$$" + answer_formula + "$$ [E1]"
+    report = verify_grounding(answer, [source])
+    assert formula_check(report).status == "unassessed"
+    assert not report.needs_repair
+    assert safe_partial_answer(answer, report) == answer

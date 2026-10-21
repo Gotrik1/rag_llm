@@ -19,7 +19,9 @@ from typing import Any, Callable, Iterable, Mapping
 _MATH = re.compile(
     r"\$\$(?P<display>[\s\S]*?)\$\$|\\\[(?P<bracket>[\s\S]*?)\\\]"
     r"|(?<!\$)\$(?P<inline>[^$\n]+)\$(?!\$)|\\\((?P<paren>[^\n]*?)\\\)"
-    r"|\[MATH:\s*(?P<word>[^\]\n]+)\]"
+    # Word line breaks inside one marker are presentation, including blank
+    # lines. Paragraph boundaries outside the closing marker remain intact.
+    r"|\[MATH:\s*(?P<word>[^\]]+)\]"
 )
 _CITATION = re.compile(r"\[(?P<ids>E\d+(?:\s*[,;]\s*E\d+)*)\]|\[Источник:\s*(?P<human>[^\]\n]+)\]", re.I)
 _WRAPPERS = r"(?:mathrm|text|textrm|mathbf|mathit|operatorname|mbox)"

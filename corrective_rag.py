@@ -154,6 +154,7 @@ def assess_coverage(plan: SearchPlan, evidence: list[dict], complete: Callable[[
 Для сравнения нужны обе стороны; для общего обзора — общая структура, не одна произвольно выбранная категория.
 evidence_family перечисляет непосредственные пункты одного порядка. При complete=false нельзя объявлять перечень полным; missing_children и excerpted_children обозначают конкретные пробелы.
 selection_limits.scoped_cohort_incomplete означает, что компактный блок области применения и его списка не поместился целиком. Не выдавай оставшийся кусок за полный порядок.
+selection_limits.definition_closure_incomplete означает, что не поместились определения обозначений или их условия. missing_definition_symbols перечисляет пробелы; наличие одной формулы не покрывает требование расшифровать её обозначения.
 Сетевой и покупной компоненты, разные редакции, условия договора не смешивать. Отрицательные ограничения обязательны.
 Если доказательств нет, оставь требование непокрытым и предложи точечный запрос. Не угадывай факты из знаний модели.
 '''+json.dumps({'requirements':requirements,'exclusions':plan.exclusions,
@@ -195,6 +196,8 @@ selection_limits.scoped_cohort_incomplete означает, что компак�
         conflicts.append('Не полностью переданы подразделы релевантного порядка; перечень нельзя объявить полным.')
     if any(item.get('selection_signals',{}).get('scoped_cohort_incomplete') for item in evidence):
         conflicts.append('Не целиком передан блок условий и связанного перечня; покрытие может быть неполным.')
+    if any(item.get('selection_signals',{}).get('definition_closure_incomplete') for item in evidence):
+        conflicts.append('Не целиком переданы определения обозначений или их условия; не расшифровывай их по догадке.')
     missing = [row for row in requirements if row['id'] not in covered]
     return {'assessed':assessed,'complete':assessed and not missing and not conflicts,
             'covered_requirements':sorted(covered),'missing_requirements':missing,
@@ -215,6 +218,7 @@ def generation_prompt(question: str, plan: SearchPlan, evidence: list[dict], cov
 Обязательные условия включения компонента и настройки его применимости — часть основного правила, а не необязательная деталь.
 Если единицы или редакции противоречат друг другу, явно обозначь конфликт. Не выбирай молча удобную единицу, не придумывай согласование размерностей или коэффициент пересчета.
 Если точная формула не подтверждена, дай подтвержденное словесное объяснение и явно обозначь пробел.
+При definition_closure_incomplete не угадывай отсутствующую расшифровку символов: используй только переданные определения и явно обозначь недостающие.
 Неразборчивая OCR-формула не является проверенной. Не угадывай ее индексы.
 В native_formulae программа уже перевела исходные MATH-объекты в LaTeX без изменения знаков и индексов.
 Для подходящей формулы используй эту запись дословно, не переписывай индексы самостоятельно и не объявляй её нечитаемой только из-за исходного Word-формата.
@@ -298,7 +302,8 @@ def run_corrective(question: str, search_question: str, *, retrieve: Callable,
         assessment_key = tuple(sorted((item['evidence_id'],hashlib.sha256(json.dumps(
             {**{key:item.get(key) for key in ('text','applicability','scope_categories','reference_from','reference_target',
                                          'evidence_family','version_status','status','section_role')},
-             'scoped_cohort_incomplete':item.get('selection_signals',{}).get('scoped_cohort_incomplete')},
+             **{key:item.get('selection_signals',{}).get(key) for key in
+                ('scoped_cohort_incomplete','definition_closure_incomplete','missing_definition_symbols')}},
             ensure_ascii=False,sort_keys=True,default=str).encode()).hexdigest()) for item in context))
         reused = assessment_key in assessments
         coverage = assessments[assessment_key] if reused else assess_coverage(plan,context,complete)

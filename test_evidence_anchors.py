@@ -196,6 +196,19 @@ def test_resolver_binds_quote_programmatically_in_requested_order():
                                      {"evidence_id": "E1", "quote": "Первый документ."}])
 
 
+def test_payload_preserves_missing_definition_limits_without_other_selection_diagnostics():
+    evidence = [item("Правило расчета.", selection_signals={
+        'definition_closure_incomplete':True, 'missing_definition_symbols':['c'],
+        'debug_score':123, 'scoped_cohort_incomplete':[]})]
+    assert evidence_anchor_payload(evidence)[0]['selection_limits'] == {
+        'definition_closure_incomplete':True, 'missing_definition_symbols':['c']}
+
+
+def test_complete_definition_closure_does_not_add_empty_limits_to_payload():
+    assert 'selection_limits' not in evidence_anchor_payload([item("Правило.", selection_signals={
+        'definition_closure_incomplete':False,'missing_definition_symbols':[]})])[0]
+
+
 def test_multiple_passages_of_one_evidence_share_one_evidence_id_but_keep_all_quotes():
     source = "Правило. " * 180 + "\n\n" + "Ограничение. " * 120
     evidence = [item(source)]

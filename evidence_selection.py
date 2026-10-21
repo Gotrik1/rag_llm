@@ -183,17 +183,85 @@ def _applicable_groups(groups, requested, scope):
 
 def _content_blocks(text: str) -> list[str]:
     """Paragraph units without splitting display equations at blank lines."""
-    blocks, pending, in_display = [], [], False
+    blocks, pending, in_display, in_native = [], [], False, False
     for paragraph in str(text).split('\n\n'):
         pending.append(paragraph)
         if paragraph.count('$$') % 2 or paragraph.count('\\[') != paragraph.count('\\]'):
             in_display = not in_display
-        if not in_display:
+        for marker in re.finditer(r'\[MATH:|(?<!\])\](?!\])', paragraph):
+            if marker[0] == '[MATH:':
+                in_native = True
+            elif in_native:
+                in_native = False
+        if not in_display and not in_native:
             blocks.append('\n\n'.join(pending))
             pending = []
     if pending:
         blocks.append('\n\n'.join(pending))
-    return [block for block in blocks if block.strip()]
+    return [row for block in blocks if block.strip() for row in _legend_rows(block)]
+
+
+def _legend_rows(block: str) -> list[str]:
+    """Split explicit table rows, never a Word line break inside native math.
+
+    A notation row retains every cell and its continuation/conditions. Requiring
+    both a notation cell and multiple structural rows avoids treating narrative
+    line breaks or a vertical bar inside an equation as table boundaries.
+    """
+    spans = list(re.finditer(r'\[MATH:\s*[^\]]+\]|\$\$.*?\$\$|\\\[.*?\\\]', block, re.S))
+    starts, notation, offset = [], False, 0
+    for line in block.splitlines(keepends=True):
+        pipes = [offset + match.start() for match in re.finditer(r'\|', line)
+                 if not any(span.start() <= offset + match.start() < span.end() for span in spans)]
+        cell_start = offset
+        if len(pipes) > 1 and not block[offset:pipes[0]].strip():
+            cell_start = pipes[0] + 1
+            pipes = pipes[1:]  # Optional Markdown opening cell border.
+        if pipes:
+            # A cell's notation can itself contain a Word line break. Its
+            # structural separator belongs to the row that began before it.
+            start = next((block.rfind('\n', 0, span.start()) + 1 for span in spans
+                          if span.start() < offset < span.end()), offset)
+            cell = block[cell_start if start == offset else start:pipes[0]].strip()
+            if cell:
+                if start not in starts:
+                    starts.append(start)
+                notation |= any(span.start() >= start and span.end() <= pipes[0] for span in spans)
+        offset += len(line)
+    if not notation or len(starts) < 2:
+        return [block]
+    if starts[0]:
+        starts.insert(0, 0)
+    return [block[start:end].rstrip('\r\n') for start, end in zip(starts, [*starts[1:], len(block)])
+            if block[start:end].strip()]
+
+
+def _notation_cell(text: str) -> tuple[str, str | None]:
+    """A table/prose definition delimiter is outside mathematical markup."""
+    start = 0
+    for match in re.finditer(r'\[MATH:\s*[^\]]+\]|\$\$.*?\$\$|\\\[.*?\\\]|\||—|\s[–-]\s', text, re.S):
+        if match[0] == '|':
+            if not text[:match.start()].strip():
+                start = match.end()
+                continue
+            return text[start:match.start()], text[match.end():]
+        if not match[0].startswith(('[MATH:', '$$', '\\[')):
+            return text[start:match.start()], text[match.end():]
+    return text, None
+
+
+def _notation_expressions(text: str) -> list[str]:
+    """Whitespace-separated notation labels are a list, not an equation chain.
+
+    Only the explicitly delimited definition cell uses this treatment. Native
+    equations continue through the verifier's strict connected-run parser.
+    """
+    labels = list(re.finditer(r'\[MATH:\s*[^\]]+\]|\$\$.*?\$\$|\\\[.*?\\\]', text, re.S))
+    remainder = re.sub(r'\[\[MATHML_REF:[^\]\r\n]+\]\]', '', text)
+    remainder = re.sub(r'\[MATH:\s*[^\]]+\]|\$\$.*?\$\$|\\\[.*?\\\]', '', remainder, flags=re.S)
+    if len(labels) > 1 and not remainder.strip():
+        return [expression for label in labels for expression in _math_expressions(label[0])]
+    return _math_expressions(text)
 
 
 def _substantive_text(text: str, title: str = '') -> str:
@@ -224,9 +292,13 @@ def _section_role(item: dict) -> str:
 
 def _math_expressions(text: str) -> list[str]:
     """Read only explicit formula markup; prose equalities are not a math AST."""
-    return [next(value for value in match.groups() if value is not None)
-            for match in re.finditer(r'\[MATH:\s*([^\]]+)\]|\$\$(.*?)\$\$|\\\[(.*?)\\\]',
-                                     str(text), re.S)]
+    from grounding_verifier import _native_math_runs
+
+    view = str(text)
+    expressions = [(run['start'], run['formula']) for run in _native_math_runs(view) if run['complete']]
+    expressions.extend((match.start(), next(value for value in match.groups() if value is not None))
+                       for match in re.finditer(r'\$\$(.*?)\$\$|\\\[(.*?)\\\]', view, re.S))
+    return [expression for _, expression in sorted(expressions)]
 
 
 def _math_symbols(expression: str) -> frozenset[str]:
@@ -258,7 +330,7 @@ def _equation_guards(blocks, number):
     conditional = r'\s*(?:При\b|Если\b|Только\b|За исключением\b)'
     if number and re.match(conditional, blocks[number - 1], re.I) and not _math_expressions(blocks[number - 1]):
         positions.append(number - 1)
-    for following in range(number + 1, min(len(blocks), number + 3)):
+    for following in range(number + 1, len(blocks)):
         if _math_expressions(blocks[following]) or not re.match(
             r'\s*(?:Где\b|Здесь\b|Обозначения\b|При\b|Если\b|Только\b|За исключением\b)',
             blocks[following], re.I,
@@ -281,22 +353,22 @@ def _formula_dependencies(blocks, question, groups):
     requested = frozenset(key for key in requested if not key.isdigit())
     if not requested:
         requested = frozenset().union(*groups) if groups else frozenset()
-    definitions, equations = {}, []
+    definitions, equations, definition_blocks = {}, [], set()
     for number, block in enumerate(blocks):
-        for line in block.splitlines():
-            expressions = _math_expressions(line)
+        for line in _legend_rows(block):
+            notation, description = _notation_cell(line)
+            if description is None:
+                continue
+            # A table's cell separator is not a dangling mathematical operator.
+            expressions = _notation_expressions(notation)
             if not expressions or any('=' in expression for expression in expressions):
                 continue
             # Native table rows / explicit notation sentences, not incidental
             # symbol mentions in arbitrary narrative text.
-            if '|' in line:
-                description = ' '.join(line.split('|')[1:])
-            elif re.search(r'—|\s–\s|\s-\s', line):
-                description = re.split(r'—|\s–\s|\s-\s', line, maxsplit=1)[-1]
-            else:
-                continue
+            description = description.replace('|', ' ')
             relevance = len(requested & term_keys(description)) / max(1, len(requested))
             for symbol in frozenset().union(*(_math_symbols(expression) for expression in expressions)):
+                definition_blocks.add(number)
                 previous = definitions.get(symbol)
                 if previous is None or relevance > previous[0]:
                     definitions[symbol] = (relevance, number)
@@ -311,7 +383,8 @@ def _formula_dependencies(blocks, question, groups):
             # A short lead-in provides applicability and the semantic subject.
             prelude = []
             for preceding in range(number - 1, max(-1, number - 4), -1):
-                if len(blocks[preceding]) > 700 or _math_expressions(blocks[preceding]) or '[TABLE]' in blocks[preceding]:
+                if (len(blocks[preceding]) > 700 or preceding in definition_blocks or
+                        _math_expressions(blocks[preceding]) or '[TABLE]' in blocks[preceding]):
                     break
                 prelude.append(preceding)
             prose = ' '.join(blocks[position] for position in prelude)
@@ -452,6 +525,8 @@ def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnos
             incomplete_cohorts.append({'anchor': cohort['anchor'], 'scope_categories': cohort['scope_categories'],
                                        'reason': 'payload-budget' if cohort['bounded'] else 'cohort-limit'})
     packages, definitions = _formula_dependencies(blocks, question, groups)
+    for _, number in definitions.values():
+        guarded[number] = sorted({*guarded.get(number, ()), *_equation_guards(blocks, number)})
     formula_blocks = []
     # The mandatory equation + its short applicability lead-in is reserved
     # before generic lexical matches / huge notation tables consume the cap.
@@ -465,7 +540,8 @@ def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnos
             continue
         for symbol in sorted({package['symbol'], *package['rhs']}):
             if symbol in definitions:
-                reserve([definitions[symbol][1]])
+                number = definitions[symbol][1]
+                reserve([number, *_equation_guards(blocks, number)])
     if diagnostics is not None:
         diagnostics['scoped_cohort_blocks'] = cohort_blocks
         diagnostics['scoped_cohort_incomplete'] = incomplete_cohorts
@@ -478,6 +554,15 @@ def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnos
             if position < 0 or position >= len(blocks) or position in selected:
                 continue
             reserve([position])
+    if diagnostics is not None:
+        # These are locally recognized definitions lost during packing, not a
+        # certification that every source symbol has a definition or meaning.
+        missing = {symbol for package in packages if package['block'] in selected
+                   for symbol in {package['symbol'], *package['rhs']}
+                   if symbol in definitions and
+                   not {definitions[symbol][1], *guarded.get(definitions[symbol][1], ())} <= selected}
+        diagnostics['definition_closure_incomplete'] = bool(missing)
+        diagnostics['missing_definition_symbols'] = sorted(missing)
     if not selected:
         return '', []
     ordered = sorted(selected)

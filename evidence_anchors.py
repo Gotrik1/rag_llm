@@ -233,8 +233,11 @@ def evidence_anchor_payload(evidence: Sequence[Mapping[str, Any]]) -> list[dict[
     return [{"evidence_id": item["evidence_id"], "file": item.get("file"), "section_path": item.get("section_path"),
              "applicability": item.get("applicability"),
              **{key:item[key] for key in ('reference_from','reference_target','evidence_family') if item.get(key) is not None},
-             **({'selection_limits':{'scoped_cohort_incomplete':item['selection_signals']['scoped_cohort_incomplete']}}
-                if item.get('selection_signals',{}).get('scoped_cohort_incomplete') else {}),
+             **({'selection_limits':{key:item['selection_signals'][key] for key in
+                    ('scoped_cohort_incomplete','definition_closure_incomplete','missing_definition_symbols')
+                    if item['selection_signals'].get(key)}}
+                if any(item.get('selection_signals',{}).get(key) for key in
+                       ('scoped_cohort_incomplete','definition_closure_incomplete')) else {}),
              "version_status": item.get("version_status", item.get("status")),
              "passages": [{"passage_id": passage_id, "text": passage["text"]}
                           for passage_id, passage in anchors.items() if passage["evidence_id"] == item["evidence_id"]]}

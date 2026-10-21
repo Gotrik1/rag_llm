@@ -600,5 +600,40 @@ def test_native_transcription_preserves_ratio_direction_indices_superscripts_and
 
 
 def test_native_catalogue_does_not_repair_broken_notation_or_guess_ocr():
-    for text in ("[MATH: Z=A*,+,-B]", "[MATH: Z_sub(a=A+B]", "[MATH: Z=A+B)]", "[MATH: Z=A+[B]]", "[IMAGE_WARNING: unverified formula]\n[MATH: Z=A+B]", "$$Z=A+B$$"):
+    for text in ("[MATH: Z=A*,+,-B]", "[MATH: Z_sub(a=A+B]", "[MATH: Z=A+B)]", "[MATH: Z=A+[B]]", "[IMAGE_WARNING: unverified formula]\n$$Z=A+B$$", "$$Z=A+B$$"):
         assert native_formula_catalogue([evidence(text)]) == []
+
+
+@pytest.mark.parametrize("warning_first", [False, True])
+def test_unread_image_warning_does_not_taint_independent_native_word_math(warning_first):
+    raw = "F_sub(a,i)=X_sub(a,i)-Y_sub(a,i)"
+    native = "[MATH: " + raw + "]"
+    unread = "[IMAGE_UNREAD: media/image1.png] [IMAGE_WARNING: visual extraction failed (TimeoutError)]"
+    source = evidence("\n\n".join([unread, native] if warning_first else [native, unread]))
+    catalogue = native_formula_catalogue([source])
+    assert len(catalogue) == 1
+    assert catalogue[0]["source_formula"] == raw
+    assert normalize_formula(catalogue[0]["latex"]) == normalize_formula(raw)
+    report = verify_grounding(catalogue[0]["display_latex"] + " [E1]", [source])
+    assert formula_check(report).status == "source_matched"
+    assert not report.assessment_complete  # Transcription is not semantic proof.
+
+
+@pytest.mark.parametrize("ocr_end", ["[/IMAGE_OCR]", ""])
+def test_native_marker_inside_ocr_remains_untrusted_even_with_warning(ocr_end):
+    source = evidence("[IMAGE_OCR: media/image1.png]\n[MATH: F=A+B]\n" + ocr_end +
+                      "\n[IMAGE_WARNING: verify transcription]")
+    assert native_formula_catalogue([source]) == []
+    assert formula_check(verify_grounding("$$F=A+B$$ [E1]", [source])).status == "unverified_ocr"
+
+
+def test_closed_ocr_and_its_warning_do_not_taint_following_native_formula():
+    source = evidence("[IMAGE_OCR: media/image1.png]\n[MATH: Z=A+B]\n[/IMAGE_OCR]\n"
+                      "[IMAGE_WARNING: verify transcription]\n\n[MATH: F=A-B]")
+    catalogue = native_formula_catalogue([source])
+    assert [row["source_formula"] for row in catalogue] == ["F=A-B"]
+
+
+def test_explicit_evidence_wide_image_warning_still_blocks_native_catalogue():
+    source = {**evidence("[MATH: F=A+B]"), "image_warning": "unverified image transcription"}
+    assert native_formula_catalogue([source]) == []

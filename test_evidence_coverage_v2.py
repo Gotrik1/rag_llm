@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from evidence_selection import SectionEvidenceIndex, category_ids, overview_sections
+from evidence_selection import SectionEvidenceIndex, category_ids, overview_sections, _focused_excerpt, _query_groups
 
 
 def node(path, text, file='novel-manual.md', **metadata):
@@ -410,3 +410,115 @@ def test_historical_question_does_not_deprioritize_change_log():
     historic = next(item for item in selected if item['section_title'] == history.metadata['section_title'] and item['text'] == history.text)
     assert historic['section_role'] == 'change_log'
     assert not historic.get('section_role_penalty')
+
+
+@pytest.mark.parametrize('style', ['native', 'latex'])
+def test_excerpt_reserves_defining_formula_not_earlier_use_or_large_dictionary(style):
+    def math(expression):
+        return f'[MATH: {expression}]' if style == 'native' else f'$${expression}$$'
+
+    early_use = math('M=C*V')
+    defining = math('C=K+Z')
+    condition = 'При отрицательном значении Z эта формула неприменима; требуется отдельная калибровка.'
+    definitions = '\n'.join([
+        '[TABLE]', 'Обозначение | Описание | Ед. изм.',
+        math('M') + ' | Масса активного реагента | мг',
+        math('C') + ' | Концентрация активного реагента | мг/л',
+        math('K') + ' | Эталонная концентрация | мг/л',
+        math('Z') + ' | Поправка на разбавление | мг/л',
+    ])
+    dictionary = 'Концентрация активного реагента указана в терминологическом указателе. ' * 6
+    text = '\n\n'.join([
+        'Масса активного реагента определяется через концентрацию:', early_use, definitions,
+        *([dictionary] * 35),
+        'Для активного реагента применяются две формулы.',
+        'Как сумма эталонной величины и поправки:', defining, condition,
+        *(['Сведения о транспортировке и упаковке. ' * 20] * 4),
+    ])
+    question = 'Как определяется концентрация активного реагента?'
+    selected = SectionEvidenceIndex([node('Метод анализа > Параметры', text)]).select_v2(
+        question, [], max_chars=1500,
+    )
+    assert selected and defining in selected[0]['text']
+    assert condition in selected[0]['text']
+    assert math('C') + ' | Концентрация активного реагента' in selected[0]['text']
+    assert selected[0]['selection_signals']['formula_dependency_blocks']
+    assert sum(len(item['text']) for item in selected) <= 1500
+
+
+def test_symbolic_dependency_is_one_hop_and_does_not_merge_descriptive_subscripts():
+    blocks = [
+        '[MATH: R_sub(cold,t)] | Сопротивление холодного канала | Ом',
+        '[MATH: R_sub(hot,t)] | Сопротивление горячего канала | Ом',
+        'Сопротивление холодного канала:', '[MATH: R_sub(cold,t)=K+A]',
+        'Показатель K:', '[MATH: K=B+D]',
+        'Показатель B:', '[MATH: B=E+F]',
+        'Сопротивление горячего канала:', '[MATH: R_sub(hot,t)=G+H]',
+        *(['Обычное техническое описание узла. ' * 30] * 20),
+    ]
+    question = 'Как определяется сопротивление холодного канала?'
+    signals = {}
+    excerpt, _ = _focused_excerpt('\n\n'.join(blocks), 1100, _query_groups(question), {},
+                                  question=question, diagnostics=signals)
+    assert '[MATH: R_sub(cold,t)=K+A]' in excerpt
+    assert '[MATH: K=B+D]' in excerpt
+    assert signals['formula_dependency_max_hops'] == 1
+    assert set(signals['formula_dependency_blocks']) == {3, 5}
+    assert 7 not in signals['formula_dependency_blocks']
+    assert 9 not in signals['formula_dependency_blocks']
+
+
+def test_formula_dependencies_never_reconstruct_another_section_or_source():
+    active = node('Процесс > Реагент', 'Концентрация реагента:\n\n[MATH: C=K+Z]\n\n' + 'Данные по процессу. ' * 200)
+    secret = node('Секретный процесс', 'Концентрация реагента:\n\n[MATH: K=SECRET]', 'other.md')
+    selected = SectionEvidenceIndex([active, secret]).select_v2('Концентрация реагента', [hit(active)],
+        allowed_sources={'novel-manual.md'}, max_chars=800)
+    assert selected and all('SECRET' not in item['text'] for item in selected)
+    assert all(item['file'] == 'novel-manual.md' for item in selected)
+
+
+def test_formula_definition_can_omit_period_indices_but_not_descriptive_qualifier():
+    definition = '[MATH: C_sub(active)] | Концентрация активного реагента | мг/л'
+    correction = '[MATH: Z_sub(active)] | Поправка активного реагента | мг/л'
+    equation = '[MATH: C_sub(active,g,t)=K_sub(active,g,t)+Z_sub(active,g,t)]'
+    text = '\n\n'.join([
+        definition, correction,
+        *(['Концентрация активного реагента — термин классификатора. ' * 5] * 30),
+        'Сумма эталонной величины и поправки:', equation,
+    ])
+    question = 'Концентрация активного реагента'
+    excerpt, _ = _focused_excerpt(text, 1200, _query_groups(question), {}, question=question)
+    assert equation in excerpt and definition in excerpt and correction in excerpt
+
+
+def test_equation_is_not_packed_without_oversized_explicit_condition():
+    condition = 'Только при соблюдении всех условий допускается расчет: ' + 'требование обязательной проверки; ' * 60
+    equation = '[MATH: C=K+Z]'
+    text = '\n\n'.join(['Концентрация реагента.', condition, equation, 'Концентрация реагента измеряется прибором.'])
+    question = 'Концентрация реагента'
+    excerpt, _ = _focused_excerpt(text, 200, _query_groups(question), {}, question=question)
+    assert equation not in excerpt
+    assert condition not in excerpt
+
+
+def test_dynamic_budget_reserves_payload_for_tenth_formula_after_four_long_hits():
+    question = 'Калибровка датчика'
+    long_body = '\n\n'.join(['Калибровка датчика выполняется в соответствии с процедурой испытаний. ' * 8] * 22)
+    items = [node(f'Приложение {number}', long_body, f'background-{number}.md') for number in range(4)]
+    items += [node(f'Порядок {number}', 'Калибровка датчика требует проверки герметичности.',
+                   f'conditions-{number}.md') for number in range(5)]
+    equation = '[MATH: K_sub(sensor,t)=A_sub(sensor,t)-B_sub(sensor,t)]'
+    guard = 'При нулевом эталонном сигнале этот расчет запрещен; датчик требует отдельной настройки.'
+    target = node('Измерение > Поправка', '\n\n'.join([
+        'Калибровка датчика: вычисляют поправку по измерениям эталона.', equation, guard,
+        'Обозначения A и B — показания двух каналов; K — поправка.',
+    ]), 'primary-procedure.md')
+    items.append(target)
+    selected = SectionEvidenceIndex(items).select_v2(question, [hit(item) for item in items],
+                                                   top_k=10, max_chars=12000)
+    primary = next(item for item in selected if item['file'] == target.metadata['file_name'])
+    assert len(selected) == 10
+    assert equation in primary['text'] and guard in primary['text']
+    assert sum(len(item['text']) for item in selected) <= 12000
+    assert all(item['selection_signals']['fair_budget_chars'] >= 1200 for item in selected)
+    assert selected[0]['selection_signals']['reserved_payload_slots'] == 10

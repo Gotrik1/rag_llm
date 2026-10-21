@@ -196,7 +196,135 @@ def _section_role(item: dict) -> str:
     return 'operative'
 
 
-def _focused_excerpt(text, budget, groups, facet_groups):
+def _math_expressions(text: str) -> list[str]:
+    """Read only explicit formula markup; prose equalities are not a math AST."""
+    return [next(value for value in match.groups() if value is not None)
+            for match in re.finditer(r'\[MATH:\s*([^\]]+)\]|\$\$(.*?)\$\$|\\\[(.*?)\\\]',
+                                     str(text), re.S)]
+
+
+def _math_symbols(expression: str) -> frozenset[str]:
+    # Preserve descriptive subscripts: X_temperature and X_pressure must not
+    # collapse into the same variable. This is deliberately conservative and
+    # local; no synonym inference or source-specific symbol dictionary.
+    value = re.sub(r'\\(?:mathrm|text|operatorname)\{([^{}]*)\}', r'\1', expression)
+    symbols = re.findall(r'\\?[A-Za-zА-Яа-яЁё]+(?:(?:_sub|_sup)\([^)]*\)|_\{[^}]*\}|_\w+)*', value)
+    ignored = {'sub', 'sup', 'frac', 'sum', 'sqrt', 'left', 'right', 'times', 'cdot'}
+    def identity(symbol):
+        def qualifier(match):
+            # Tables commonly omit trailing period/entity indices. Keep the
+            # descriptive first qualifier (cold != hot), never strip numbered
+            # variants such as X_1 / X_2. No domain symbol names are assumed.
+            descriptor = match[1].split(',', 1)[0].strip()
+            descriptor = re.sub(r'(?<=\S)\s+[A-Za-zА-Яа-яЁё]$', '', descriptor)
+            return '_sub(' + descriptor + ')'
+        symbol = re.sub(r'_sub\(([^)]*,[^)]*)\)', qualifier, symbol)
+        symbol = re.sub(r'_\{([^},]+),[^}]+\}', lambda m: '_{' + m[1] + '}', symbol)
+        return re.sub(r'\s+', '', symbol).casefold()
+
+    return frozenset(identity(symbol) for symbol in symbols
+                     if symbol.casefold().lstrip('\\') not in ignored)
+
+
+def _equation_guards(blocks, number):
+    """Keep explicit neighboring applicability clauses indivisible with math."""
+    positions = []
+    conditional = r'\s*(?:При\b|Если\b|Только\b|За исключением\b)'
+    if number and re.match(conditional, blocks[number - 1], re.I) and not _math_expressions(blocks[number - 1]):
+        positions.append(number - 1)
+    for following in range(number + 1, min(len(blocks), number + 3)):
+        if _math_expressions(blocks[following]) or not re.match(
+            r'\s*(?:Где\b|Здесь\b|Обозначения\b|При\b|Если\b|Только\b|За исключением\b)',
+            blocks[following], re.I,
+        ):
+            break
+        positions.append(following)
+    return positions
+
+
+def _formula_dependencies(blocks, question, groups):
+    """Prioritize locally defined quantities and one-hop native equations.
+
+    Lookup words (e.g. price versus amount, concentration versus mass) matter
+    here even if retrieval normalized them away. A definition row identifies
+    the requested symbol; an equation *defining* it is stronger than an early
+    equation merely using it. Never generate or transform a source equation.
+    """
+    requested = term_keys(_positive_query(question)[0]) - _V2_FILLER - _CATEGORY_STEMS
+    requested -= term_keys('ценовой категории') if _category_ids(question) else frozenset()
+    requested = frozenset(key for key in requested if not key.isdigit())
+    if not requested:
+        requested = frozenset().union(*groups) if groups else frozenset()
+    definitions, equations = {}, []
+    for number, block in enumerate(blocks):
+        for line in block.splitlines():
+            expressions = _math_expressions(line)
+            if not expressions or any('=' in expression for expression in expressions):
+                continue
+            # Native table rows / explicit notation sentences, not incidental
+            # symbol mentions in arbitrary narrative text.
+            if '|' in line:
+                description = ' '.join(line.split('|')[1:])
+            elif re.search(r'—|\s–\s|\s-\s', line):
+                description = re.split(r'—|\s–\s|\s-\s', line, maxsplit=1)[-1]
+            else:
+                continue
+            relevance = len(requested & term_keys(description)) / max(1, len(requested))
+            for symbol in frozenset().union(*(_math_symbols(expression) for expression in expressions)):
+                previous = definitions.get(symbol)
+                if previous is None or relevance > previous[0]:
+                    definitions[symbol] = (relevance, number)
+        for expression in _math_expressions(block):
+            if '=' not in expression:
+                continue
+            lhs, rhs = expression.split('=', 1)
+            symbols = _math_symbols(lhs)
+            if len(symbols) != 1:
+                continue
+            symbol = next(iter(symbols))
+            # A short lead-in provides applicability and the semantic subject.
+            prelude = []
+            for preceding in range(number - 1, max(-1, number - 4), -1):
+                if len(blocks[preceding]) > 700 or _math_expressions(blocks[preceding]) or '[TABLE]' in blocks[preceding]:
+                    break
+                prelude.append(preceding)
+            prose = ' '.join(blocks[position] for position in prelude)
+            local = len(requested & term_keys(prose)) / max(1, len(requested))
+            direct = definitions.get(symbol, (0, number))[0]
+            relevance = 3 * direct + local
+            guards = _equation_guards(blocks, number)
+            equations.append({'block': number, 'symbol': symbol, 'rhs': _math_symbols(rhs),
+                              'score': relevance, 'core': sorted([*prelude, number, *guards]),
+                              'expression': re.sub(r'\s+', '', expression)})
+    if not equations:
+        return [], definitions
+    best = max(equation['score'] for equation in equations)
+    if best <= 0:
+        return [], definitions
+    roots, seen = [], set()
+    for equation in sorted(equations, key=lambda item: (-item['score'], item['block'])):
+        if equation['score'] < max(0.65, best - 0.25) or equation['expression'] in seen:
+            continue
+        roots.append(equation)
+        seen.add(equation['expression'])
+        if len(roots) == 3:
+            break
+    # One edge only: no recursive symbolic traversal, and no cross-section,
+    # version, source or ACL widening. Keep root equations ahead of supports.
+    dependencies, seen_blocks = [], {item['block'] for item in roots}
+    for root in roots:
+        for equation in equations:
+            if equation['symbol'] in root['rhs'] and equation['block'] not in seen_blocks:
+                dependencies.append(equation)
+                seen_blocks.add(equation['block'])
+                if len(dependencies) == 3:
+                    break
+        if len(dependencies) == 3:
+            break
+    return roots + dependencies, definitions
+
+
+def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnostics=None):
     """Pack relevant whole paragraphs with neighbors, in source order.
 
     A 50k collapsed Markdown section must not contribute its unrelated preface
@@ -216,17 +344,46 @@ def _focused_excerpt(text, budget, groups, facet_groups):
     # Leave room for omission markers, which are metadata-like labels, not
     # invented source content. A prefix-only excerpt needs no extra markers.
     marker = '\n\n[ПРОПУСК АБЗАЦЕВ]\n\n'
+    guarded = {number: _equation_guards(blocks, number) for number, block in enumerate(blocks)
+               if any('=' in expression for expression in _math_expressions(block))}
+
+    def reserve(positions):
+        nonlocal size
+        positions = set(positions)
+        positions.update(guard for position in list(positions) for guard in guarded.get(position, ()))
+        positions -= selected
+        cost = sum(len(blocks[position]) + len(marker) for position in positions)
+        if size + cost > budget:
+            return False
+        selected.update(positions)
+        size += cost
+        return True
+
+    packages, definitions = _formula_dependencies(blocks, question, groups)
+    formula_blocks = []
+    # The mandatory equation + its short applicability lead-in is reserved
+    # before generic lexical matches / huge notation tables consume the cap.
+    for package in packages:
+        if reserve(package['core']):
+            formula_blocks.append(package['block'])
+    # Definitions are supporting context, not a substitute for an equation.
+    # They receive budget only after the defining equation packets are safe.
+    for package in packages:
+        if package['block'] not in formula_blocks:
+            continue
+        for symbol in sorted({package['symbol'], *package['rhs']}):
+            if symbol in definitions:
+                reserve([definitions[symbol][1]])
+    if diagnostics is not None:
+        diagnostics['formula_dependency_blocks'] = formula_blocks
+        diagnostics['formula_dependency_max_hops'] = 1
     for number in order:
         # Adjacent notation/conditions are more valuable than an unrelated
         # introduction. The anchor paragraph gets budget before its neighbors.
         for position in (number, number - 1, number + 1, number + 2):
             if position < 0 or position >= len(blocks) or position in selected:
                 continue
-            cost = len(blocks[position]) + (len(marker) if selected else 0)
-            if size + cost > budget:
-                continue
-            selected.add(position)
-            size += cost
+            reserve([position])
     if not selected:
         return '', []
     ordered = sorted(selected)
@@ -733,13 +890,6 @@ class SectionEvidenceIndex:
         # separate, and category/source/negative restrictions remain enforced.
         selected, covered, used, families = [], set(), 0, {}
         limit = max(top_k, min(24, len(facet_groups) + min(2, len(roots))))
-        meaningful = [item for item in candidates if max(item['_body_coverage'], item['_heading_coverage']) > 0
-                      and (wants_exception or item['evidence_role'] != 'exception')]
-        # Reserve several independent units before one long section can consume
-        # the entire model input. This is not a document-diversity requirement:
-        # several necessary facets in one source get the same fair packing.
-        fair_slots = min(4, limit, max(1, len(meaningful)))
-        fair_budget = max(1, max_chars // fair_slots)
         while candidates and len(selected) < limit:
             def priority(item):
                 family = (source_key(item.get('file')), str(item.get('section_path', '')).rsplit(' > ', 1)[0])
@@ -752,9 +902,16 @@ class SectionEvidenceIndex:
             item = {key: value for key, value in candidate.items() if not key.startswith('_')
                     and key not in {'heading_keys', 'position'}}
             text, remaining = str(item.get('text', '')), max_chars - used
-            budget = min(remaining, fair_budget) if candidates and fair_slots > 1 else remaining
+            # Every still-selectable slot needs a useful payload, not only the
+            # first four long hits. Short complete sections release their spare
+            # allowance to subsequent candidates. This is facet/item fairness,
+            # not a quota for different physical documents or a larger top_k.
+            remaining_slots = min(limit - len(selected), len(candidates) + 1)
+            budget = max(0, remaining // max(1, remaining_slots))
+            excerpt_signals = {}
             if len(text) > budget:
-                excerpt, indices = _focused_excerpt(text, budget, groups, facet_groups)
+                excerpt, indices = _focused_excerpt(text, budget, groups, facet_groups,
+                                                    question=positive, diagnostics=excerpt_signals)
                 if not excerpt or not _substantive_text(excerpt, str(item.get('section_title', ''))):
                     continue
                 item['text'] = excerpt
@@ -774,7 +931,9 @@ class SectionEvidenceIndex:
                 'body_coverage': round(candidate['_body_coverage'], 4),
                 'local_paragraph_coverage': round(candidate['_local_coverage'], 4),
                 'fair_budget_chars': budget,
+                'reserved_payload_slots': remaining_slots,
                 'section_role_penalty': candidate.get('section_role_penalty', 0),
+                **excerpt_signals,
             }
             item['applicability'] = ('referenced' if candidate.get('reference_from') else
                                      ('mixed' if len(candidate['scope_categories']) > 1 else

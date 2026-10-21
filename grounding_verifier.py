@@ -290,8 +290,11 @@ def native_formula_catalogue(evidence: Iterable[Mapping[str, Any]]) -> list[dict
                 continue
             prefix = item["text"][:match.start()]
             inside_ocr = prefix.rfind("[IMAGE_OCR") > prefix.rfind("[/IMAGE_OCR]")
-            warning_only = "[IMAGE_WARNING" in item["text"] and "[IMAGE_OCR" not in item["text"]
-            if _ocr_formula(item, inside_ocr) or warning_only or (identifier, raw) in seen:
+            # A failed illustration produces a local IMAGE_WARNING, not an
+            # OCR taint on independent native Word equations in its section.
+            # OCR block bounds and explicit evidence-wide warnings still deny
+            # a transcription; the MATH marker alone cannot override those.
+            if _ocr_formula(item, inside_ocr) or (identifier, raw) in seen:
                 continue
             # These source notations describe alternatives/are corrupted, not
             # one unambiguous algebraic equality. Do not make one up.

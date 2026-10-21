@@ -63,6 +63,41 @@ def test_family_metadata_is_in_payload_only_once():
     assert sum('evidence_family' in row for row in payload) == 1
 
 
+def test_reconciliation_does_not_certify_another_revision_at_the_same_locator():
+    original = item('Действующее правило.', section_path='A', content_hash='new', evidence_family_id='f',
+                    evidence_family={'id':'f','file':'Методика.md','expected_children':['A'],
+                                     'total_children':1,'complete':True})
+    old = item('Старое правило.', section_path='A', content_hash='old')
+    result = reconcile_evidence_families([old], [original])
+    family = result[0]['evidence_family']
+    assert not family['complete']
+    assert family['missing_children'] == ['A'] and family['incompatible_children'] == ['A']
+    assert family['incomplete_reason'] == 'revision-or-content-mismatch'
+
+
+def test_known_revision_missing_from_surviving_member_fails_closed():
+    import hashlib
+    text = 'Полное правило.'
+    family = {'id':'f','file':'Методика.md','expected_children':['A'],'total_children':1,'complete':True,
+              'expected_members':[{'section_path':'A','revision':{'version_id':'rev-2'},
+                                   'text_sha256':hashlib.sha256(text.encode()).hexdigest()}]}
+    member = item(text,section_path='A',evidence_family_id='f',evidence_family=family)
+    result = reconcile_evidence_families([member])
+    assert not result[0]['evidence_family']['complete']
+    assert result[0]['evidence_family']['incompatible_children'] == ['A']
+    matching = reconcile_evidence_families([{**member,'version_id':'rev-2'}])
+    assert matching[0]['evidence_family']['complete']
+
+
+def test_identical_revision_label_does_not_hide_unmarked_changed_content():
+    original = item('Полный порядок с обязательным условием.',section_path='A',version_id='rev-2',evidence_family={
+        'id':'f','file':'Методика.md','expected_children':['A'],'total_children':1,'complete':True})
+    altered = {**original,'text':'Полный порядок.'}
+    result = reconcile_evidence_families([altered],[original])
+    assert not result[0]['evidence_family']['complete']
+    assert result[0]['evidence_family']['incompatible_children'] == ['A']
+
+
 def test_reference_provenance_is_retained_without_claiming_general_applicability():
     origin = {'file':'Методика.md','section_path':'Основной порядок','quote':'Смотри пункт 4.'}
     payload = evidence_anchor_payload([item('Целевой порядок.',applicability='referenced',

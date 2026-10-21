@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from evidence_selection import SectionEvidenceIndex, category_ids, overview_sections, _focused_excerpt, _query_groups
+from evidence_selection import SectionEvidenceIndex, category_ids, overview_sections, _focused_excerpt, _query_groups, _positive_query
 
 
 def node(path, text, file='novel-manual.md', **metadata):
@@ -588,7 +588,7 @@ def test_sibling_family_cannot_import_another_source_revision_or_descendant():
                 node('Регенерация фильтра > Старый', 'Старая обработка.', content_hash='old'),
                 node('Регенерация фильтра > Удаленный', 'Удаленная обработка.', status='deleted', content_hash='new'),
                 node('Регенерация фильтра > Промывка > Ограничения', 'Вложенные ограничения.', content_hash='new')]
-    selected = SectionEvidenceIndex([parent, *children, *excluded]).select_v2('Регенерация фильтра', [hit(parent)],
+    selected = SectionEvidenceIndex([parent, *children, *excluded]).select_v2('Какие способы регенерации фильтра?', [hit(parent)],
         allowed_sources={'novel-manual.md'})
     family = next(item['evidence_family'] for item in selected if item.get('evidence_family'))
     assert family['complete'] and family['total_children'] == 2
@@ -600,7 +600,7 @@ def test_sibling_family_has_independent_count_and_character_bounds():
     parent = node('Регенерация фильтра', 'Регенерация фильтра выполняется несколькими методами.')
     children = [node(f'Регенерация фильтра > Метод {number}', f'Режим {number}: ' + 'Полная последовательность действий. ' * 20)
                 for number in range(14)]
-    selected = SectionEvidenceIndex([parent, *children]).select_v2('Регенерация фильтра', [hit(parent)],
+    selected = SectionEvidenceIndex([parent, *children]).select_v2('Какие способы регенерации фильтра?', [hit(parent)],
         top_k=24, max_chars=20000)
     family = next(item['evidence_family'] for item in selected if item.get('evidence_family'))
     assert not family['complete'] and family['incomplete_reason'] == 'family-limit'
@@ -664,3 +664,61 @@ def test_targeted_quantity_question_keeps_symbolic_dependency_priority_not_whole
     excerpt, _ = _focused_excerpt('\n\n'.join(blocks), 800, _query_groups(question), {}, question=question, diagnostics=signals)
     assert '[MATH: C=K+Z]' in excerpt
     assert not signals['scoped_cohort_blocks']
+
+
+def test_definition_does_not_require_all_subsystems_with_matching_ancestor_topic():
+    parent = node('Параметры калибровки датчика', 'Калибровка датчика — настройка измерительного канала по эталону.')
+    children = [node('Параметры калибровки датчика > ' + name, name + ': настройки канала.')
+                for name in ['Подсистема измерений', 'Подсистема хранения', 'Подсистема уведомлений']]
+    selected = SectionEvidenceIndex([parent, *children]).select_v2('Что такое калибровка датчика?', [hit(parent)])
+    assert selected and all('evidence_family' not in item for item in selected)
+    overview = SectionEvidenceIndex([parent, *children]).select_v2('Какие параметры калибровки датчика?', [hit(parent)])
+    assert any(item.get('evidence_family') for item in overview)
+
+
+def test_complete_reconstruction_resets_previous_excerpt_and_family_snapshot():
+    text = '\n\n'.join(['Калибровка датчика выполняется по эталону. ' * 5] * 8)
+    original = node('Калибровка датчика', text)
+    index = SectionEvidenceIndex([original])
+    partial = index.select_v2('Калибровка датчика', [hit(original)], max_chars=500)
+    assert partial[0]['evidence_excerpt']
+    partial[0]['evidence_family'] = {'id': 'stale', 'complete': False}
+    partial[0]['evidence_family_id'] = 'stale'
+    complete = index.select_v2('Калибровка датчика', partial, max_chars=10000)
+    assert complete[0]['text'] == index.sections[0]['text']
+    assert all(key not in complete[0] for key in
+               ('evidence_excerpt', 'evidence_truncated', 'evidence_block_indices', 'evidence_family', 'evidence_family_id'))
+
+
+def test_negative_clause_never_consumes_the_next_query_line():
+    positive, forbidden = _positive_query('Калибровка датчика; шум не смотри\nКоэффициент погрешности фотоприемника')
+    assert forbidden == ['шум']
+    assert 'Коэффициент погрешности фотоприемника' in positive
+
+
+def test_application_envelope_keeps_subject_and_local_reference_without_host_label_noise():
+    subject = 'Как определяется погрешность фотоприемника для 2 ЦК?'
+    followup = 'Смотри только погрешность фотоприемника, шум не смотри'
+    enriched = ('Тема диалога — вопрос пользователя: ' + subject + '\n'
+                'Условия и уточнения пользователя: ' + followup + '\n'
+                'Исключить из предмета ответа: шум\n'
+                'Текущий запрос пользователя: ' + followup)
+    positive, forbidden = _positive_query(enriched)
+    assert 'фотоприемника' in positive and '2 ЦК' in positive
+    assert 'пользователя' not in positive and 'диалога' not in positive
+    assert set(forbidden) == {'шум'}
+    origin = node('2 ЦК', 'Погрешность фотоприемника определяется так же как для 4 ЦК.')
+    target = node('4 ЦК', 'Погрешность фотоприемника:\n\n[MATH: E=K+Z]')
+    other = node('Шум', 'Шум фотоприемника вычисляется отдельным методом.')
+    selected = SectionEvidenceIndex([origin, target, other]).select_v2(enriched,
+        [hit(origin), hit(target), hit(other)], resolve_references=True)
+    referenced = [item for item in selected if item.get('reference_from')]
+    assert referenced and '[MATH: E=K+Z]' in referenced[0]['text']
+    assert referenced[0]['scope_categories'] == ['4']
+    assert referenced[0]['applicability'] == 'referenced'
+
+
+def test_ordinary_topic_words_are_not_globally_removed_as_envelope_labels():
+    question = 'Какие условия и уточнения пользователя сохраняет диалог?'
+    positive, _ = _positive_query(question)
+    assert positive == question

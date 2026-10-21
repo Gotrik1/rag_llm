@@ -7,6 +7,7 @@ No source content is dropped to satisfy a character target or output budget.
 from __future__ import annotations
 
 import re
+import hashlib
 from bisect import bisect_right
 from typing import Any, Mapping, Sequence
 
@@ -40,15 +41,38 @@ def reconcile_evidence_families(evidence, provenance=None):
         carriers = members or [item for item in records if item.get('file') == family.get('file')]
         if not carriers:
             continue
-        present = {item.get('section_path') for item in members}
+        signatures = {item.get('section_path'): item for item in family.get('expected_members',[])
+                      if isinstance(item,dict) and item.get('section_path') in expected}
+        if not signatures and provenance is not None:
+            # Compatibility for an older family record: the prior snapshot is
+            # still available, so bind the retained locators to its revision
+            # and native text rather than silently accepting another version.
+            from evidence_selection import _VERSION_FIELDS
+            signatures = {item.get('section_path'): {
+                'revision': {field:item[field] for field in _VERSION_FIELDS if item.get(field)},
+                'text_sha256':hashlib.sha256(str(item.get('text','')).strip().encode()).hexdigest(),
+            } for item in provenance if item.get('file') == family.get('file')
+                and item.get('section_path') in expected}
+        incompatible = []
+        for item in members:
+            signature = signatures.get(item.get('section_path'))
+            if signature is None:
+                continue
+            mismatch = any(item.get(field) != value for field,value in signature.get('revision',{}).items())
+            if not item.get('evidence_excerpt') and signature.get('text_sha256'):
+                mismatch |= hashlib.sha256(str(item.get('text','')).strip().encode()).hexdigest() != signature['text_sha256']
+            if mismatch:
+                incompatible.append(item.get('section_path'))
+        present = {item.get('section_path') for item in members if item.get('section_path') not in incompatible}
         missing = [path for path in expected if path not in present]
         excerpted = [item.get('section_path') for item in members if item.get('evidence_excerpt')]
         total = int(family.get('total_children',len(expected)))
-        complete = not missing and not excerpted and len(present) == total and not family.get('omitted_children_count',0)
+        complete = not missing and not excerpted and not incompatible and len(present) == total and not family.get('omitted_children_count',0)
         family.update(complete=complete,selected_children=[path for path in expected if path in present],
-                      missing_children=missing,excerpted_children=excerpted)
+                      missing_children=missing,excerpted_children=excerpted,incompatible_children=list(dict.fromkeys(incompatible)))
         if not complete:
-            family['incomplete_reason'] = family.get('incomplete_reason') or 'post-filter-or-payload-budget'
+            family['incomplete_reason'] = ('revision-or-content-mismatch' if incompatible else
+                                           family.get('incomplete_reason') or 'post-filter-or-payload-budget')
         else:
             family['incomplete_reason'] = None
         carriers[0]['evidence_family'] = family

@@ -259,13 +259,25 @@ def storage_defaults() -> tuple[str, str, str]:
     )
 
 
-def project_context_prompt(scope: dict) -> str:
-    """Format only the current project's persisted conversation for generation."""
+def project_context_prompt(scope: dict, chat_id: str = "") -> str:
+    """Share project notes, but only this chat's user-authored conversation.
+
+    Project-wide message history can contain answers derived from another
+    chat's private attachments. It is not a substitute for source ACLs: even
+    sending those old answers to a generator would cross the chat boundary.
+    Missing chat identity therefore exposes notes only, never message history.
+    """
     memory = scope.get("memory") if isinstance(scope.get("memory"), dict) else {}
     memory_text = str(memory.get("text", "")).strip()
     entries: list[str] = []
     used = 0
     for message in reversed(scope.get("messages", [])):
+        if not chat_id or str(message.get("chat_id") or "") != str(chat_id):
+            continue
+        # Prior model assertions are not evidence. The retrieval resolver and
+        # generator retain user intent without promoting old answers to facts.
+        if message.get("role") != "user":
+            continue
         content = str(message.get("content", "")).strip()
         if not content:
             continue
@@ -280,12 +292,14 @@ def project_context_prompt(scope: dict) -> str:
     parts = [
         f"КОНТЕКСТ ПРОЕКТА: {scope.get('project_name', 'Проект')}",
         "Используй этот контекст только для продолжения работы в проекте. "
-        "Он не заменяет доказательства из регламентов и не содержит данных других проектов.",
+        "История запросов описывает намерения пользователя, а не подтверждённые факты. "
+        "Прошлые ответы модели не являются источниками. Проверяй существенные утверждения "
+        "по доступным документам; память проекта не заменяет доказательства из них.",
     ]
     if memory_text:
         parts.append(f"ПАМЯТЬ ПРОЕКТА:\n{memory_text[:4000]}")
     if entries:
-        parts.append("ИСТОРИЯ ЧАТОВ ПРОЕКТА:\n" + "\n".join(entries))
+        parts.append("ИСТОРИЯ ЗАПРОСОВ ТЕКУЩЕГО ЧАТА:\n" + "\n".join(entries))
     return "\n\n".join(parts)
 
 
@@ -1477,7 +1491,7 @@ class Handler(BaseHTTPRequestHandler):
         retrieval_question = contextualize_retrieval_question(question, scope, chat_id)
         t0 = time.time()
         profile = get_profile(load_system_prompt_id(), GROUNDED_SYSTEM_PROMPT)
-        scoped_prompt = f"{profile['prompt']}\n\n{project_context_prompt(scope)}"
+        scoped_prompt = f"{profile['prompt']}\n\n{project_context_prompt(scope, chat_id)}"
         ask_domain_options = supported_retrieval_options(
             agent.ask,
             source_domains=source_domains,
@@ -1535,7 +1549,7 @@ class Handler(BaseHTTPRequestHandler):
             rust_result = rust_generate(
                 question,
                 context,
-                "" if cache_enabled else project_context_prompt(scope),
+                "" if cache_enabled else project_context_prompt(scope, chat_id),
                 cache_enabled=cache_enabled,
             )
             if isinstance(rust_result, tuple):

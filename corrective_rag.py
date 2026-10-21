@@ -38,6 +38,27 @@ def _categories(value: str) -> frozenset[str]:
     return category_ids(value)
 
 
+def _has_response_exclusion(question: str) -> bool:
+    """Recognize a response directive, not a factual negative in a question."""
+    return bool(re.search(
+        r'исключить\s+из\s+предмета\s+ответа\s*:|'
+        r'\bне\s+(?:смотри|рассматривай|описывай|включай|показывай|упоминай|пиши)\b|'
+        r'\bбез\s+(?:описания|упоминания|информации\s+о)\b|'
+        r'\b(?:do\s+not|don.t)\s+(?:include|discuss|describe|mention)\b',
+        question, re.I))
+
+
+def _is_response_constraint(value: str) -> bool:
+    # Intentionally narrow: "исключения из общего правила" and "что не
+    # включается в расчет" are real questions about facts, not output policy.
+    return bool(re.match(
+        r'^\s*(?:исключ(?:ить|ение)\s+(?:(?:информаци|сведени|описани|упоминани)\w*\b|'
+        r'из\s+(?:ответа|предмета\s+ответа)\b)|'
+        r'не\s+(?:описывать|рассматривать|включать|показывать|упоминать|смотреть)\b|'
+        r'(?:exclude|omit)\s+(?:information|discussion|description|mentions?)\b|'
+        r'do\s+not\s+(?:include|discuss|describe|mention)\b)', value, re.I))
+
+
 @dataclass(frozen=True)
 class SearchPlan:
     requirements: tuple[str, ...]
@@ -55,6 +76,9 @@ def make_plan(question: str, complete: Callable[[str,str],str], *, corpus_hints:
 Для простого определения обычно достаточно 1–3 требований. Не добавляй для полноты историю,
 правовое обоснование, настройку системы или полный расчет, если их не спрашивали и они не нужны для ответа.
 Сохраняй предмет, сравниваемые стороны, условия и отрицательные ограничения из контекста.
+Исключенные пользователем темы записывай только в exclusions, не в requirements.
+Ограничение «не описывай X» не требует искать в документах правила сокрытия X.
+requirements и queries должны искать нужный предмет, а не инструкции оформления ответа.
 Общий вопрос не сужай до одной категории, документа или частного случая.
 Синонимы/сокращения — альтернативы поиска, не требование одновременного наличия.
 Не добавляй номера категорий, которых нет в запросе. Требования описывают полноту ответа, а не предполагаемый ответ.
@@ -65,6 +89,12 @@ def make_plan(question: str, complete: Callable[[str,str],str], *, corpus_hints:
         data = json_object(complete(prompt,'planning'))
         requirements = _strings(data.get('requirements'))
         queries = _strings(data.get('queries'),6)
+        exclusions = _strings(data.get('exclusions'))
+        if _has_response_exclusion(question):
+            constraints = [r for r in requirements if _is_response_constraint(r)]
+            requirements = [r for r in requirements if r not in constraints]
+            queries = [q for q in queries if not _is_response_constraint(q)]
+            exclusions = list(dict.fromkeys([*exclusions,*constraints]))[:8]
         if not requirements or not queries:
             raise ValueError('Empty search plan')
         explicit = _categories(question)
@@ -74,7 +104,7 @@ def make_plan(question: str, complete: Callable[[str,str],str], *, corpus_hints:
         # The planner's own JSON output contract must not become the user's
         # desired answer format. The original question already carries style.
         return SearchPlan(tuple(requirements),tuple(dict.fromkeys([question,*queries]))[:7],
-                          tuple(_strings(data.get('exclusions'))))
+                          tuple(exclusions))
     except Exception:
         # Planning is optional. A transport timeout must not crash a durable
         # conversation or turn a failed plan into fabricated search constraints.

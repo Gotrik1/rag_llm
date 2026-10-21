@@ -83,6 +83,40 @@ def test_planner_json_contract_is_not_user_answer_style():
     assert '"style": "JSON"' not in next(p for s,p in model.calls if s=='answer')
 
 
+def test_response_exclusion_does_not_become_a_missing_document_fact():
+    question = 'Опиши этапы контроля канала. Температуру не рассматривай.'
+    model = Model(plan={
+        'requirements':['Этапы контроля канала','Исключение информации о температуре'],
+        'queries':['Этапы контроля канала','Не описывать температуру'],
+        'exclusions':['температура'],
+    })
+    plan = make_plan(question,model)
+    assert plan.requirements == ('Этапы контроля канала',)
+    assert len(plan.exclusions) == 2
+    assert 'температура' in plan.exclusions
+    assert 'Не описывать температуру' not in plan.queries
+    result = run_corrective(question,question,retrieve=Retrieval(),complete=model)
+    assert result.trace['coverage_complete']
+    assert len(result.trace['rounds']) == 1
+
+
+@pytest.mark.parametrize('requirement',[
+    'Исключения из общего правила контроля',
+    'Условия, при которых каналы не включаются в контроль',
+    'Какие каналы не проходят контроль',
+])
+def test_factual_negations_and_exceptions_remain_search_requirements(requirement):
+    model = Model(plan={'requirements':[requirement],'queries':['Контроль каналов']})
+    assert make_plan('Когда каналы не проходят контроль?',model).requirements == (requirement,)
+
+
+def test_response_exclusion_does_not_drop_a_required_factual_exception():
+    requirement = 'Исключения из общего порядка контроля канала'
+    model = Model(plan={'requirements':[requirement],'queries':['Исключения из порядка контроля']})
+    plan = make_plan('Опиши исключения из порядка контроля. Температуру не описывай.',model)
+    assert plan.requirements == (requirement,)
+
+
 def test_incomplete_direct_child_family_cannot_be_certified_as_complete_by_model():
     data = fragment(evidence_family_id='f',evidence_family={'id':'f','file':'Проверка каналов.md',
         'expected_children':['Основной порядок','Другой метод'],'total_children':2,'complete':False})

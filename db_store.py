@@ -863,16 +863,28 @@ def document_sources(source_names: list[str]) -> dict[str, dict]:
             name = name[33:]
         return name.casefold()
 
-    for row in rows:
-        stored_name = Path(str(row.get("source_path", ""))).name
-        display_name = str(row.get("file_name", ""))
-        for candidate in names:
-            if (
-                candidate == stored_name
-                or candidate == display_name
-                or lookup_key(candidate) in {lookup_key(stored_name), lookup_key(display_name)}
-            ):
-                resolved[candidate] = row
+    for candidate in names:
+        candidate_name = Path(candidate).name.casefold()
+        if re.match(r"^[0-9a-f]{32}_", candidate_name):
+            # This is an immutable indexed upload identity, not a display
+            # alias. A later same-named upload must never replace its link,
+            # and a missing UUID must not silently resolve to another version.
+            matches = [
+                row for row in rows
+                if Path(str(row.get("source_path", ""))).name.casefold() == candidate_name
+            ]
+        else:
+            # Human names are a compatibility fallback only. They are safe to
+            # link when unambiguous within the already authorized query rows.
+            matches = [
+                row for row in rows
+                if lookup_key(candidate) in {
+                    lookup_key(row.get("source_path", "")),
+                    lookup_key(row.get("file_name", "")),
+                }
+            ]
+        if len(matches) == 1:
+            resolved[candidate] = matches[0]
     return resolved
 
 

@@ -57,6 +57,32 @@ def _expand_ordinal_categories(text: str) -> str:
     return _ORDINAL_ABBREVIATION.sub(expand, text)
 
 
+def _retrieval_subject(question: str) -> str:
+    """Decode the application's query envelope, not arbitrary topic vocabulary.
+
+    Host labels must not become AND retrieval terms or a paragraph following
+    a trailing negative verb. The envelope contract retains the actual topic,
+    user focus and exclusions; no assistant facts are introduced here.
+    """
+    fields = {}
+    labels = {
+        'Тема диалога — вопрос пользователя': 'subject',
+        'Условия и уточнения пользователя': 'constraints',
+        'Исключить из предмета ответа': 'exclusions',
+        'Текущий запрос пользователя': 'current',
+    }
+    for line in str(question).splitlines():
+        label, separator, value = line.partition(':')
+        if separator and label.strip() in labels:
+            fields[labels[label.strip()]] = value.strip()
+    if not fields.get('subject') or not fields.get('current'):
+        return question
+    clauses = list(dict.fromkeys(fields[key] for key in ('subject', 'constraints', 'current') if fields.get(key)))
+    if fields.get('exclusions'):
+        clauses.append('не рассматривай ' + fields['exclusions'])
+    return '; '.join(clauses)
+
+
 def _positive_query(question: str) -> tuple[str, list[str]]:
     """Separate retrieval subjects from explicit negative search instructions."""
     excluded = []
@@ -66,10 +92,10 @@ def _positive_query(question: str) -> tuple[str, list[str]]:
         return ' '
 
     value = re.sub(
-        r'\b(?:не\s+(?:учитывай|смотри|рассматривай|включай|используй)|кроме|исключая)'
-        r'\s+([^;.!?,]+)', remove, question, flags=re.I,
+        r'\b(?:не[ \t]+(?:учитывай|смотри|рассматривай|включай|используй)|кроме|исключая)'
+        r'[ \t]+([^;\r\n.!?,]+)', remove, _retrieval_subject(question), flags=re.I,
     )
-    value = re.sub(r'\b((?:[а-яёa-z]+\s+){0,1}[а-яёa-z]+)\s+не\s+'
+    value = re.sub(r'\b((?:[а-яёa-z]+[ \t]+){0,1}[а-яёa-z]+)[ \t]+не[ \t]+'
                    r'(?:учитывай|смотри|рассматривай|включай|используй)\b',
                    remove, value, flags=re.I)
     return value, excluded
@@ -824,6 +850,13 @@ class SectionEvidenceIndex:
                 return
             section = compatible[0] if len(compatible) == 1 else None
             item = {**candidate, **section} if section else dict(candidate)
+            if section is not None:
+                # A former excerpt is now a fresh complete native section.
+                # Earlier budget/family annotations describe another packing
+                # snapshot and must not survive this reconstruction.
+                for transient in ('evidence_excerpt', 'evidence_truncated', 'evidence_block_indices',
+                                  'selection_signals', 'coverage_facets', 'evidence_family', 'evidence_family_id'):
+                    item.pop(transient, None)
             if not _substantive_text(str(item.get('text', '')), str(item.get('section_title', ''))):
                 return
             scope = _scope_categories(item)
@@ -943,7 +976,11 @@ class SectionEvidenceIndex:
         # Narrow / negative requests are intentionally not expanded into a
         # complete sibling family. Ordinary subject children remain unchanged.
         sibling_family = None
-        if not forbidden and not wants_exception:
+        family_intent = bool(re.search(
+            r'какие|перечисл|обзор|сколько|из\s+чего|состав|структур|порядок|процедур|'
+            r'как\s+(?:\w+\s+){0,2}(?:рассчит|рассчитыв|выполн|провод|начисл|организ)', positive, re.I,
+        ))
+        if family_intent and not forbidden and not wants_exception:
             sibling_family = _sibling_family(sections, list(pool.values()), groups, visible, requested)
             if sibling_family:
                 for child in sibling_family['children'][:12]:
@@ -1112,6 +1149,10 @@ class SectionEvidenceIndex:
                 'parent_section_path': sibling_family['parent_section_path'],
                 'basis': 'eligible-direct-children', 'complete': complete,
                 'expected_children': expected, 'selected_children': [item['section_path'] for item in members],
+                'expected_members': [{'section_path': child['section_path'],
+                                      'revision': {field: child[field] for field in _VERSION_FIELDS if child.get(field)},
+                                      'text_sha256': hashlib.sha256(child['text'].strip().encode()).hexdigest()}
+                                     for child in bounded_children],
                 'missing_children': missing, 'excerpted_children': excerpted,
                 'omitted_children_count': max(0, len(sibling_family['children']) - 12),
                 'total_children': len(sibling_family['children']), 'max_children': 12, 'max_bundle_chars': 6000,

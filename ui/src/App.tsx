@@ -276,6 +276,13 @@ declare global {
 
 const createId = () => crypto.randomUUID();
 
+function replaceChatUrl(chatId: string) {
+  const url = new URL(window.location.href);
+  if (chatId) url.searchParams.set("chat", chatId);
+  else url.searchParams.delete("chat");
+  window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
 function projectFromRecord(record: ProjectRecord): Project {
   const memory = typeof record.memory?.text === "string" ? record.memory.text : "";
   return {
@@ -798,8 +805,15 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
       ]);
       const nextProjects = projectData.items.map(projectFromRecord);
       const nextChats = chatData.items.map(chatFromRecord);
-      const nextProjectId = workspace.active_project_id || nextProjects[0]?.id || "";
-      const nextChatId = workspace.active_chat_id || nextChats.find((chat) => chat.projectId === null)?.id || nextChats[0]?.id || "";
+      const requestedChatId = new URLSearchParams(window.location.search).get("chat");
+      const nextChat = nextChats.find((chat) => chat.id === requestedChatId)
+        ?? nextChats.find((chat) => chat.id === workspace.active_chat_id)
+        ?? nextChats.find((chat) => chat.projectId === null)
+        ?? nextChats[0];
+      const nextChatId = nextChat?.id ?? "";
+      const nextProjectId = nextChat
+        ? nextChat.projectId ?? ""
+        : nextProjects.find((project) => project.id === workspace.active_project_id)?.id || nextProjects[0]?.id || "";
 
       setWorkspaceSettings(workspace.settings ?? {});
       setProjects(nextProjects);
@@ -807,6 +821,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
       setActiveProjectId(nextProjectId);
       setActiveChatId(nextChatId);
       activeChatIdRef.current = nextChatId;
+      replaceChatUrl(nextChatId);
       if (nextChatId) await loadMessages(nextChatId);
       else setMessages([]);
     } catch (error) {
@@ -881,6 +896,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     setActiveProjectId(projectId);
     setActiveChatId(chat.id);
     activeChatIdRef.current = chat.id;
+    replaceChatUrl(chat.id);
     await syncWorkspace(projectId, chat.id);
     resetThreadState();
     return chat;
@@ -893,6 +909,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     setActiveProjectId("");
     setActiveChatId(chat.id);
     activeChatIdRef.current = chat.id;
+    replaceChatUrl(chat.id);
     await syncWorkspace(null, chat.id);
     resetThreadState();
     return chat;
@@ -902,6 +919,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     setActiveProjectId(chat.projectId ?? "");
     setActiveChatId(chat.id);
     activeChatIdRef.current = chat.id;
+    replaceChatUrl(chat.id);
     setLastResult(null);
     setLastQuestion("");
     setDebugResult(null);
@@ -1018,7 +1036,10 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
       await deleteJson<{ deleted: boolean }>(`/api/chats/${chatId}`, API_TIMEOUT_MS);
       setChats((current) => current.filter((item) => item.id !== chatId));
       if (activeChatId === chatId) {
+        setActiveProjectId("");
         setActiveChatId("");
+        activeChatIdRef.current = "";
+        replaceChatUrl("");
         resetThreadState();
         await syncWorkspace(null, "");
       }

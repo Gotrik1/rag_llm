@@ -637,3 +637,201 @@ def test_closed_ocr_and_its_warning_do_not_taint_following_native_formula():
 def test_explicit_evidence_wide_image_warning_still_blocks_native_catalogue():
     source = {**evidence("[MATH: F=A+B]"), "image_warning": "unverified image transcription"}
     assert native_formula_catalogue([source]) == []
+
+
+@pytest.mark.parametrize("text", [
+    "[MATH: L_sub(batch)=A_sub(batch)] [[MATHML_REF:abc]] + [MATH: C_sub(batch)] - [MATH: D_sub(batch)]",
+    "[MATH: L_sub(batch)=A_sub(batch)] [MATH: +C_sub(batch)-D_sub(batch)]",
+    "[MATH: L_sub(batch)=A_sub(batch)+] [MATH: C_sub(batch)-D_sub(batch)]",
+    "L_sub(batch)=A_sub(batch) [MATH: +C_sub(batch)-D_sub(batch)]",
+])
+def test_native_run_chain_is_one_equation_and_cannot_certify_its_prefix(text):
+    source = evidence(text)
+    catalogue = native_formula_catalogue([source])
+    assert len(catalogue) == 1
+    expected = r"L_{batch}=A_{batch}+C_{batch}-D_{batch}"
+    assert normalize_formula(catalogue[0]["latex"]) == normalize_formula(expected)
+    assert formula_check(verify_grounding("$$" + expected + "$$ [E1]", [source])).status == "source_matched"
+    for wrong in [r"L_{batch}=A_{batch}", r"L_{batch}=A_{batch}+C_{batch}",
+                  r"L_{batch}=A_{batch}+C_{batch}+D_{batch}",
+                  r"L_{batch}=A_{batch}+C_{other}-D_{batch}"]:
+        report = verify_grounding("$$" + wrong + "$$ [E1]", [source])
+        assert formula_check(report).status == "unsupported"
+        assert wrong not in safe_partial_answer("$$" + wrong + "$$ [E1]", report)
+
+
+def test_numeric_rule_uses_entire_native_chain_not_first_rhs_fragment():
+    source = evidence("[MATH: L=A] + [MATH: B] - [MATH: C]")
+    rules, diagnostics = build_numeric_rules("A=9, B=4, C=2", [source])
+    assert not diagnostics
+    assert len(rules) == 1 and rules[0]["expected_numeric_result"] == "11"
+    assert set(rules[0]["bindings"]) == {"A", "B", "C"}
+    report = verify_grounding("$$L=9+4-2=11$$ [E1]", [source], question="A=9, B=4, C=2", calculation_rules=rules)
+    assert formula_check(report).status == "calculated"
+
+
+@pytest.mark.parametrize("separator", ["\n\n", "; ", " with an independent rule "])
+def test_native_chains_never_cross_paragraph_or_prose_boundaries(separator):
+    source = evidence("[MATH: R=A]" + separator + "[MATH: S=B+C]")
+    assert [row["source_formula"] for row in native_formula_catalogue([source])] == ["R=A", "S=B+C"]
+
+
+def test_whitespace_separated_independent_equalities_remain_independent():
+    source = evidence("[MATH: R=A] [[MATHML_REF:abc]] [MATH: S=B+C]")
+    assert [row["source_formula"] for row in native_formula_catalogue([source])] == ["R=A", "S=B+C"]
+
+
+@pytest.mark.parametrize("text", ["[MATH: T=A] [MATH: B]", "[MATH: T=A] +", "[MATH: T=A+]"])
+def test_ambiguous_or_dangling_native_runs_are_not_silently_completed(text):
+    source = evidence(text)
+    assert native_formula_catalogue([source]) == []
+    rules, diagnostics = build_numeric_rules("A=7, B=3", [source])
+    assert rules == []
+    assert diagnostics[0]["reason"] == "ambiguous_native_formula_boundary"
+    answer = "$$T=A$$ [E1]"
+    report = verify_grounding(answer, [source])
+    assert formula_check(report).status == "unassessed"
+    assert not report.needs_repair
+    assert not report.assessment_complete
+    assert safe_partial_answer(answer, report) == answer
+
+
+def test_linked_native_chain_cannot_cross_an_ocr_boundary_or_authorize_ocr_terms():
+    source = evidence("[MATH: T=A] + [IMAGE_OCR: scan]\n[MATH: B=C]\n[/IMAGE_OCR]")
+    assert native_formula_catalogue([source]) == []
+    report = verify_grounding("$$B=C$$ [E1]", [source])
+    assert formula_check(report).status == "unverified_ocr"
+
+
+def test_an_unparsed_literal_equality_cannot_promote_its_native_continuation():
+    source = evidence("R=A + [MATH: T=B]")
+    assert native_formula_catalogue([source]) == []
+    report = verify_grounding("$$T=B$$ [E1]", [source])
+    assert formula_check(report).status == "unassessed"
+    assert not report.assessment_complete
+
+
+def test_unicode_sum_and_latex_sum_are_exact_presentation_equivalents():
+    raw = "H_sub(batch)=∑_sub(k=1)^(N)\u200a(a_sub(k)-b_sub(k))"
+    source = evidence("[MATH: " + raw + "]")
+    answer = r"$$H_{batch}=\sum_{k=1}^{N}(a_k-b_k)$$ [E1]"
+    catalogue = native_formula_catalogue([source])
+    assert len(catalogue) == 1 and r"\sum" in catalogue[0]["latex"]
+    assert normalize_formula(catalogue[0]["latex"]) == normalize_formula(raw)
+    report = verify_grounding(answer, [source])
+    assert formula_check(report).status == "source_matched"
+    assert not report.needs_repair
+    assert safe_partial_answer(answer, report) == answer
+
+
+@pytest.mark.parametrize("changed", [
+    r"H_{batch}=\sum_{k=2}^{N}(a_k-b_k)",
+    r"H_{batch}=\sum_{k=1}^{M}(a_k-b_k)",
+    r"H_{batch}=\sum_{k=1}^{N}(a_j-b_k)",
+    r"H_{batch}=\sum_{k=1}^{N}(a_k+b_k)",
+    r"H_{batch}=\sum_{k=1}^{N}(a_k)",
+])
+def test_sum_bounds_indices_signs_and_terms_are_not_normalized_away(changed):
+    source = evidence("[MATH: H_sub(batch)=∑_sub(k=1)^(N)(a_sub(k)-b_sub(k))]")
+    answer = "$$" + changed + "$$ [E1]"
+    report = verify_grounding(answer, [source])
+    assert formula_check(report).status == "unassessed"
+    assert not report.assessment_complete
+
+
+def test_unproved_sum_equivalence_is_not_forced_false_or_deleted():
+    source = evidence("[MATH: H=∑_sub(k=1)^(N)a_sub(k)]")
+    answer = r"$$H=\sum_{k=1}^{N}(a_k)$$ [E1]"
+    claim = {"claim_id": "C1", "support": "supported", "passage_ids": ["E1:P1"]}
+    report = verify_grounding(answer, [source], claims=[claim])
+    assert formula_check(report).status == "unassessed"
+    assert not report.needs_repair
+    assert not report.assessment_complete  # A prose judge cannot bypass unknown math.
+    assert safe_partial_answer(answer, report) == answer
+
+
+@pytest.mark.parametrize("text", [
+    "[MATH: F=A] ^ [MATH: 2]",
+    "[MATH: F=A^] [MATH: 2]",
+    "[MATH: F=A] [MATH: ^(2)]",
+    "F=A ^ [MATH: 2]",
+])
+def test_native_power_continuation_preserves_exponent_and_numeric_result(text):
+    source = evidence(text)
+    catalogue = native_formula_catalogue([source])
+    assert len(catalogue) == 1
+    assert formula_check(verify_grounding("$$F=A^2$$ [E1]", [source])).status == "source_matched"
+    assert formula_check(verify_grounding("$$F=A$$ [E1]", [source])).status == "unsupported"
+    rules, diagnostics = build_numeric_rules("A=3", [source])
+    assert not diagnostics
+    assert len(rules) == 1 and rules[0]["expected_numeric_result"] == "9"
+    good = verify_grounding("$$F=3^2=9$$ [E1]", [source], question="A=3", calculation_rules=rules)
+    bad = verify_grounding("$$F=3$$ [E1]", [source], question="A=3", calculation_rules=rules)
+    assert formula_check(good).status == "calculated"
+    assert formula_check(bad).status == "unsupported"
+
+
+@pytest.mark.parametrize("connector", ["±", "∓", "⊕", r"\pm", "\u200b+", "_sub(i)"])
+def test_unknown_native_connector_cannot_certify_a_prefix_or_numeric_rule(connector):
+    source = evidence("[MATH: F=A] " + connector + " [MATH: B]")
+    assert native_formula_catalogue([source]) == []
+    rules, diagnostics = build_numeric_rules("A=3, B=2", [source])
+    assert rules == []
+    assert diagnostics[0]["reason"] == "ambiguous_native_formula_boundary"
+    answer = "$$F=A$$ [E1]"
+    report = verify_grounding(answer, [source])
+    assert formula_check(report).status == "unassessed"
+    assert not report.needs_repair
+    assert not report.assessment_complete
+    assert safe_partial_answer(answer, report) == answer
+
+
+def test_actual_docx_paragraph_delimiter_keeps_independent_equations_separate():
+    from docx_parser import DocxBlock, _render_blocks
+
+    text = _render_blocks([DocxBlock("paragraph", "[MATH: R=A]"),
+                           DocxBlock("paragraph", "[MATH: S=B+C]")])
+    assert text == "[MATH: R=A]\n\n[MATH: S=B+C]"
+    source = evidence(text)
+    assert [row["source_formula"] for row in native_formula_catalogue([source])] == ["R=A", "S=B+C"]
+    report = verify_grounding("$$R=A+B$$ [E1]", [source])
+    assert formula_check(report).status == "unsupported"
+
+
+@pytest.mark.parametrize("source_formula,answer_formula", [
+    ("H=∑_sub(k=1)^(N)a_sub(k)", r"\sum_{k=1}^{N}a_k=H"),
+    ("H=∑_sub(k=1)^(N)a_sub(k)", r"\sum_{k=1}^{N}(a_k)=H"),
+    ("∑_sub(k=1)^(N)a_sub(k)=H", r"H=\sum_{k=1}^{N}a_k"),
+])
+def test_unproved_complex_equality_with_swapped_sides_remains_unassessed(source_formula, answer_formula):
+    source = evidence("[MATH: " + source_formula + "]")
+    answer = "$$" + answer_formula + "$$ [E1]"
+    claim = {"claim_id": "C1", "support": "supported", "passage_ids": ["E1:P1"]}
+    report = verify_grounding(answer, [source], claims=[claim])
+    assert formula_check(report).status == "unassessed"
+    assert not report.needs_repair
+    assert not report.assessment_complete
+    assert safe_partial_answer(answer, report) == answer
+
+
+@pytest.mark.parametrize("tail", ["+0", "-0", "+(2-2)", "*1", "/1"])
+def test_neutral_arithmetic_tail_of_unknown_notation_is_not_a_proven_error(tail):
+    source = evidence("[MATH: H=∑_sub(k=1)^(N)a_sub(k)]")
+    answer = r"$$H=\sum_{k=1}^{N}a_k" + tail + "$$ [E1]"
+    report = verify_grounding(answer, [source])
+    assert formula_check(report).status == "unassessed"
+    assert not report.needs_repair
+    assert not report.assessment_complete
+    assert safe_partial_answer(answer, report) == answer
+
+
+@pytest.mark.parametrize("tail", ["+1", "-2", "+B", "*2", "/2"])
+def test_non_neutral_extra_or_missing_continuation_is_still_rejected(tail):
+    original = r"H=\sum_{k=1}^{N}a_k"
+    for source_formula, answer_formula in [(original, original + tail), (original + tail, original)]:
+        source = evidence("$$" + source_formula + "$$")
+        answer = "$$" + answer_formula + "$$ [E1]"
+        report = verify_grounding(answer, [source])
+        assert formula_check(report).status == "unsupported"
+        assert report.needs_repair
+        assert answer_formula not in safe_partial_answer(answer, report)

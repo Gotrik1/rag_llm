@@ -1,6 +1,25 @@
-import { describe, expect, it } from "vitest";
+import { act, createElement } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { chatFromRecord, documentUploadedLabel, documentVersionLabel, generationResponseIsTerminal, hasRunningAssistantMessage, normalizeMarkdown, normalizeSourceCitations, panelStateFromMessageRecords, resultFromMessageRecord, sourceLocatorLabel, splitDocumentsByScope, uploadFeedback, uploadScopeFields, visibleNavigationChats } from "./App";
+import { App, chatFromRecord, documentUploadedLabel, documentVersionLabel, generationResponseIsTerminal, hasRunningAssistantMessage, normalizeMarkdown, normalizeSourceCitations, panelStateFromMessageRecords, resultFromMessageRecord, sourceLocatorLabel, splitDocumentsByScope, uploadFeedback, uploadScopeFields, visibleNavigationChats } from "./App";
+
+// These tests exercise workspace navigation; the editor viewport runs in the browser checks.
+vi.mock("@assistant-ui/react", async () => {
+  const { createElement } = await import("react");
+  return {
+    AssistantRuntimeProvider: ({ children }: { children?: import("react").ReactNode }) => createElement("div", null, children),
+    useExternalStoreRuntime: () => ({}),
+    ThreadPrimitive: { Root: "div", Viewport: "div", Empty: "div", Messages: () => null, ViewportFooter: "div" },
+    ComposerPrimitive: {
+      Root: "div",
+      Input: ({ submitMode: _submitMode, ...props }: { submitMode?: string } & import("react").ComponentProps<"textarea">) => createElement("textarea", props),
+      Send: "button"
+    },
+    MessagePrimitive: { Root: "div", Content: () => null },
+    useMessage: vi.fn()
+  };
+});
 
 
 describe("persisted generation state", () => {
@@ -246,5 +265,215 @@ describe("persisted generation state", () => {
       title: "Общий",
       metadata: { retrieval_focus: "invalid" }
     }).retrievalFocus).toBe("auto");
+  });
+});
+
+describe("per-tab chat restoration", () => {
+  const chatA = { id: "chat-a", project_id: "project-a", title: "Chat A" };
+  const chatB = { id: "chat-b", project_id: "project-b", title: "Chat B" };
+  const freeChat = { id: "chat-free", project_id: null, title: "Free chat" };
+  let availableChats: { id: string; project_id: string | null; title: string }[];
+  let serverWorkspace: { active_chat_id: string | null; active_project_id: string | null };
+  let workspaceResponse: Promise<unknown> | undefined;
+  let root: Root | undefined;
+  let container: HTMLDivElement;
+  const fetchMock = vi.fn();
+
+  function jsonResponse(data: unknown) {
+    return {
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      headers: new Headers({ "content-type": "application/json" }),
+      json: async () => data
+    };
+  }
+
+  async function mountAt(url: string) {
+    window.history.replaceState({ previous: "kept" }, "", url);
+    root = createRoot(container);
+    await act(async () => root!.render(createElement(App)));
+  }
+
+  async function unmount() {
+    await act(async () => root?.unmount());
+    root = undefined;
+  }
+
+  async function click(element: Element | null) {
+    expect(element).not.toBeNull();
+    await act(async () => (element as HTMLElement).click());
+  }
+
+  async function openMenu(element: Element | null) {
+    expect(element).not.toBeNull();
+    await act(async () => (element as HTMLElement).focus());
+  }
+
+  function messageRequests() {
+    return fetchMock.mock.calls.map(([path]) => path as string).filter((path) => path.endsWith("/messages"));
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    availableChats = [chatA, chatB, freeChat];
+    serverWorkspace = { active_chat_id: chatB.id, active_project_id: chatB.project_id };
+    workspaceResponse = undefined;
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    fetchMock.mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path === "/api/auth/session") return jsonResponse({
+        authenticated: true,
+        csrf_token: "csrf",
+        user: { id: "user-1", email: "user@example.test", display_name: "User", is_admin: false, can_manage_global_documents: false }
+      });
+      if (path === "/api/workspace") return jsonResponse(workspaceResponse ? await workspaceResponse : serverWorkspace);
+      if (path === "/api/projects") return jsonResponse({ items: [
+        { id: "project-a", name: "Project A" },
+        { id: "project-b", name: "Project B" }
+      ] });
+      if (path === "/api/chats" && options?.method === "POST") {
+        const chat = { id: "new-free", project_id: null, title: "Новый чат" };
+        availableChats = [...availableChats, chat];
+        return jsonResponse(chat);
+      }
+      if (path === "/api/projects/project-a/chats" && options?.method === "POST") {
+        const chat = { id: "new-project-chat", project_id: "project-a", title: "Новый чат" };
+        availableChats = [...availableChats, chat];
+        return jsonResponse(chat);
+      }
+      if (path === "/api/chats") return jsonResponse({ items: availableChats });
+      if (options?.method === "DELETE") {
+        availableChats = availableChats.filter((chat) => path !== `/api/chats/${chat.id}`);
+        return jsonResponse({ deleted: true });
+      }
+      if (path === "/api/settings") {
+        serverWorkspace = JSON.parse(options!.body as string);
+        return jsonResponse(serverWorkspace);
+      }
+      if (path === "/api/models") return jsonResponse({ models: ["test-model"], selected: "test-model" });
+      if (path === "/api/providers") return jsonResponse({ config: { provider: "ollama", model: "test-model" }, defaults: {} });
+      if (path === "/api/system-prompts") return jsonResponse({ prompts: [], selected: "rag-grounded" });
+      if (path === "/api/flow-mode") return jsonResponse({ mode: "python" });
+      return jsonResponse({ items: [] });
+    });
+  });
+
+  afterEach(async () => {
+    await unmount();
+    container.remove();
+    fetchMock.mockReset();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    window.history.replaceState(null, "", "/");
+  });
+
+  it("restores two independent tab URLs after the account default changes", async () => {
+    await mountAt("/?chat=chat-a");
+    expect(messageRequests()).toEqual(["/api/chats/chat-a/messages"]);
+    const tabAUrl = window.location.href;
+    await unmount();
+
+    await mountAt("/?chat=chat-b");
+    const tabBUrl = window.location.href;
+    expect(messageRequests().slice(-1)[0]).toBe("/api/chats/chat-b/messages");
+    await unmount();
+
+    fetchMock.mockClear();
+    await mountAt(tabAUrl);
+    expect(serverWorkspace.active_chat_id).toBe("chat-b");
+    expect(messageRequests()).toEqual(["/api/chats/chat-a/messages"]);
+    expect(window.location.href).toBe(tabAUrl);
+    expect(tabBUrl).toContain("chat=chat-b");
+    expect(container.querySelector(".nav-item.active .nav-item-copy > span")?.textContent).toBe("Project A");
+  });
+
+  it("keeps the deep link intact while workspace bootstrap is pending", async () => {
+    let resolveWorkspace!: (value: unknown) => void;
+    workspaceResponse = new Promise((resolve) => { resolveWorkspace = resolve; });
+    await mountAt("/?chat=chat-a#answer");
+    expect(window.location.search).toBe("?chat=chat-a");
+    expect(messageRequests()).toEqual([]);
+
+    await act(async () => resolveWorkspace(serverWorkspace));
+    expect(messageRequests()).toEqual(["/api/chats/chat-a/messages"]);
+    expect(window.location.hash).toBe("#answer");
+  });
+
+  it.each(["deleted-chat", "foreign-chat"])("falls back safely from the unavailable URL chat %s", async (chatId) => {
+    await mountAt(`/?chat=${chatId}`);
+    expect(messageRequests()).toEqual(["/api/chats/chat-b/messages"]);
+    expect(window.location.search).toBe("?chat=chat-b");
+  });
+
+  it("validates a stale shared default before fetching any chat messages", async () => {
+    serverWorkspace.active_chat_id = "foreign-chat";
+    await mountAt("/?chat=deleted-chat");
+    expect(messageRequests()).toEqual(["/api/chats/chat-free/messages"]);
+    expect(window.location.search).toBe("?chat=chat-free");
+    expect(container.querySelector('[aria-label="Документы проекта"]')).toBeNull();
+  });
+
+  it("derives a project's document scope from the URL chat", async () => {
+    await mountAt("/?chat=chat-a");
+    const paths = fetchMock.mock.calls.map(([path]) => path);
+    expect(paths).toContain("/api/projects/project-a/documents");
+    expect(paths).not.toContain("/api/projects/project-b/documents");
+  });
+
+  it("keeps a free chat outside the shared default project", async () => {
+    await mountAt("/?chat=chat-free");
+    expect(messageRequests()).toEqual(["/api/chats/chat-free/messages"]);
+    expect(container.querySelector('[aria-label="Документы проекта"]')).toBeNull();
+    expect(fetchMock.mock.calls.some(([path]) => (path as string).includes("/projects/project-b/documents"))).toBe(false);
+  });
+
+  it("preserves other query parameters, the hash and history state when opening a chat", async () => {
+    await mountAt("/workspace?view=wide&filter=two%20words&chat=chat-a#sources");
+    const projectB = Array.from(container.querySelectorAll(".nav-item")).find((element) => element.textContent?.startsWith("Project B"));
+    await click(projectB ?? null);
+    expect(new URLSearchParams(window.location.search).get("chat")).toBe("chat-b");
+    expect(new URLSearchParams(window.location.search).get("filter")).toBe("two words");
+    expect(new URLSearchParams(window.location.search).get("view")).toBe("wide");
+    expect(window.location.pathname).toBe("/workspace");
+    expect(window.location.hash).toBe("#sources");
+    expect(window.history.state).toEqual({ previous: "kept" });
+    expect(serverWorkspace.active_chat_id).toBe("chat-b");
+    expect(messageRequests().slice(-1)[0]).toBe("/api/chats/chat-b/messages");
+  });
+
+  it("updates the tab URL when creating a free chat and clears it on deletion", async () => {
+    await mountAt("/?chat=chat-a&view=wide#sources");
+    await click(container.querySelector(".new-thread"));
+    expect(new URLSearchParams(window.location.search).get("chat")).toBe("new-free");
+    expect(serverWorkspace.active_project_id).toBeNull();
+
+    await openMenu(container.querySelector(".chat-nav-item.active"));
+    await click(document.querySelector(".nav-hover-menu .danger"));
+    expect(new URLSearchParams(window.location.search).has("chat")).toBe(false);
+    expect(window.location.search).toBe("?view=wide");
+    expect(window.location.hash).toBe("#sources");
+    expect(serverWorkspace.active_chat_id).toBe("");
+    expect(container.querySelector('[aria-label="Документы проекта"]')).toBeNull();
+  });
+
+  it("updates the tab URL when creating a project chat", async () => {
+    await mountAt("/?chat=chat-a");
+    const projectA = Array.from(container.querySelectorAll(".nav-item")).find((element) => element.textContent?.startsWith("Project A"));
+    await openMenu(projectA ?? null);
+    const createButton = Array.from(document.querySelectorAll(".nav-menu-action")).find((element) => element.textContent === "Новый чат");
+    await click(createButton ?? null);
+    expect(window.location.search).toBe("?chat=new-project-chat");
+    expect(serverWorkspace.active_project_id).toBe("project-a");
+  });
+
+  it("clears an unavailable URL chat when the account has no chats", async () => {
+    availableChats = [];
+    await mountAt("/?chat=foreign-chat&view=wide#sources");
+    expect(messageRequests()).toEqual([]);
+    expect(window.location.search).toBe("?view=wide");
+    expect(window.location.hash).toBe("#sources");
   });
 });

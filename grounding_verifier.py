@@ -53,7 +53,9 @@ class GroundingReport:
     @property
     def assessment_complete(self) -> bool:
         return (self.unassessed_claim_count == 0 and self.assessed_claim_count > 0 and
-                not any(check.status == "invalid_judge_evidence" for check in self.checks))
+                not any(check.status == "invalid_judge_evidence" or
+                        (check.kind == "formula" and check.status == "unassessed")
+                        for check in self.checks))
 
     @property
     def unsupported_spans(self) -> list[tuple[int, int]]:
@@ -204,6 +206,7 @@ def normalize_formula(formula: str) -> str:
     value = re.sub(r"\\(?:left|right|displaystyle|textstyle)\b", "", value)
     value = re.sub(r"\\(?:quad|qquad|,|;|!|:|\s)", "", value)
     value = value.replace("−", "-").replace("×", "*").replace("·", "*").replace("÷", "/")
+    value = value.replace("∑", r"\sum")
     value = re.sub(r"\\(?:cdot|times)\b", "*", value)
     for _ in range(12):
         previous = value
@@ -226,6 +229,82 @@ def normalize_formula(formula: str) -> str:
     value = re.sub(r"\s+", "", value)
     value = re.sub(r"_([\w])", r"_{\1}", value)
     return value.rstrip(".;")
+
+
+def _native_math_runs(text: str) -> list[dict[str, Any]]:
+    """Retain one Word equation across explicitly linked math runs.
+
+    A MATH marker is a Word run boundary, not necessarily an equation boundary.
+    References between runs are presentation metadata. Never invent an infix
+    operator for adjacent runs or join across a paragraph/prose/OCR boundary.
+    Ambiguous/dangling runs remain observable, but cannot certify a formula.
+    """
+    matches = [match for match in _MATH.finditer(text) if match.group("word") is not None]
+    records: list[dict[str, Any]] = []
+    reference = re.compile(r"\[\[MATHML_REF:[^\]\r\n]+\]\]")
+    operators = "+-−*×·/÷=^"
+
+    def math_operator(value: str, *, trailing: bool = False) -> bool:
+        # Unknown mathematical connectors must make a boundary uncertain too;
+        # they cannot turn the preceding RHS fragment into a whole equation.
+        visible = [char for char in value if not char.isspace() and unicodedata.category(char) != "Cf"]
+        if not visible:
+            return False
+        char = visible[-1] if trailing else visible[0]
+        return char in operators or char in "\\_" or unicodedata.category(char) == "Sm"
+
+    index = 0
+    while index < len(matches):
+        first = matches[index]
+        start, end = first.span()
+        raw = first.group("word").strip()
+        complete = True
+        # Word may also leave a literal equation prefix in an ordinary text
+        # run and continue it in native math, e.g. A=B [MATH: +C]. Only an
+        # explicitly connected, bounded arithmetic prefix is eligible; prose
+        # or adjacency without an operator is never promoted to mathematics.
+        line_start = text.rfind("\n", 0, start) + 1
+        literal_prefix = text[line_start:start].strip()
+        explicit_prefix = math_operator(literal_prefix, trailing=True) or math_operator(raw)
+        if literal_prefix and "=" in literal_prefix and explicit_prefix and not re.search(
+                r"(?<=[^\W\d_])\s+(?=[^\W\d_])", literal_prefix, re.UNICODE):
+            combined = literal_prefix + " " + raw
+            try:
+                equation = _equation(combined)
+                if len(equation) == 2 and equation[0][0] == "symbol":
+                    raw = combined
+                    start = line_start + len(text[line_start:start]) - len(text[line_start:start].lstrip())
+                else:
+                    complete = False
+            except (ValueError, InvalidOperation, RecursionError):
+                complete = False
+        prefix = text[:start]
+        inside_ocr = prefix.rfind("[IMAGE_OCR") > prefix.rfind("[/IMAGE_OCR]")
+        while index + 1 < len(matches):
+            following = matches[index + 1]
+            gap = text[end:following.start()]
+            connector = reference.sub("", gap)
+            if (re.search(r"\r?\n[ \t]*\r?\n", connector) or
+                    re.search(r"[^\s+\-−*×·/÷=^]", connector)):
+                break
+            next_raw = following.group("word").strip()
+            explicit = (bool(connector.strip()) or math_operator(raw, trailing=True) or
+                        math_operator(next_raw))
+            # Whitespace-separated independent equalities are not a chain.
+            if not explicit and "=" in raw and "=" in next_raw:
+                break
+            if not explicit:
+                complete = False  # Do not infer multiplication or another operator.
+            raw += connector + next_raw
+            end = following.end()
+            index += 1
+        suffix = reference.sub("", text[end:].split("\n", 1)[0]).lstrip()
+        if math_operator(raw, trailing=True) or math_operator(suffix):
+            complete = False  # A dangling continuation must not promote its prefix.
+        records.append({"formula": raw, "start": start, "end": end,
+                        "inside_ocr": inside_ocr, "complete": complete})
+        index += 1
+    return records
 
 
 def native_formula_catalogue(evidence: Iterable[Mapping[str, Any]]) -> list[dict]:
@@ -274,6 +353,9 @@ def native_formula_catalogue(evidence: Iterable[Mapping[str, Any]]) -> list[dict
             elif char in {"×", "·"}:
                 result.append("\\times " if char == "×" else "\\cdot ")
                 index += 1
+            elif char == "∑":
+                result.append("\\sum ")
+                index += 1
             else:
                 if char in ")[]\\{}$#&%" or unicodedata.category(char) == "Cf":
                     raise ValueError("Unsupported native math character")
@@ -284,17 +366,15 @@ def native_formula_catalogue(evidence: Iterable[Mapping[str, Any]]) -> list[dict
     catalogue: list[dict] = []
     seen: set[tuple[str, str]] = set()
     for identifier, item in _evidence_map(evidence).items():
-        for match in _MATH.finditer(item["text"]):
-            raw = match.group("word")
-            if not raw or "=" not in raw:
+        for run in _native_math_runs(item["text"]):
+            raw = run["formula"]
+            if not run["complete"] or "=" not in raw:
                 continue
-            prefix = item["text"][:match.start()]
-            inside_ocr = prefix.rfind("[IMAGE_OCR") > prefix.rfind("[/IMAGE_OCR]")
             # A failed illustration produces a local IMAGE_WARNING, not an
             # OCR taint on independent native Word equations in its section.
             # OCR block bounds and explicit evidence-wide warnings still deny
             # a transcription; the MATH marker alone cannot override those.
-            if _ocr_formula(item, inside_ocr) or (identifier, raw) in seen:
+            if _ocr_formula(item, run["inside_ocr"]) or (identifier, raw) in seen:
                 continue
             # These source notations describe alternatives/are corrupted, not
             # one unambiguous algebraic equality. Do not make one up.
@@ -413,21 +493,48 @@ def _equation(formula: str) -> tuple:
     return tuple(_canonical_ast(_ast(part)) for part in parts)
 
 
-def _same_formula(left: str, right: str) -> bool:
+def _formula_relation(left: str, right: str) -> bool | None:
+    """True/False only for supported structural comparison; None is not disproof."""
     try:
         a, b = _equation(left), _equation(right)
         return a == b or (len(a) == len(b) == 2 and a == tuple(reversed(b)))
     except (ValueError, InvalidOperation, RecursionError):
         # Unknown notation is permitted only as exactly copied presentation.
         try:
-            return normalize_formula(left) == normalize_formula(right)
+            a, b = normalize_formula(left), normalize_formula(right)
+            if a == b:
+                return True
+            # A visibly omitted/added continuation of the very same equality
+            # is not an unknown algebraic identity, even if the tail contains
+            # notation outside the bounded arithmetic parser.
+            for shorter, longer in [(a, b), (b, a)]:
+                if (longer.startswith(shorter) and len(longer) > len(shorter) and
+                        longer[len(shorter)] in "+-*/"):
+                    continuation = longer[len(shorter):]
+                    try:
+                        value = _evaluate(_ast(continuation[1:]), {})
+                        neutral = value == (0 if continuation[0] in "+-" else 1)
+                    except (ValueError, KeyError, InvalidOperation, ArithmeticError, RecursionError):
+                        neutral = False
+                    # An unchanged expression with a neutral arithmetic tail
+                    # is not a demonstrated error. Do not prove an identity
+                    # for notation outside the parser, or force its removal.
+                    return None if neutral else False
+            return None
         except (ValueError, RecursionError):
-            return False
+            return None
+
+
+def _same_formula(left: str, right: str) -> bool:
+    return _formula_relation(left, right) is True
 
 
 def _formulas(text: str) -> list[tuple[str, int, int, bool]]:
-    formulas = []
+    formulas = [(run["formula"], run["start"], run["end"], run["inside_ocr"])
+                for run in _native_math_runs(text) if "=" in run["formula"]]
     for match in _MATH.finditer(text):
+        if match.group("word") is not None:
+            continue
         formula = next(value for value in match.groupdict().values() if value is not None)
         if "=" not in formula:
             continue  # A variable or unit in inline math is not an asserted equation.
@@ -564,8 +671,12 @@ def build_numeric_rules(question: str, evidence: Iterable[Mapping[str, Any]]) ->
     if not matches:
         diagnostics.append({"reason": "no_explicit_numeric_assignments", "message": "No positional or semantic number binding is allowed"})
     for identifier, item in sources.items():
+        ambiguous_runs = {run["formula"] for run in _native_math_runs(item["text"]) if not run["complete"]}
         for formula, _, _, inside_ocr in _formulas(item["text"]):
             details = {"evidence_id": identifier, "formula": formula}
+            if formula in ambiguous_runs:
+                diagnostics.append({**details, "reason": "ambiguous_native_formula_boundary"})
+                continue
             if _ocr_formula(item, inside_ocr):
                 diagnostics.append({**details, "reason": "unverified_ocr_formula"})
                 continue
@@ -746,6 +857,11 @@ def verify_grounding(answer: str, evidence: Iterable[Mapping[str, Any]], *,
     source_formulas = [(identifier, formula, _ocr_formula(item, ocr))
                        for identifier, item in sources.items()
                        for formula, _, _, ocr in _formulas(item["text"])]
+    ambiguous_sources = {(identifier, run["formula"])
+                         for identifier, item in sources.items()
+                         for run in _native_math_runs(item["text"]) if not run["complete"]}
+    ambiguous_answers = {(run["start"], run["end"])
+                         for run in _native_math_runs(answer) if not run["complete"]}
     equations = _formulas(answer)
     for number, (formula, start, end, _) in enumerate(equations):
         # Citations normally follow an equation. Do not borrow a citation across
@@ -759,7 +875,8 @@ def verify_grounding(answer: str, evidence: Iterable[Mapping[str, Any]], *,
             identifiers, bad = citation_ids(before, sources)
         candidates = [(identifier, candidate, ocr) for identifier, candidate, ocr in source_formulas
                       if identifier in identifiers and _same_formula(formula, candidate)]
-        authoritative = [(identifier, candidate) for identifier, candidate, ocr in candidates if not ocr]
+        authoritative = [(identifier, candidate) for identifier, candidate, ocr in candidates
+                         if not ocr and (identifier, candidate) not in ambiguous_sources]
         details: dict[str, Any] = {"normalized": "", "semantic_applicability_verified": False}
         try:
             details["normalized"] = normalize_formula(formula)
@@ -768,6 +885,8 @@ def verify_grounding(answer: str, evidence: Iterable[Mapping[str, Any]], *,
             pass
         if bad:
             status, reason = "invalid_citation", "Formula cites unknown evidence"
+        elif (start, end) in ambiguous_answers:
+            status, reason = "unassessed", "Answer has an ambiguous or dangling native math continuation; no equivalence is certified"
         elif authoritative:
             status, reason = "source_matched", "Presentation-normalized structure matches supplied source; applicability still needs semantic assessment"
             details["source_formulas"] = [{"evidence_id": identifier, "formula": candidate,
@@ -776,17 +895,57 @@ def verify_grounding(answer: str, evidence: Iterable[Mapping[str, Any]], *,
                                             "source_context": sources[identifier]["text"],
                                             "units_and_applicability": "Retained in source_context; not inferred by structural formula matching"}
                                            for identifier, candidate in authoritative]
-        elif candidates:
+        elif any(ocr for _, _, ocr in candidates):
             status, reason = "unverified_ocr", "Only image transcription supports this formula; verify indices and signs against the original"
         else:
             arithmetic = _calculation_support(formula, calculation_rules,
-                                             [entry for entry in source_formulas if entry[0] in identifiers],
+                                             [entry for entry in source_formulas if entry[0] in identifiers and
+                                              (entry[0], entry[1]) not in ambiguous_sources],
                                              question + "\n" + "\n".join(sources[key]["text"] for key in identifiers))
             if arithmetic:
                 status, reason = "calculated", "Whitelisted arithmetic follows an actual source formula with explicitly evidenced input assignments"
                 identifiers = arithmetic
             else:
-                status, reason = "unsupported", "No structurally matching cited source formula or evidenced arithmetic derivation"
+                def same_output(candidate: str) -> bool:
+                    try:
+                        left, right = normalize_formula(formula), normalize_formula(candidate)
+                        if left.split("=", 1)[0] == right.split("=", 1)[0]:
+                            return True
+
+                        def outputs(value: str) -> set[str]:
+                            # Only top-level equalities delimit sides: bounds
+                            # and indices may contain an '=' of their own.
+                            sides: list[str] = []
+                            depth, beginning = 0, 0
+                            for position, char in enumerate(value):
+                                if char in "({":
+                                    depth += 1
+                                elif char in ")}":
+                                    depth -= 1
+                                elif char == "=" and depth == 0:
+                                    sides.append(value[beginning:position])
+                                    beginning = position + 1
+                            sides.append(value[beginning:])
+                            symbols = set()
+                            for side in sides:
+                                try:
+                                    if _ast(side)[0] == "symbol":
+                                        symbols.add(side)
+                                except (ValueError, InvalidOperation, RecursionError):
+                                    continue
+                            return symbols
+
+                        return bool(outputs(left) & outputs(right))
+                    except (ValueError, RecursionError):
+                        return False
+                uncertain = any(identifier in identifiers and same_output(candidate) and
+                                ((identifier, candidate) in ambiguous_sources or
+                                 _formula_relation(formula, candidate) is None)
+                                for identifier, candidate, _ in source_formulas)
+                if uncertain:
+                    status, reason = "unassessed", "Cited formula boundaries or notation exceed strict equivalence checking; lack of proof is not a factual contradiction"
+                else:
+                    status, reason = "unsupported", "No structurally matching cited source formula or evidenced arithmetic derivation"
         report.checks.append(GroundingCheck("formula", formula, status, identifiers, reason, start, end, details))
     if judge and claims is None:
         try:
@@ -884,6 +1043,8 @@ def verify_grounding(answer: str, evidence: Iterable[Mapping[str, Any]], *,
                                             "quotes": quotes if valid else []}))
     if any(check.status == "invalid_judge_evidence" for check in report.checks):
         report.warnings.append("Invalid judge linkage leaves the claim unassessed; it does not establish a factual error or require answer repair")
+    if any(check.kind == "formula" and check.status == "unassessed" for check in report.checks):
+        report.warnings.append("Unassessed formula notation/boundaries remain; no forced formula removal or whole-answer certification is justified")
     # Discover unassessed prose separately: a judge returning one easy claim
     # cannot certify the rest of a long answer by omission.
     residual = list(answer)

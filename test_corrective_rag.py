@@ -117,6 +117,48 @@ def test_response_exclusion_does_not_drop_a_required_factual_exception():
     assert plan.requirements == (requirement,)
 
 
+def test_resolved_intent_drives_ranking_without_losing_verbatim_query_or_exclusions():
+    question = 'Теперь убери обсуждение температуры. Меня интересует тот же порядок контроля.'
+    envelope = 'Тема диалога — вопрос пользователя: '+QUESTION+'\nТекущий запрос пользователя: '+question
+    model = Model(plan={'canonical_question':QUESTION,'requirements':['Этапы контроля'],
+                        'queries':[QUESTION],'exclusions':['температура']})
+    searches, selections = [],[]
+
+    def retrieve(subject, queries, requirements, trace):
+        searches.append((subject,queries))
+        return [fragment()]
+
+    def select(subject, pool, requirements):
+        selections.append(subject)
+        return pool
+
+    result = run_corrective(question,envelope,retrieve=retrieve,select=select,complete=model)
+    assert searches[0][0] == QUESTION+'; не рассматривай температура'
+    assert envelope in searches[0][1]
+    assert selections == [searches[0][0]]
+    assert result.trace['plan']['canonical_question'] == QUESTION
+    assert result.trace['ranking_question'] == selections[0]
+
+
+def test_canonical_question_cannot_invent_a_category_absent_from_the_user_context():
+    model = Model(plan={'canonical_question':'Что такое 4 ЦК?',
+                        'requirements':['Определение ценовых категорий'],'queries':['Ценовые категории']})
+    plan = make_plan('Что такое ценовые категории?',model)
+    assert plan.fallback
+    assert not plan.canonical_question
+
+
+def test_missing_canonical_question_preserves_the_original_ranking_fallback():
+    model = Model()
+    subjects = []
+    def retrieve(subject,queries,requirements,trace):
+        subjects.append(subject)
+        return [fragment()]
+    result = run_corrective(QUESTION,QUESTION,retrieve=retrieve,complete=model)
+    assert subjects == [QUESTION]
+    assert not result.trace['plan']['canonical_question']
+
+
 def test_incomplete_direct_child_family_cannot_be_certified_as_complete_by_model():
     data = fragment(evidence_family_id='f',evidence_family={'id':'f','file':'Проверка каналов.md',
         'expected_children':['Основной порядок','Другой метод'],'total_children':2,'complete':False})

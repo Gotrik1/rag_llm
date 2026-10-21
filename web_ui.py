@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 from urllib.error import URLError
 
+from conversation_context import resolve_conversation_context
 from db_store import (
     close_thread_connection,
     create_chat,
@@ -289,45 +290,13 @@ def project_context_prompt(scope: dict) -> str:
 
 
 def contextualize_retrieval_question(question: str, scope: dict, chat_id: str) -> str:
-    """Resolve short referential follow-ups using the previous user turn in this chat."""
-    # A complete document-occurrence request already carries its own subject.
-    # Natural standalone questions beginning with "где" must not inherit an
-    # unrelated previous turn and change their retrieval terms.
-    if is_document_occurrence_question(question):
-        return question
-    normalized = re.sub(r"\s+", " ", question.strip().lower())
-    explicit_subject = bool(
-        re.search(r"\b\d+\s*[а-яёa-z]{1,5}\b", normalized)
-        or re.search(r"\b[А-ЯЁA-Z]{2,}\d*\b", question)
-        or re.search(r"[«\"'][^»\"']{2,}[»\"']", question)
-    )
-    if explicit_subject:
-        return question
-    # Question words alone do not make a follow-up. "Какие бывают модели?"
-    # names a new subject and must never inherit e.g. the preceding ИВ0 turn.
-    referential_keys = term_keys("формула расчет условия ограничения переменные источник порядок подробнее это он она они его ее их как какой какая какие сколько почему где когда зачем")
-    if term_keys(normalized) - referential_keys:
-        return question
-    follow_up = len(normalized) <= 140 and bool(re.match(
-        r"^(?:а\s+|и\s+|но\s+)?(?:по\s+)?(?:како(?:й|е|я|ие)|как|где|когда|почему|зачем|сколько|"
-        r"что\s+(?:с|насч[её]т)|это|он|она|они|его|е[её]|их)\b",
-        normalized,
-    ))
-    if not follow_up:
-        return question
-
-    skipped_current = False
-    for message in reversed(scope.get("messages", [])):
-        if str(message.get("chat_id", "")) != chat_id or str(message.get("role", "")) != "user":
-            continue
-        content = str(message.get("content", "")).strip()
-        if not content:
-            continue
-        if not skipped_current and re.sub(r"\s+", " ", content.lower()) == normalized:
-            skipped_current = True
-            continue
-        return f"Предыдущий вопрос: {content[:1000]}\nУточняющий вопрос: {question}"
-    return question
+    """Reconstruct user intent from persisted same-chat turns, not model claims."""
+    return resolve_conversation_context(
+        question,
+        scope.get("messages", []),
+        chat_id=chat_id,
+        occurrence_question=is_document_occurrence_question(question),
+    ).retrieval_question
 
 
 def enrich_source_links(sources: list[dict]) -> list[dict]:
@@ -766,8 +735,8 @@ def public_provider_config(config: dict) -> dict:
     return result
 
 
-def llm_label() -> dict:
-    config = load_provider_config()
+def llm_label(config: dict | None = None) -> dict:
+    config = load_provider_config() if config is None else config
     provider = str(config.get("provider", "ollama"))
     provider_names = {
         "ollama": "Ollama",
@@ -1498,6 +1467,13 @@ class Handler(BaseHTTPRequestHandler):
 
         mode = load_flow_mode()
         agent = get_agent()
+        # Worker threads are reused across chats and flows. Thread-local state
+        # from a prior Python ask must not be exposed by Rust/hybrid or a
+        # cache-only adapter that does not populate fresh request diagnostics.
+        request_state = getattr(agent, "_generation_state", None)
+        if request_state is not None:
+            request_state.retrieval_trace = {}
+            request_state.retrieved_context = None
         retrieval_question = contextualize_retrieval_question(question, scope, chat_id)
         t0 = time.time()
         profile = get_profile(load_system_prompt_id(), GROUNDED_SYSTEM_PROMPT)
@@ -1604,18 +1580,32 @@ class Handler(BaseHTTPRequestHandler):
         sources = select_user_facing_sources(answer, sources)
         formulas = requested_response_formulas(context, question)
         warnings = validate_retrieval(question, context, answer)
+        trace_reader = getattr(agent,'last_retrieval_trace',None) if mode == 'python' else None
+        retrieval_trace = trace_reader() if callable(trace_reader) else {}
+        retrieval_trace = retrieval_trace if isinstance(retrieval_trace,dict) else {}
+        verification = retrieval_trace.get('verification',{})
+        latest_check = verification.get('after_repair',verification.get('initial',{}))
+        if retrieval_trace.get('mode')=='corrective' and latest_check and not latest_check.get('assessment_complete'):
+            warnings.append('Автоматическая проверка доказательств выполнена не полностью. Проверьте существенные выводы по ссылкам на документы.')
+        retrieval_trace['conversation_context'] = resolve_conversation_context(
+            question,scope.get('messages',[]),chat_id=chat_id,
+            occurrence_question=is_document_occurrence_question(question),
+        ).to_dict()
+        response_llm = llm_label({"provider":retrieval_trace['provider'],"model":retrieval_trace['model']}) \
+            if retrieval_trace.get('mode')=='corrective' and retrieval_trace.get('model') else llm_label()
         self.send_json({
             "answer": answer,
             "html_answer": render_text(answer),
             "formulas": [{"text": f, "html": render_text(format_formula_for_display(f))} for f in formulas],
             "warnings": warnings,
+            "retrieval_trace": retrieval_trace,
             "sources": sources,
             "context": [
                 {**c, "html_text": render_text(c["text"])}
                 for c in context
             ],
             "from_cache": from_cache,
-            "llm": {**llm_label(), "label": f"{mode.title()} flow · {llm_label()['label']}"},
+            "llm": {**response_llm, "label": f"{mode.title()} flow · {response_llm['label']}"},
             "flow_mode": mode,
             "elapsed_s": time.time() - t0,
             "usage": usage_stats(answer, context),

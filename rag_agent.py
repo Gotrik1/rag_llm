@@ -2830,6 +2830,23 @@ def apply_document_version_preference(
     return adjusted if preserve_order else sorted(adjusted, key=lambda item: float(item.get("score", 0.0)), reverse=True)
 
 
+def filter_scoped_evidence(context: list[dict], question: str, *, source_aliases=None,
+                           excluded_sources=None, source_versions=None, spec=None) -> list[dict]:
+    """Reapply trust/scope boundaries after every raw-docstore expansion."""
+    excluded = {Path(str(source)).name.casefold() for source in (excluded_sources or ())}
+    allowed = {Path(str(source)).name.casefold() for source in source_aliases} if source_aliases is not None else None
+    explicit = matching_explicit_sources(question, source_aliases)
+    active = [item for item in context
+              if item.get('status') != 'deleted'
+              and Path(str(item.get('file',''))).name.casefold() not in excluded
+              and (allowed is None or Path(str(item.get('file',''))).name.casefold() in allowed)
+              and (not explicit or Path(str(item.get('file',''))).name.casefold() in explicit)
+              and not contains_prompt_injection(str(item.get('text','')))]
+    if spec is not None and spec.target_sections:
+        active = select_prism_evidence(active,spec,max(TOP_K,len(active)))
+    return apply_document_version_preference(active,source_versions,explicit_sources=explicit,preserve_order=True)
+
+
 def sanitize_grounded_answer(answer: str, question: str, allowed_calculations: list[str]) -> str:
     if contains_prompt_injection(answer):
         return refusal_answer()
@@ -3399,6 +3416,7 @@ class RAGAgent:
         source_domains: dict[str, tuple[str, ...]] | None = None,
         source_versions: dict[str, str] | None = None,
         retrieval_focus: str = "auto",
+        pipeline_mode: str | None = None,
     ) -> tuple[str, list[dict], bool]:
         """
         Возвращает (answer, sources, from_cache).
@@ -3412,6 +3430,7 @@ class RAGAgent:
             self._generation_state = threading.local()
         self._generation_state.from_cache = False
         self._generation_state.retrieved_context = []
+        self._generation_state.retrieval_trace = {"mode":"legacy"}
         search_question = (retrieval_query or question).strip()
 
         self._refresh_docstore_if_changed()
@@ -3420,6 +3439,15 @@ class RAGAgent:
                 "База знаний пуста. Загрузите документы командой :load <путь>",
                 [],
                 False,
+            )
+
+        mode = (pipeline_mode or os.getenv("RAG_CORRECTIVE_PIPELINE", "off")).strip().casefold()
+        if mode == "on":
+            return self._ask_corrective(
+                question, search_question, system_prompt or shared_system_prompt,
+                excluded_sources=excluded_sources, source_aliases=source_aliases,
+                priority_sources=priority_sources, source_domains=source_domains,
+                source_versions=source_versions, retrieval_focus=retrieval_focus,
             )
 
         # A short follow-up (for example, "а по какой формуле?") has no entity
@@ -3496,6 +3524,101 @@ class RAGAgent:
         if context is None:
             return None
         return [dict(item) for item in context]
+
+    def last_retrieval_trace(self) -> dict:
+        """Request-local decisions and provenance, never hidden reasoning."""
+        return dict(getattr(getattr(self,"_generation_state",None),"retrieval_trace",{}) or {})
+
+    def _ask_corrective(self, question: str, search_question: str, system_prompt: str | None, **scope):
+        from corrective_rag import run_corrective
+        completions = []
+        # A settings change in another chat must not switch this multi-stage
+        # request to a different model/provider midway through its evidence.
+        request_llm = self.llm
+        request_model = str(getattr(request_llm,'model',None) or
+                            getattr(request_llm,'model_name',None) or self.llm_model)
+
+        def complete(prompt, purpose):
+            started = time.perf_counter()
+            event = {"purpose":purpose,"thinking_requested":False,"thinking_used":False}
+            try:
+                thinking = purpose != "answer" and os.getenv("RAG_PLANNER_THINKING","false").casefold() in {"true","1","on"}
+                if purpose!='answer' and isinstance(request_llm,Ollama):
+                    import requests
+                    event['thinking_requested'] = thinking
+                    attempts = [True,False] if thinking else [False]
+                    with requests.Session() as session:
+                        session.trust_env = False
+                        for think in attempts:
+                            try:
+                                response = session.post(
+                                    str(os.getenv('RAG_PLANNER_BASE_URL') or getattr(request_llm,'base_url',OLLAMA_BASE_URL)).rstrip('/')+'/api/generate',
+                                    json={"model":request_model,"prompt":prompt,"stream":False,"think":think,"purpose":purpose,
+                                          "options":{"temperature":0,"seed":42,"num_predict":int(os.getenv('RAG_PLANNER_TOKEN_BUDGET','4096')),
+                                                     "reasoning_effort":"low"}},timeout=float(os.getenv('RAG_PLANNER_TIMEOUT_SECONDS','120')),
+                                )
+                                response.raise_for_status()
+                                body = response.json()
+                                content = str(body.get('response','')).strip()
+                                if not content:
+                                    raise ValueError('Internal stage has no complete final content')
+                                event['thinking_used'] = bool(body.get('thinking_enabled',False))
+                                return content
+                            except Exception as exc:
+                                if not think:
+                                    raise
+                                event['thinking_fallback'] = type(exc).__name__
+                stage_complete = getattr(request_llm,'complete_stage',None)
+                if purpose!='answer' and callable(stage_complete):
+                    return str(stage_complete(prompt,max_tokens=int(os.getenv('RAG_PLANNER_TOKEN_BUDGET','4096')),
+                        timeout=float(os.getenv('RAG_PLANNER_TIMEOUT_SECONDS','120')))).strip()
+                return str(request_llm.complete(prompt)).strip()
+            finally:
+                event['elapsed_s'] = round(time.perf_counter()-started,3)
+                completions.append(event)
+
+        def retrieve(original, queries, facets, trace):
+            return self.retrieve_context(original,TOP_K,retrieval_queries=queries,subject_question=original,
+                selection_mode='coverage',evidence_facets=facets,retrieval_trace=trace,**scope)
+
+        def select(original, pool, facets):
+            index = getattr(self,'_section_evidence_index',None)
+            if index is None:
+                index = SectionEvidenceIndex(self._all_nodes)
+            explicit = matching_explicit_sources(original,scope.get('source_aliases'))
+            packed = index.select_v2(original,pool,excluded_sources=scope.get('excluded_sources'),
+                allowed_sources=explicit or (set(scope['source_aliases']) if scope.get('source_aliases') is not None else None),
+                top_k=TOP_K,max_chars=int(os.getenv('RAG_EVIDENCE_MAX_CHARS','36000')),facets=facets)
+            return filter_scoped_evidence(packed,original,source_aliases=scope.get('source_aliases'),
+                excluded_sources=scope.get('excluded_sources'),source_versions=scope.get('source_versions'),
+                spec=refine_prism_query(original))
+
+        excluded = {Path(str(source)).name.casefold() for source in scope.get('excluded_sources') or ()}
+        explicit = matching_explicit_sources(search_question,scope.get('source_aliases'))
+        corpus_hints = [{'title':str(title),'domains':list(source_domains_for(source,scope.get('source_domains')))}
+            for source,title in (scope.get('source_aliases') or {}).items()
+            if Path(str(source)).name.casefold() not in excluded and (not explicit or source in explicit)]
+        result = run_corrective(question,search_question,retrieve=retrieve,complete=complete,select=select,
+            system_prompt=system_prompt or '',
+            max_additional_rounds=int(os.getenv('RAG_MAX_ADDITIONAL_SEARCH_ROUNDS','2')),
+            max_context_chars=min(int(os.getenv('RAG_EVIDENCE_MAX_CHARS','36000')),
+                                  max(2000,(int(request_llm.metadata.context_window)-4096)*2)),
+            corpus_hints=corpus_hints)
+        result.trace.update(mode='corrective',completions=completions,
+                            model=request_model,provider=getattr(request_llm,'provider','ollama'),
+                            corpus_snapshot=getattr(self,'_docstore_mtime_ns',0))
+        self._generation_state.retrieved_context = result.context
+        self._generation_state.retrieval_trace = result.trace
+        self._generation_state.from_cache = False
+        labels = {item['evidence_id']:human_source_reference(item) for item in result.context}
+        def render_citations(match):
+            identifiers = [eid.upper() for eid in re.findall(r'E\d+',match.group(0),re.I)]
+            return ' '.join('[Источник: '+labels[eid]+']' for eid in dict.fromkeys(identifiers) if eid in labels)
+
+        answer = re.sub(r'\[E\d+(?:\s*[,;]\s*E\d+)*\]',render_citations,result.answer,flags=re.I)
+        sources = [{"file":item['file'],"section":item.get('section_path',''),"score":item.get('score',0),
+                    "text_preview":item['text'][:120]} for item in result.context]
+        return answer,sources,False
 
     def _generate_grounded_answer(
         self,
@@ -4411,6 +4534,9 @@ class RAGAgent:
         source_versions: dict[str, str] | None = None,
         retrieval_focus: str = "auto",
         subject_question: str | None = None,
+        selection_mode: str | None = None,
+        evidence_facets: list[str] | None = None,
+        retrieval_trace: dict | None = None,
     ) -> list[dict]:
         """Return chunks after query planning unless a validated plan is supplied."""
         original_question = question
@@ -4441,7 +4567,8 @@ class RAGAgent:
         qe = self._build_query_engine(candidate_k)
         merged: dict[str, dict] = {}
         for seed_question in dict.fromkeys((selection_question, question)):
-            for item in section_index.body_seeds(seed_question, limit=max(top_k * 3, 24)):
+            for item in section_index.body_seeds(seed_question, limit=max(top_k * 3, 24),
+                                                 mode='coverage' if selection_mode=='coverage' else 'legacy'):
                 key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
                 merged[key] = item
         for item in self._procedural_seed_results(question):
@@ -4481,6 +4608,7 @@ class RAGAgent:
         # Deterministic probes precede free-form LLM expansions. Previously the
         # eight-query budget could fill before a regulation probe was reached.
         query_candidates = [
+            *((retrieval_queries or ()) if selection_mode=='coverage' else ()),
             selection_question,
             question,
             *build_targeted_queries(question),
@@ -4565,6 +4693,10 @@ class RAGAgent:
             and not contains_prompt_injection(str(item.get("text", "")))
         ]
         ranked = rerank_context_results(results, question)
+        if retrieval_trace is not None:
+            retrieval_trace.update(original_question=selection_question,query_plan=query_plan,
+                visible_candidates=len(results),candidates=[{"file":item.get('file'),"section":item.get('section_path'),
+                    "score":item.get('score'),"matched_queries":item.get('matched_queries',[])} for item in ranked[:40]])
         if is_document_occurrence_question(selection_question):
             # A document-occurrence query asks for a positive set, not for the
             # best explanatory chunks. The general domain router deliberately
@@ -4596,6 +4728,10 @@ class RAGAgent:
         )
         if related:
             ranked = rerank_context_results([*ranked, *related], question)
+        # Relationships expand from the raw docstore. Never send inaccessible
+        # or injected sibling text to an external reranker/model.
+        ranked = filter_scoped_evidence(ranked,selection_question,source_aliases=source_aliases,
+            excluded_sources=excluded_sources,source_versions=source_versions)
         reranker = getattr(self, "reranker", None)
         if reranker is not None:
             with _pipeline_span(
@@ -4608,13 +4744,14 @@ class RAGAgent:
             source_domains,
             domain_routing,
             top_k,
+            preserve_candidates=selection_mode=='coverage',
         )
         ranked = apply_document_version_preference(
             ranked,
             source_versions,
             explicit_sources=explicit_sources,
         )
-        if not explicit_sources:
+        if not explicit_sources and selection_mode!='coverage':
             ranked = reserve_topic_source_coverage(ranked, selection_question, top_k)
         if priority_sources and not explicit_sources:
             # Vector/BM25 scores are backend-specific and can be much larger
@@ -4661,8 +4798,12 @@ class RAGAgent:
             ]
             if operation_evidence:
                 selected = operation_evidence
-        evidence_pool = [*selected, *(item for item in ranked if item not in selected)]
-        packed = section_index.select(
+        # Legacy PRISM/top-k heuristics may choose an ordering, but must not
+        # erase the wider pool before the new coverage selector sees it.
+        evidence_pool = ranked if selection_mode=='coverage' else [*selected, *(item for item in ranked if item not in selected)]
+        selector = section_index.select_v2 if selection_mode=='coverage' else section_index.select
+        selector_options = {"facets":evidence_facets} if selection_mode=='coverage' else {}
+        packed = selector(
             selection_question, evidence_pool, excluded_sources=excluded_sources,
             allowed_sources=explicit_sources or (set(source_aliases) if source_aliases is not None else None), top_k=top_k,
             max_chars=min(
@@ -4670,13 +4811,14 @@ class RAGAgent:
                 max(2000, (int(self.llm.metadata.context_window) - 4096) * 2)
                 if getattr(self, "llm", None) is not None else 36000,
             ),
+            **selector_options,
         )
-        if spec.target_sections:
-            packed = select_prism_evidence(packed, spec, max(top_k, len(packed)))
-        packed = apply_document_version_preference(
-            packed, source_versions, explicit_sources=explicit_sources, preserve_order=True,
-        )
-        return [item for item in packed if not contains_prompt_injection(str(item.get("text", "")))]
+        final = filter_scoped_evidence(packed,selection_question,source_aliases=source_aliases,
+            excluded_sources=excluded_sources,source_versions=source_versions,spec=spec)
+        if retrieval_trace is not None:
+            retrieval_trace['selected'] = [{"file":item.get('file'),"section":item.get('section_path'),
+                "selection_reason":item.get('selection_reason'),"evidence_role":item.get('evidence_role')} for item in final]
+        return final
 
     def clear_cache(self):
         self.response_cache.clear()

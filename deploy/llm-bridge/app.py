@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import AsyncIterator
 from functools import lru_cache
 from threading import Lock
@@ -49,7 +50,14 @@ def _openai_payload(payload: dict[str, Any], stream: bool) -> dict[str, Any]:
         result["max_tokens"] = output_tokens
     # This bridge serves the latency-sensitive RAG path. Qwen3.8 can otherwise
     # spend the entire output budget on reasoning and return empty content.
-    if payload.get("think") is False or LLM_MODEL.startswith("Qwen/Qwen3.8"):
+    planner_thinking = (
+        os.getenv('RAG_ALLOW_PLANNER_THINKING','false').casefold() in {'true','1','on'}
+        and payload.get('purpose') in {'planning','evidence-review'} and payload.get('think') is True
+    )
+    if planner_thinking:
+        result['chat_template_kwargs'] = {'enable_thinking':True}
+        result['reasoning_effort'] = options.get('reasoning_effort','low')
+    elif payload.get("think") is False or LLM_MODEL.startswith("Qwen/Qwen3.8"):
         result["chat_template_kwargs"] = {"enable_thinking": False}
     return result
 
@@ -62,11 +70,15 @@ async def _upstream(payload: dict[str, Any], stream: bool = False) -> httpx.Resp
     return response
 
 
-def _content(response: httpx.Response) -> str:
+def _content(response: httpx.Response, *, reject_truncated: bool=False) -> str:
     data = response.json()
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
-    return str(message.get("content") or message.get("reasoning_content") or "")
+    content = str(message.get('content') or '')
+    content = re.sub(r'<think>.*?</think>', '', content, flags=re.S).strip()
+    if '<think>' in content or (reject_truncated and choice.get('finish_reason') == 'length'):
+        return ''  # Incomplete private reasoning is not a usable final result.
+    return content
 
 
 async def _stream_ollama(response: httpx.Response, mode: str) -> AsyncIterator[bytes]:
@@ -83,7 +95,7 @@ async def _stream_ollama(response: httpx.Response, mode: str) -> AsyncIterator[b
             except json.JSONDecodeError:
                 continue
             delta = ((data.get("choices") or [{}])[0].get("delta") or {})
-            text = delta.get("content") or delta.get("reasoning_content") or ""
+            text = delta.get("content") or ""
             item: dict[str, Any] = {"model": LLM_MODEL, "done": False}
             if mode == "chat":
                 item["message"] = {"role": "assistant", "content": text}
@@ -129,9 +141,10 @@ async def generate(payload: dict[str, Any]):
         raise HTTPException(503, str(exc)) from exc
     if stream:
         return StreamingResponse(_stream_ollama(response, "generate"), media_type="application/x-ndjson")
-    content = _content(response)
+    content = _content(response,reject_truncated=payload.get('purpose') in {'planning','evidence-review'})
     await response.extensions["bridge_client"].aclose()
-    return {"model": LLM_MODEL, "response": content, "done": True}
+    thinking_enabled = bool(_openai_payload(payload,False).get('chat_template_kwargs',{}).get('enable_thinking'))
+    return {"model": LLM_MODEL, "response": content, "done": True,"thinking_enabled":thinking_enabled}
 
 
 @app.post("/api/chat")
@@ -143,7 +156,7 @@ async def chat(payload: dict[str, Any]):
         raise HTTPException(503, str(exc)) from exc
     if stream:
         return StreamingResponse(_stream_ollama(response, "chat"), media_type="application/x-ndjson")
-    content = _content(response)
+    content = _content(response,reject_truncated=payload.get('purpose') in {'planning','evidence-review'})
     await response.extensions["bridge_client"].aclose()
     return {"model": LLM_MODEL, "message": {"role": "assistant", "content": content}, "done": True}
 

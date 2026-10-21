@@ -236,6 +236,7 @@ async def _run_and_persist_ask(request_payload: dict, assistant_message: dict) -
                 "formulas": result.get("formulas") or [],
                 "warnings": result.get("warnings") or [],
                 "usage": result.get("usage") or {},
+                "retrieval_trace": result.get("retrieval_trace") or {},
             },
         },
     )

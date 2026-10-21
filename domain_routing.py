@@ -121,6 +121,8 @@ def apply_domain_routing(
     source_domains: dict[str, Iterable[str]] | None,
     routing: DomainRouting,
     top_k: int,
+    *,
+    preserve_candidates: bool = False,
 ) -> list[dict]:
     """Boost direct-domain evidence and reserve bounded cross-domain coverage."""
     enriched: list[dict] = []
@@ -193,4 +195,5 @@ def apply_domain_routing(
         direct_sources += 1
         if direct_sources >= direct_source_quota:
             break
-    return [*reserved, *(item for item in enriched if id(item) not in reserved_ids)][:max(top_k * 3, top_k)]
+    ordered = [*reserved, *(item for item in enriched if id(item) not in reserved_ids)]
+    return ordered if preserve_candidates else ordered[:max(top_k * 3, top_k)]

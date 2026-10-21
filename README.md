@@ -25,6 +25,7 @@ deployment.
 - [Deployment](DEPLOYMENT.md) — production deployment, verification, backup, and rollback.
 - [Production readiness report](docs/PRODUCTION_READINESS_REPORT.md) — implemented guarantees and test coverage.
 - [RAG quality gate](docs/QUALITY_EVALUATION.md) — corpus-level 9/10 acceptance method.
+- [Evidence-first pipeline](docs/CORRECTIVE_RAG.md) — bounded corrective search, traces, evaluation and rollback.
 - Live API schema: `/api/openapi.json`; Swagger UI: `/docs`.
 
 ## Local verification
@@ -71,6 +72,10 @@ remain on internal networks.
 | `asgi_app.py` | FastAPI facade, auth, persistent generation, uploads, jobs, metrics |
 | `web_ui.py` | RAG request orchestration and compatibility routes |
 | `rag_agent.py` | chunking, hybrid retrieval, reranking, grounding, formulas, cache keys |
+| `corrective_rag.py` | opt-in bounded planning, repeated search, coverage and answer checks |
+| `evidence_selection.py` | applicability-aware section and paragraph packing |
+| `grounding_verifier.py` | source-linked claim checks, conservative formula and arithmetic validation |
+| `conversation_context.py` | current-chat subject, focus and exclusions from persisted user turns |
 | `db_store.py` | PostgreSQL workspace/document CRUD and migrations |
 | `ingestion_worker.py` | ARQ single-writer ingestion worker |
 | `response_cache.py` | exact Redis cache with TTL and namespace isolation |

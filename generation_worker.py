@@ -69,6 +69,7 @@ async def generate_answer_job(ctx: dict, job_id: str, payload: dict | None = Non
                     "formulas": result.get("formulas") or [],
                     "warnings": result.get("warnings") or [],
                     "usage": result.get("usage") or {},
+                    "retrieval_trace": result.get("retrieval_trace") or {},
                 },
             },
         )

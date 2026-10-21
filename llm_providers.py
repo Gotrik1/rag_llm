@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import time
 import uuid
@@ -34,9 +35,10 @@ GIGACHAT_CA_BUNDLE = CERTIFICATES_DIR / "gigachat-russian-ca.pem"
 MAX_OUTPUT_TOKENS = int(os.getenv("RAG_MAX_OUTPUT_TOKENS", "-1"))
 
 
-def output_limit(field: str = "max_tokens") -> dict[str, Any]:
+def output_limit(field: str = "max_tokens", *, limit: int | None = None) -> dict[str, Any]:
     """Omit the application cap by default; the provider's model window remains."""
-    return {field: MAX_OUTPUT_TOKENS} if MAX_OUTPUT_TOKENS > 0 else {}
+    value = MAX_OUTPUT_TOKENS if limit is None else limit
+    return {field: value} if value > 0 else {}
 
 
 def gigachat_ca_bundle() -> str | bool:
@@ -77,12 +79,14 @@ class ProviderLLM(CustomLLM):
     auth_type: str = "api_key"
     temperature: float = 0.0
     timeout: float = Field(default_factory=lambda: float(os.getenv("LLM_REQUEST_TIMEOUT", "900")))
+    output_token_limit: int = Field(default_factory=lambda: MAX_OUTPUT_TOKENS)
     _giga_token: str = ""
     _giga_token_expires: float = 0.0
 
     @property
     def metadata(self) -> LLMMetadata:
-        return LLMMetadata(context_window=32768, num_output=max(MAX_OUTPUT_TOKENS, 2048), is_chat_model=True, model_name=self.model)
+        return LLMMetadata(context_window=32768, num_output=self.output_token_limit if self.output_token_limit > 0 else 2048,
+                           is_chat_model=True, model_name=self.model)
 
     def _post(self, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
         response = requests.post(
@@ -101,7 +105,8 @@ class ProviderLLM(CustomLLM):
         data = self._post(
             "/chat/completions",
             {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-            {"model": self.model, "messages": [{"role": "user", "content": prompt}], "temperature": self.temperature, **output_limit()},
+            {"model": self.model, "messages": [{"role": "user", "content": prompt}], "temperature": self.temperature,
+             **output_limit(limit=self.output_token_limit)},
         )
         return str(data["choices"][0]["message"]["content"])
 
@@ -137,7 +142,8 @@ class ProviderLLM(CustomLLM):
         data = self._post(
             "/v1/chat/completions",
             {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            {"model": self.model, "messages": [{"role": "user", "content": prompt}], "temperature": self.temperature, **output_limit()},
+            {"model": self.model, "messages": [{"role": "user", "content": prompt}], "temperature": self.temperature,
+             **output_limit(limit=self.output_token_limit)},
         )
         return str(data["choices"][0]["message"]["content"])
 
@@ -149,7 +155,8 @@ class ProviderLLM(CustomLLM):
         data = self._post(
             "/completion",
             {"Authorization": f"{scheme} {self.api_key}", "Content-Type": "application/json"},
-            {"modelUri": model_uri, "completionOptions": {"stream": False, "temperature": self.temperature, **output_limit("maxTokens")}, "messages": [{"role": "user", "text": prompt}]},
+            {"modelUri": model_uri, "completionOptions": {"stream": False, "temperature": self.temperature,
+             **output_limit("maxTokens", limit=self.output_token_limit)}, "messages": [{"role": "user", "text": prompt}]},
         )
         return str(data["result"]["alternatives"][0]["message"]["text"])
 
@@ -167,6 +174,20 @@ class ProviderLLM(CustomLLM):
     @llm_completion_callback()
     def complete(self, prompt: str, formatted: bool = False, **kwargs: Any) -> CompletionResponse:
         return CompletionResponse(text=self._request(prompt))
+
+    def complete_stage(self, prompt: str, max_tokens: int, timeout: float) -> CompletionResponse:
+        """Bound an internal planning/review call without capping final answers.
+
+        Per-request copies avoid racing shared adapter settings between chats.
+        Authentication/configuration are inherited, while refreshed private
+        token state and temporary budgets remain confined to the copy.
+        """
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
+            raise ValueError("Internal stage max_tokens must be a positive integer")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Internal stage timeout must be positive and finite")
+        request_llm = self.model_copy(update={"output_token_limit": max_tokens, "timeout": float(timeout)})
+        return request_llm.complete(prompt)
 
     @llm_completion_callback()
     def stream_complete(self, prompt: str, formatted: bool = False, **kwargs: Any) -> Generator[CompletionResponse, None, None]:

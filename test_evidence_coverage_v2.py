@@ -930,3 +930,214 @@ def test_empty_markdown_notation_cell_continues_previous_definition_conditions(f
     assert (definition in excerpt) is fits
     assert signals['definition_closure_incomplete'] is not fits
     assert signals['missing_definition_symbols'] == ([] if fits else ['c'])
+
+
+def test_inventory_type_table_is_reserved_before_a_method_family():
+    parent = node('Маршрутизация', 'В системе существуют основные виды маршрутизации.')
+    first = node('Маршрутизация > Режим А',
+                 'Виды маршрутизации включают режим А для оперативной обработки сигналов.')
+    second = node('Маршрутизация > Режим Б',
+                  'Виды маршрутизации включают режим Б для отложенной обработки сигналов.')
+    selector = node('Формы > Создание маршрутизации',
+                    'Документ маршрутизации доступен для редактирования.\n\n[TABLE]\n'
+                    'Поле | Описание\nТип | Выбор из списка: Кварц; Олива; Туман\n'
+                    'Статус | Выбор из списка: Новый; Закрыт')
+    result = SectionEvidenceIndex([parent, first, second, selector]).select_v2(
+        'Какие виды маршрутизации реализованы в системе?',
+        [hit(item) for item in (parent, first, second, selector)], top_k=3, max_chars=36000)
+    selected = next(item for item in result if item['section_path'] == selector.metadata['section_path'])
+    assert 'Кварц; Олива; Туман' in selected['text']
+    assert selected['selection_signals']['inventory_enumeration_reserved']
+    assert len(result) <= 3 and sum(len(item['text']) for item in result) <= 36000
+
+
+def test_inventory_table_with_wrapped_conditions_is_not_pruned_to_fit():
+    row = 'Тип | Выбор из списка: Янтарь; Лилия; Риф; Сфера\nДействует только после проверки оператора.'
+    irrelevant = '\n'.join(f'Примечание {i} | ' + 'Нерелевантное описание. ' * 30 for i in range(25))
+    prelude = '### Создание маршрутизации\n\nТипы допустимы только при условии действующей заявки.'
+    selector = node('Формы > Создание маршрутизации',
+                    prelude + '\n\n[TABLE]\nПоле | Описание\n'
+                    + irrelevant + '\n' + row + '\nСтатус | Новый; Закрыт')
+    noise = node('Справочник', 'Весь справочник типов маршрутизации объясняет различия основных категорий.')
+    result = SectionEvidenceIndex([selector, noise]).select_v2(
+        'Перечислить полный справочник типов маршрутизации и объяснить различия между ними',
+        [hit(noise), hit(selector)], top_k=2, max_chars=900)
+    assert not any('Янтарь; Лилия; Риф; Сфера' in item['text'] for item in result)
+    assert result[0]['selection_signals']['inventory_enumeration_incomplete']
+    assert result[0]['selection_signals']['missing_inventory_sections'][0]['reason'] == 'atomic-inventory-packet-budget'
+    assert len(result) <= 2 and sum(len(item['text']) for item in result) <= 900
+
+
+@pytest.mark.parametrize('placement', ['after-table', 'named-row', 'empty-label-row'])
+@pytest.mark.parametrize('fits', [False, True])
+def test_inventory_conditions_after_choices_are_atomic(placement, fits):
+    condition = 'Перечисленные типы допустимы только при действующей заявке.'
+    noise = '' if fits else '\n'.join(
+        f'Поле {i} | ' + 'Описание дополнительного поля. ' * 30 for i in range(25)) + '\n'
+    table = '[TABLE]\nПоле | Описание\n' + noise + 'Тип | Выбор из списка: Кварц; Олива'
+    if placement == 'after-table':
+        table += '\n\n' + condition
+    elif placement == 'named-row':
+        table += '\nПрименимость | ' + condition
+    else:
+        table += '\n | ' + condition
+    selector = node('Формы > Создание маршрутизации', 'Документ маршрутизации.\n\n' + table)
+    fallback = node('Маршрутизация', 'Общие сведения о маршрутизации без полного справочника.')
+    meta = {}
+    result = SectionEvidenceIndex([selector, fallback]).select_v2(
+        'Какие виды маршрутизации?', [hit(selector), hit(fallback)],
+        top_k=2, max_chars=900, selection_meta=meta)
+    enumerations = [item for item in result if 'Кварц; Олива' in item['text']]
+    if fits:
+        assert len(enumerations) == 1
+        assert condition in enumerations[0]['text']
+        assert not meta and not any(item['selection_signals'].get('inventory_enumeration_incomplete') for item in result)
+    else:
+        assert not enumerations
+        assert any(item['selection_signals'].get('inventory_enumeration_incomplete') for item in result)
+    assert sum(len(item['text']) for item in result) <= 900
+
+
+def test_inventory_packet_preserves_source_order_and_whole_matching_table():
+    from evidence_selection import _inventory_enum_rows
+    text = ('Условия создания маршрутизации.\n\n[TABLE]\nПоле | Описание\n'
+            'Применимость | Только для подтвержденных заявок\n'
+            'Тип | Выбор из списка: Кварц; Олива\n'
+            ' | После проверки оператора\n\nПоследующее обязательное условие.')
+    packet = '\n\n'.join(_inventory_enum_rows(
+        {'section_path': 'Формы > Создание маршрутизации', 'text': text},
+        'Какие виды маршрутизации?'))
+    assert packet == text
+
+
+def test_inventory_packet_keeps_repeated_governing_conditions_in_source_order():
+    from evidence_selection import _inventory_enum_rows
+    condition_a = 'Применимость следующей таблицы: только режим А.'
+    condition_b = 'Применимость следующей таблицы: только режим Б.'
+    first = '[TABLE]\nПоле | Описание\nТип | Выбор из списка: Кварц; Олива'
+    second = '[TABLE]\nПоле | Описание\nВид | Выбор из списка: Туман; Лилия'
+    unrelated = '[TABLE]\nСтатус | Новый; Закрыт'
+    text = '\n\n'.join([condition_a, first, condition_b, unrelated, condition_a, second])
+    packet = _inventory_enum_rows(
+        {'section_path': 'Формы > Создание маршрутизации', 'text': text},
+        'Какие виды маршрутизации?')
+    assert packet == [condition_a, first, condition_b, condition_a, second]
+    assert packet.count(condition_a) == 2
+
+
+def test_inventory_reservation_keeps_acl_deletion_and_revision_boundaries():
+    path = 'Формы > Создание маршрутизации'
+    def table(values):
+        return 'Документ маршрутизации.\n\n[TABLE]\nПоле | Описание\nТип | Выбор из списка: ' + values
+    active = node(path, table('Кварц; Олива'), file='public.md', revision_id='r2')
+    old = node(path, table('Устаревший; Старый'), file='public.md', revision_id='r1')
+    private = node(path, table('Закрытый; Секретный'), file='private.md')
+    deleted = node(path, table('Удаленный; Неактивный'), file='public.md', status='deleted')
+    result = SectionEvidenceIndex([active, old, private, deleted]).select_v2(
+        'Какие виды маршрутизации?', [hit(active)], allowed_sources={'public.md'},
+        top_k=2, max_chars=2000)
+    text = '\n'.join(item['text'] for item in result)
+    assert 'Кварц; Олива' in text
+    assert not any(value in text for value in ('Устаревший', 'Закрытый', 'Удаленный'))
+    assert all(item['file'] == 'public.md' and item.get('revision_id') == 'r2' for item in result)
+
+
+def test_inventory_reservation_does_not_promote_open_or_unrelated_lists():
+    from evidence_selection import _inventory_enum_rows
+    question = 'Какие виды маршрутизации?'
+    def item(path, text):
+        return {'section_path': path, 'text': text}
+    assert _inventory_enum_rows(item('Формы > Создание охлаждения',
+        '[TABLE]\nПоле | Описание\nТип | Выбор из списка: Кварц; Олива'), question) == []
+    assert _inventory_enum_rows(item('Формы > Создание маршрутизации',
+        '[TABLE]\nПоле | Описание\nТип | Выбор из списка: Кварц; Олива и другие'), question) == []
+    math = '[TABLE]\nПоле | Описание\nТип | Выбор из списка: [MATH: X\n\n+Y]; Олива'
+    assert _inventory_enum_rows(item('Формы > Создание маршрутизации', math), question) == []
+
+
+def test_inventory_path_does_not_reinterpret_negative_scope():
+    positive, excluded = _positive_query('Рассматривай только A, B не рассматривай')
+    assert excluded == ['B'] and 'A' in positive
+    positive, excluded = _positive_query('Не только A, но и B')
+    assert excluded == [] and 'A' in positive and 'B' in positive
+    positive, excluded = _positive_query('Маршрутизация; не рассматривай A')
+    assert excluded == ['A']
+
+
+def test_inventory_mandatory_prelude_is_not_dropped_to_fit_a_small_budget():
+    prelude = 'Типы допустимы только при условии ' + 'проверки действующей заявки ' * 40
+    selector = node('Формы > Создание маршрутизации',
+                    '### Создание маршрутизации\n\n' + prelude
+                    + '\n\n[TABLE]\nПоле | Описание\nТип | Выбор из списка: Кварц; Олива')
+    fallback = node('Маршрутизация', 'Общие сведения о маршрутизации не содержат полного справочника.')
+    result = SectionEvidenceIndex([selector, fallback]).select_v2(
+        'Какие виды маршрутизации?', [hit(selector), hit(fallback)], top_k=2, max_chars=200)
+    assert not any('Кварц; Олива' in item['text'] for item in result)
+    signals = result[0]['selection_signals']
+    assert signals['inventory_enumeration_incomplete']
+    assert signals['missing_inventory_sections'][0]['reason'] == 'atomic-inventory-packet-budget'
+
+
+def test_inventory_profile_is_prepared_once_per_selection(monkeypatch):
+    import evidence_selection as selection
+    original, calls = selection._inventory_subject, []
+    def counted(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(selection, '_inventory_subject', counted)
+    nodes = [node(f'Справочник > Глава {i}', 'Обычное описание формы и доступных действий.')
+             for i in range(30)]
+    nodes.append(node('Формы > Создание маршрутизации',
+                      '[TABLE]\nПоле | Описание\nТип | Выбор из списка: Кварц; Олива'))
+    SectionEvidenceIndex(nodes).select_v2('Какие виды маршрутизации?', [], max_chars=2000)
+    assert len(calls) == 1
+
+
+def test_inventory_overflow_without_a_source_carrier_is_metadata_only():
+    import json
+    prelude = 'Типы допустимы только при условии ' + 'проверки действующей заявки ' * 40
+    selector = node('Формы > Создание маршрутизации',
+                    prelude + '\n\n[TABLE]\nПоле | Описание\nТип | Выбор из списка: Кварц; Олива',
+                    file='catalog.md')
+    fallback = node('Маршрутизация', 'Общие сведения о маршрутизации без полного перечня.',
+                    file='general.md')
+    meta = {}
+    result = SectionEvidenceIndex([selector, fallback]).select_v2(
+        'Какие виды маршрутизации?', [hit(selector), hit(fallback)],
+        allowed_sources={'catalog.md', 'general.md'}, top_k=2, max_chars=200, selection_meta=meta)
+    assert all(item['file'] == 'general.md' for item in result)
+    assert all(not item['selection_signals'].get('inventory_enumeration_incomplete') for item in result)
+    assert meta['inventory_enumeration_incomplete']
+    assert set(meta['inventory_enumeration_scoped_warnings'][0]) == {'reason', 'required_chars', 'available_chars'}
+    assert not any(value in json.dumps(meta, ensure_ascii=False)
+                   for value in ('catalog.md', 'Создание маршрутизации', 'Кварц', 'Олива'))
+    empty_meta = {}
+    empty = SectionEvidenceIndex([selector]).select_v2(
+        'Какие виды маршрутизации?', [hit(selector)], max_chars=1, selection_meta=empty_meta)
+    assert empty == [] and empty_meta['inventory_enumeration_incomplete']
+
+
+@pytest.mark.parametrize('slots', [1, 3, 10])
+def test_inventory_reservations_do_not_raise_the_payload_slot_limit(slots):
+    catalogs = [node(f'Формы > Создание маршрутизации {i}',
+                     'Документ маршрутизации.\n\n[TABLE]\nПоле | Описание\n'
+                     f'Тип | Выбор из списка: Кварц-{i}; Олива-{i}')
+                for i in range(slots + 3)]
+    selected = SectionEvidenceIndex(catalogs).select_v2(
+        'Какие виды маршрутизации?', [hit(item) for item in catalogs],
+        top_k=slots, max_chars=36000)
+    assert len(selected) <= slots
+    assert sum(len(item['text']) for item in selected) <= 36000
+
+
+def test_non_inventory_question_skips_the_inventory_scan(monkeypatch):
+    import evidence_selection as selection
+
+    def unexpected_scan(*args, **kwargs):
+        pytest.fail('An unrelated question must not scan inventory tables')
+
+    monkeypatch.setattr(selection, '_inventory_enum_rows', unexpected_scan)
+    source = node('Маршрутизация', 'Маршрутизация выполняется после проверки заявки.')
+    result = SectionEvidenceIndex([source]).select_v2(
+        'Как выполняется маршрутизация?', [hit(source)], max_chars=2000)
+    assert result

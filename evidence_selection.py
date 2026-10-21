@@ -45,9 +45,30 @@ _CATEGORY_WORDS = {'1': 'первой', '2': 'второй', '3': 'третье�
 _CATEGORY_IDS = {_STEMMER.stem(word): number for number, word in _CATEGORY_WORDS.items()}
 _VERSION_FIELDS = ('document_id', 'source_id', 'revision_id', 'version_id', 'document_version', 'content_hash', 'sha256')
 _ORDINAL_ABBREVIATION = re.compile(r'((?:[а-яё]+\s*(?:,|и)\s*)*[а-яё]+)\s+цк\b', re.I)
+_NUMERIC_ORDINAL_CATEGORY = re.compile(
+    r'(?<![\w.])([1-6])(?:[ \t\u00a0\u202f]*[-\u2010\u2011][ \t\u00a0\u202f]*|[ \t\u00a0\u202f]+)'
+    r'(?:ой|ая|ую|й|я|ю)[ \t\u00a0\u202f]+'
+    r'(?:цк\b|ценов(?:ая|ой|ую|ою|ые|ых|ым|ыми)[ \t\u00a0\u202f]+'
+    r'категори(?:я|и|ю|ей|ею|й|ям|ями|ях)\b)', re.I,
+)
+
+
+def _normalize_numeric_ordinal_categories(text: str) -> str:
+    """Normalize an explicitly named category, never a bare ordinal or count.
+
+    This is a lexical/scoping view only. Native evidence text is not rewritten.
+    Sharing it before both category detection and stemming prevents an ordinal
+    suffix and category boilerplate from competing as semantic subject words.
+    """
+    return _NUMERIC_ORDINAL_CATEGORY.sub(
+        lambda match: _CATEGORY_WORDS[match[1]] + ' ценовой категории', text,
+    )
+
 
 
 def _expand_ordinal_categories(text: str) -> str:
+    text = _normalize_numeric_ordinal_categories(text)
+
     def expand(match):
         words = re.findall(r'[а-яё]+', match[1].casefold().replace('ё', 'е'))
         ordinals = [_CATEGORY_IDS.get(_stem_word(word)) for word in words if word != 'и']
@@ -671,6 +692,7 @@ def _stem_word(word: str) -> str:
 
 @lru_cache(maxsize=8192)
 def term_keys(text: str) -> frozenset[str]:
+    text = _normalize_numeric_ordinal_categories(text)
     # Leading section numbers are not topics, but "2 ЦК" is a topic with an
     # essential category number. Never normalize it to the ambiguous "ЦК".
     text = re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s+(?!цк\b)", "", text, flags=re.I)
@@ -709,6 +731,74 @@ def evidence_role(item: dict) -> str:
 def evidence_id(item: dict) -> str:
     return hashlib.sha256((source_key(item.get("file")) + "\n" + str(item.get("text", ""))).encode()).hexdigest()
 
+
+
+def _inventory_subject(positive: str, groups=None):
+    """Prepare the inventory profile once, separately from domain subjects."""
+    if not re.search(r'какие|перечисл|справочник|перечень|список', positive, re.I):
+        return ()
+    groups = _query_groups(positive) if groups is None else groups
+    kinds = term_keys('виды типы')
+    if not any(group & kinds for group in groups):
+        return ()
+    framing = term_keys('виды типы перечисли перечислить перечень список справочник '
+                        'полный весь основные объясни объяснить различия между ними '
+                        'включая не только категории')
+    return tuple(group for group in groups if not group <= framing)
+
+
+def _inventory_enum_rows(item: dict, question: str = '', *, prepared_subject=None) -> list[str]:
+    """Atomic matching tables and surrounding source prose, not guessed values.
+
+    The leaf/nearest parent must govern the subject. A condition can follow
+    the choices or occupy a separate table row, so rows of a matching table
+    are never pruned. All surrounding prose in this section is mandatory.
+    Native/display math is never split by this plain-table path. This is a
+    structural closure, not a proof that external dependencies are complete.
+    """
+    subject = prepared_subject
+    if subject is None:
+        subject = _inventory_subject(_positive_query(question)[0])
+    if not subject:
+        return []
+    context = ' > '.join(str(item.get('section_path', '')).split(' > ')[-2:])
+    if _group_coverage(subject, term_keys(context)) != 1:
+        return []
+    kinds, found, matched = term_keys('виды типы'), [], False
+    for block in _content_blocks(str(item.get('text', ''))):
+        if '[TABLE]' not in block:
+            found.append(block)
+            continue
+        if re.search(r'\[MATH:|\$\$|\\\[', block):
+            continue
+        starts, offset = [], 0
+        for line in block.splitlines(keepends=True):
+            # Only explicit row separators are boundaries. Wrapped lines and
+            # their source conditions remain in the same row.
+            if '|' in line and line.strip().strip('|').strip():
+                starts.append(offset)
+            offset += len(line)
+        rows = [block[start:end].rstrip('\r\n')
+                for start, end in zip(starts, [*starts[1:], len(block)])]
+        matching = []
+        for row in rows:
+            label, separator, value = row.lstrip(' \t|').partition('|')
+            if not separator or not term_keys(label) & kinds:
+                continue
+            marker = re.search(r'\b(?:выбор\s+из\s+списка|допустим\w*\s+значени\w*)\s*:', value, re.I)
+            if not marker or re.search(r'\bнапример\b|\b(?:и|возможны)\s+други\w*\b|и\s+т\.\s*д\.', value, re.I):
+                continue
+            options = [part.strip() for part in value[marker.end():].split(';') if part.strip()]
+            if len(options) >= 2:  # No expected count or item vocabulary.
+                matching.append(row)
+        if matching:
+            # A different named or empty-label row may constrain these same
+            # choices. No keyword guess can establish that it is disposable.
+            found.append(block)
+            matched = True
+    # Identical wording can govern different following tables. Deduplicating
+    # it would change the source's scope/order, not merely save characters.
+    return found if matched else []
 
 class SectionEvidenceIndex:
     """Group split paragraphs by physical document and complete section path."""
@@ -862,6 +952,7 @@ class SectionEvidenceIndex:
         allowed_sources: set[str] | None = None, top_k: int = 10, max_chars: int = 36000,
         facets: list[str] | None = None,
         resolve_references: bool | None = None,
+        selection_meta: dict | None = None,
     ) -> list[dict]:
         """Coverage-aware evidence packing; legacy ``select`` remains unchanged.
 
@@ -871,6 +962,9 @@ class SectionEvidenceIndex:
         of a document-diversity quota. Conditions/exceptions are retained but
         cannot displace a primary rule unless the question asks for them.
         """
+        if selection_meta is not None:
+            selection_meta.pop('inventory_enumeration_incomplete', None)
+            selection_meta.pop('inventory_enumeration_scoped_warnings', None)
         if top_k <= 0 or max_chars <= 0:
             return []
         reference_enabled = (os.getenv('RAG_REFERENCE_EXPANSION', 'off').casefold() in {'on', 'true', '1'}
@@ -970,7 +1064,7 @@ class SectionEvidenceIndex:
                 return  # An explicitly excluded child heading is not a mixed-topic source paragraph.
             if forbidden_keys & (body | heading) and discriminators and not discriminators & (body | heading):
                 return
-            if reason != 'subject-child' and rank is None and reference is None and max(body_coverage, heading_coverage) < 0.65:
+            if reason not in {'subject-child', 'inventory-enumeration'} and rank is None and reference is None and max(body_coverage, heading_coverage) < 0.65:
                 return
             support = pool.get(identity)
             covered = {label for label, keys in facet_groups.items()
@@ -1057,6 +1151,23 @@ class SectionEvidenceIndex:
                     if evidence_role(child) != 'exception':
                         facet_groups.setdefault(label, ())
                     offer(child, 'subject-child', structural_facet=label)
+
+        # Finite UI field choices can be stronger inventory evidence than a
+        # family of examples. Prepare intent once; all offers retain existing
+        # visibility/version/category/negative constraints and source wording.
+        inventory_subject = _inventory_subject(positive, groups)
+        for section in (sections if inventory_subject else ()):
+            if not visible(section):
+                continue
+            rows = _inventory_enum_rows(section, prepared_subject=inventory_subject)
+            if not rows:
+                continue
+            label = 'inventory:' + source_key(section['file']) + '::' + section['section_path']
+            # A structural reservation must not add requested facets and
+            # thereby increase the existing derived payload-slot limit.
+            offer(section, 'inventory-enumeration', structural_facet=label)
+            if evidence_id(section) in pool:
+                pool[evidence_id(section)]['_inventory_rows'] = rows
 
         # Narrow / negative requests are intentionally not expanded into a
         # complete sibling family. Ordinary subject children remain unchanged.
@@ -1151,6 +1262,7 @@ class SectionEvidenceIndex:
         # separate, and category/source/negative restrictions remain enforced.
         selected, covered, used, families = [], set(), 0, {}
         family_used = 0
+        incomplete_inventory = []
         limit = max(top_k, min(24, len(facet_groups) + min(2, len(roots))))
         complete_family_fits = bool(sibling_family and len(sibling_family['children']) <= min(12, limit)
                                    and sibling_family['total_chars'] <= min(6000, max_chars))
@@ -1158,6 +1270,7 @@ class SectionEvidenceIndex:
             def priority(item):
                 family = (source_key(item.get('file')), str(item.get('section_path', '')).rsplit(' > ', 1)[0])
                 return (not wants_exception and item['evidence_role'] == 'exception',
+                        not bool(item.get('_inventory_rows')),
                         not bool(item.get('_family_id')),
                         -(item['_score'] + 2.2 * len(item['_facets'] - covered)
                           - 0.25 * families.get(family, 0)), item['_rank'], item.get('position', 100000))
@@ -1180,6 +1293,27 @@ class SectionEvidenceIndex:
             if candidate.get('_family_id'):
                 budget = min(budget, max(0, 6000 - family_used))
             excerpt_signals = {}
+            if candidate.get('_inventory_rows'):
+                excerpt_signals['inventory_enumeration_reserved'] = True
+                if len(text) > budget:
+                    packet = '\n\n'.join(candidate['_inventory_rows'])
+                    if len(packet) > budget:
+                        # Whole matching tables and surrounding source prose
+                        # are atomic: never drop conditions or enum values.
+                        incomplete_inventory.append({
+                            'file': item.get('file'), 'section_path': item.get('section_path'),
+                            '_revision': {key: item[key] for key in _VERSION_FIELDS if item.get(key)},
+                            'reason': 'atomic-inventory-packet-budget',
+                            'required_chars': len(packet), 'available_chars': budget})
+                        continue
+                    item['text'] = packet
+                    item['evidence_truncated'] = True
+                    item['evidence_excerpt'] = True
+                    text = packet
+                    packet_keys = term_keys(packet) | term_keys(str(item.get('section_title', '')))
+                    candidate['_facets'] = {label for label in candidate['_facets']
+                                            if not facet_groups.get(label)
+                                            or _group_coverage(facet_groups[label], packet_keys) >= 0.7}
             if len(text) > budget:
                 excerpt, indices = _focused_excerpt(text, budget, groups, facet_groups,
                                                     question=positive, diagnostics=excerpt_signals)
@@ -1220,6 +1354,24 @@ class SectionEvidenceIndex:
             covered.update(actual_facets)
             family = (source_key(item.get('file')), str(item.get('section_path', '')).rsplit(' > ', 1)[0])
             families[family] = families.get(family, 0) + 1
+        scoped_inventory_warnings = []
+        for warning in incomplete_inventory:
+            carrier = next((item for item in selected
+                            if source_key(item.get('file')) == source_key(warning['file'])
+                            and _version_compatible(item, warning['_revision'])), None)
+            if carrier is not None:
+                signals = carrier['selection_signals']
+                signals['inventory_enumeration_incomplete'] = True
+                signals.setdefault('missing_inventory_sections', []).append({
+                    key: value for key, value in warning.items() if key not in {'file', '_revision'}})
+            else:
+                # Out-of-context identities/locators never hitchhike on an
+                # unrelated evidence item. Return only source-free metadata.
+                scoped_inventory_warnings.append({key: warning[key] for key in
+                    ('reason', 'required_chars', 'available_chars')})
+        if scoped_inventory_warnings and selection_meta is not None:
+            selection_meta.update({'inventory_enumeration_incomplete': True,
+                                   'inventory_enumeration_scoped_warnings': scoped_inventory_warnings})
         if sibling_family and selected:
             bounded_children = sibling_family['children'][:12]
             expected = [child['section_path'] for child in bounded_children]

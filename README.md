@@ -23,8 +23,9 @@ deployment.
 - [User guide](docs/USER_GUIDE_RU.md) — detailed Russian-language instructions.
 - [Architecture](architecture.md) — current runtime and data-flow boundaries.
 - [Deployment](DEPLOYMENT.md) — production deployment, verification, backup, and rollback.
-- [Production readiness report](docs/PRODUCTION_READINESS_REPORT.md) — implemented guarantees and test coverage.
+- [Historical production report](docs/PRODUCTION_READINESS_REPORT.md) — release-scoped capabilities and tests, not current answer-quality certification.
 - [RAG quality gate](docs/QUALITY_EVALUATION.md) — corpus-level 9/10 acceptance method.
+- [Context ablation](docs/ORACLE_CONTEXT_EVALUATION.md) — isolate evidence-selection errors from generation errors.
 - [Evidence-first pipeline](docs/CORRECTIVE_RAG.md) — bounded corrective search, traces, evaluation and rollback.
 - Live API schema: `/api/openapi.json`; Swagger UI: `/docs`.
 

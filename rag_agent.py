@@ -3530,7 +3530,7 @@ class RAGAgent:
         return dict(getattr(getattr(self,"_generation_state",None),"retrieval_trace",{}) or {})
 
     def _ask_corrective(self, question: str, search_question: str, system_prompt: str | None, **scope):
-        from corrective_rag import run_corrective
+        from corrective_rag import run_corrective, EvidenceSelection
         completions = []
         # A settings change in another chat must not switch this multi-stage
         # request to a different model/provider midway through its evidence.
@@ -3586,14 +3586,17 @@ class RAGAgent:
             if index is None:
                 index = SectionEvidenceIndex(self._all_nodes)
             explicit = matching_explicit_sources(original,scope.get('source_aliases'))
+            selection_meta = {}  # Fresh per call: never share limits across rounds or chats.
             packed = index.select_v2(original,pool,excluded_sources=scope.get('excluded_sources'),
                 allowed_sources=explicit or (set(scope['source_aliases']) if scope.get('source_aliases') is not None else None),
-                top_k=TOP_K,max_chars=int(os.getenv('RAG_EVIDENCE_MAX_CHARS','36000')),facets=facets)
-            from evidence_anchors import reconcile_evidence_families
+                top_k=TOP_K,max_chars=int(os.getenv('RAG_EVIDENCE_MAX_CHARS','36000')),facets=facets,
+                selection_meta=selection_meta)
+            from evidence_anchors import reconcile_evidence_families, inventory_limits_after_filter
             scoped = filter_scoped_evidence(packed,original,source_aliases=scope.get('source_aliases'),
                 excluded_sources=scope.get('excluded_sources'),source_versions=scope.get('source_versions'),
                 spec=refine_prism_query(original))
-            return reconcile_evidence_families(scoped,packed)
+            scoped = reconcile_evidence_families(scoped,packed)
+            return EvidenceSelection(scoped,inventory_limits_after_filter(selection_meta,packed,scoped))
 
         excluded = {Path(str(source)).name.casefold() for source in scope.get('excluded_sources') or ()}
         explicit = matching_explicit_sources(search_question,scope.get('source_aliases'))

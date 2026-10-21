@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import hashlib
 from bisect import bisect_right
+from itertools import chain
 from typing import Any, Mapping, Sequence
 
 
@@ -19,6 +20,120 @@ _EVIDENCE_ID = re.compile(r"E[1-9]\d*\Z")
 _MATH_START = re.compile(r"\$\$|\\\[|\\\(|\[MATH(?::|\])|(?<!\$)\$(?!\$)", re.I)
 _PARAGRAPH_BREAK = re.compile(r"\r?\n[ \t]*(?:\r?\n)+")
 _SENTENCE_BREAK = re.compile(r"[.!?;][ \t\r\n]+")
+_INVENTORY_WARNING_REASONS = ('atomic-inventory-packet-budget', 'inventory-selection-incomplete')
+_MAX_INVENTORY_CARRIER_ROWS = 8
+_MAX_INVENTORY_SECTION_PATH_CHARS = 512
+
+
+def _inventory_warning(row):
+    """A scoped warning has no source identity, including inside its values."""
+    if not isinstance(row, Mapping):
+        return None
+    if not all(type(row.get(key)) is int and row[key] >= 0
+               for key in ('required_chars', 'available_chars')):
+        return None
+    reason = row.get('reason')
+    return {'reason': reason if reason == 'atomic-inventory-packet-budget' else 'inventory-selection-incomplete',
+            'required_chars': row['required_chars'], 'available_chars': row['available_chars']}
+
+
+def _inventory_budget_order(row):
+    return (row['required_chars'] - row['available_chars'],
+            row['required_chars'], row['available_chars'])
+
+
+def _representative_inventory_warnings(rows):
+    """At most one real worst-budget row per reason, never an exhaustive list."""
+    worst = {}
+    for row in rows:
+        warning = _inventory_warning(row)
+        if warning is None:
+            continue
+        reason = warning['reason']
+        if reason not in worst or _inventory_budget_order(warning) > _inventory_budget_order(worst[reason]):
+            worst[reason] = warning
+    return [worst[reason] for reason in _INVENTORY_WARNING_REASONS if reason in worst]
+
+
+def inventory_carrier_signals(signals):
+    """Keep bounded representative locators only on the retained source carrier."""
+    if not isinstance(signals, Mapping):
+        return {}
+    rows = signals.get('missing_inventory_sections')
+    incomplete = signals.get('inventory_enumeration_incomplete') is True or bool(rows)
+    if not incomplete:
+        return {}
+    missing = []
+    for row in rows if isinstance(rows, list) else ():
+        warning = _inventory_warning(row)
+        path = row.get('section_path') if isinstance(row, Mapping) else None
+        if (warning and isinstance(path, str) and path.strip()
+                and len(path) <= _MAX_INVENTORY_SECTION_PATH_CHARS):
+            candidate = {'section_path': path, **warning}
+            if candidate not in missing:
+                missing.append(candidate)
+                missing.sort(key=lambda item: (*_inventory_budget_order(item),
+                                               item['reason'], item['section_path']), reverse=True)
+                del missing[_MAX_INVENTORY_CARRIER_ROWS:]
+    return {'inventory_enumeration_incomplete': True, 'missing_inventory_sections': missing}
+
+
+def normalize_inventory_evidence(evidence):
+    """Share eight representative locators; never trim text or change its scope."""
+    result = []
+    remaining = _MAX_INVENTORY_CARRIER_ROWS
+    for item in evidence:
+        record = dict(item)
+        signals = item.get('selection_signals')
+        if isinstance(signals, Mapping):
+            record['selection_signals'] = {
+                key: value for key, value in signals.items()
+                if key not in ('inventory_enumeration_incomplete', 'missing_inventory_sections')}
+            inventory = inventory_carrier_signals(signals)
+            if inventory:
+                inventory['missing_inventory_sections'] = inventory['missing_inventory_sections'][:remaining]
+                remaining -= len(inventory['missing_inventory_sections'])
+            record['selection_signals'].update(inventory)
+        result.append(record)
+    return result
+
+
+def normalize_inventory_selection_limits(limits):
+    """Allow only bounded source-free representatives across selection boundaries."""
+    if not isinstance(limits, Mapping):
+        return {}
+    rows = limits.get('inventory_enumeration_scoped_warnings')
+    if limits.get('inventory_enumeration_incomplete') is not True and not rows:
+        return {}
+    return {'inventory_enumeration_incomplete': True,
+            'inventory_enumeration_scoped_warnings':
+                _representative_inventory_warnings(rows if isinstance(rows, list) else ())}
+
+
+def inventory_limits_after_filter(limits, before, after):
+    """A removed carrier leaves a coarse warning, never its source/path/name.
+
+    Inputs are an already scoped selection and its retained subset. This does
+    not look up documents or reattach a carrier to unrelated evidence.
+    """
+    result = normalize_inventory_selection_limits(limits)
+    identity = lambda item: tuple(item.get(key) for key in (
+        'file', 'section_path', 'document_id', 'source_id', 'revision_id', 'version_id',
+        'document_version', 'content_hash', 'sha256'))
+    retained = {identity(item) for item in after
+                if inventory_carrier_signals(item.get('selection_signals'))}
+    for item in before:
+        signals = inventory_carrier_signals(item.get('selection_signals'))
+        if not signals or identity(item) in retained:
+            continue
+        result['inventory_enumeration_incomplete'] = True
+        # Read original rows: a long/omitted locator still carries a real budget
+        # warning, but no source identity may cross the removed-carrier boundary.
+        rows = item.get('selection_signals', {}).get('missing_inventory_sections')
+        result['inventory_enumeration_scoped_warnings'] = _representative_inventory_warnings(chain(
+            result.get('inventory_enumeration_scoped_warnings', []),
+            rows if isinstance(rows, list) else ()))
+    return result
 
 
 def reconcile_evidence_families(evidence, provenance=None):
@@ -228,16 +343,18 @@ def build_evidence_anchors(evidence: Sequence[Mapping[str, Any]]) -> dict[str, d
 
 def evidence_anchor_payload(evidence: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Compact source payload for selecting passage IDs instead of typing quotes."""
-    records = _records(evidence)
+    records = normalize_inventory_evidence(_records(evidence))
     anchors = build_evidence_anchors(records)
     return [{"evidence_id": item["evidence_id"], "file": item.get("file"), "section_path": item.get("section_path"),
              "applicability": item.get("applicability"),
              **{key:item[key] for key in ('reference_from','reference_target','evidence_family') if item.get(key) is not None},
              **({'selection_limits':{key:item['selection_signals'][key] for key in
                     ('scoped_cohort_incomplete','definition_closure_incomplete','missing_definition_symbols')
-                    if item['selection_signals'].get(key)}}
+                    if item['selection_signals'].get(key)}
+                    | inventory_carrier_signals(item.get('selection_signals'))}
                 if any(item.get('selection_signals',{}).get(key) for key in
-                       ('scoped_cohort_incomplete','definition_closure_incomplete')) else {}),
+                       ('scoped_cohort_incomplete','definition_closure_incomplete',
+                        'inventory_enumeration_incomplete','missing_inventory_sections')) else {}),
              "version_status": item.get("version_status", item.get("status")),
              "passages": [{"passage_id": passage_id, "text": passage["text"]}
                           for passage_id, passage in anchors.items() if passage["evidence_id"] == item["evidence_id"]]}

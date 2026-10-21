@@ -1,5 +1,11 @@
 # Production readiness report
 
+> Historical release snapshot, not current semantic-quality certification.
+> The 2026-10-21 review found substantial answer errors outside the old acceptance
+> examples. Test counts and source recall below do not establish general 9/10
+> answer quality. See [current quality criteria](QUALITY_EVALUATION.md) and the
+> [context-isolation experiment](ORACLE_CONTEXT_EVALUATION.md).
+
 Date: 2026-09-10. Canonical branch: `dev`. Active application and frontend
 release: `9fc3b2e8c`. Rollback release: `47fa298eb`.
 

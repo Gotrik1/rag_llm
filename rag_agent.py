@@ -3589,9 +3589,11 @@ class RAGAgent:
             packed = index.select_v2(original,pool,excluded_sources=scope.get('excluded_sources'),
                 allowed_sources=explicit or (set(scope['source_aliases']) if scope.get('source_aliases') is not None else None),
                 top_k=TOP_K,max_chars=int(os.getenv('RAG_EVIDENCE_MAX_CHARS','36000')),facets=facets)
-            return filter_scoped_evidence(packed,original,source_aliases=scope.get('source_aliases'),
+            from evidence_anchors import reconcile_evidence_families
+            scoped = filter_scoped_evidence(packed,original,source_aliases=scope.get('source_aliases'),
                 excluded_sources=scope.get('excluded_sources'),source_versions=scope.get('source_versions'),
                 spec=refine_prism_query(original))
+            return reconcile_evidence_families(scoped,packed)
 
         excluded = {Path(str(source)).name.casefold() for source in scope.get('excluded_sources') or ()}
         explicit = matching_explicit_sources(search_question,scope.get('source_aliases'))

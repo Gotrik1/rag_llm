@@ -324,6 +324,62 @@ def _formula_dependencies(blocks, question, groups):
     return roots + dependencies, definitions
 
 
+def _scoped_cohorts(blocks, question, groups):
+    """Keep a compact applicability clause and its native enumeration atomic."""
+    requested = _category_ids(question)
+    overview = bool(re.search(r'какие|перечисл|обзор|виды|состав|структур|этапы|что\s+входит', question, re.I))
+    category_keys = _CATEGORY_STEMS | term_keys('ценовая категория')
+    if not overview and any(not group <= category_keys for group in groups):
+        return []
+
+    def mode_ids(value):
+        # Explicit local identifiers, not a maintained list of mode names.
+        return {match[1].casefold() for match in re.finditer(
+            r'\b(?i:режим\w*|вариант\w*|mode|variant)\s+([A-ZА-ЯЁ][A-Za-zА-Яа-яЁё0-9_-]{0,20}|\d+)\b', value,
+        )}
+
+    requested_modes = mode_ids(question)
+    cohorts = []
+    for number, block in enumerate(blocks):
+        if len(block) > 700 or _math_expressions(block) or '[TABLE]' in block:
+            continue
+        if not re.match(r'\s*(?:Применени[ея]\b|Для\b|Режим\b|При\b)', block, re.I):
+            continue
+        scope = _category_ids(block)
+        if requested and (not scope or not requested & scope):
+            continue
+        modes = mode_ids(block)
+        if requested_modes and modes and not requested_modes & modes:
+            continue
+        if not requested and not _group_coverage(groups, term_keys(block)):
+            continue
+        core, count = [number], 0
+        for following in range(number + 1, len(blocks)):
+            value = blocks[following]
+            if re.match(r'\s*(?:Где\b|Здесь\b|Обозначения\b|#{1,6}\s|\[TABLE\]|Применени[ея]\b|Режим\b|Для\b|При\b)', value, re.I):
+                break
+            if len(value) < 100 and re.fullmatch(r'\s*(?:Формул[аы]|Расчет|Состав)\s*:\s*', value, re.I):
+                core.append(following)
+                continue
+            expressions = _math_expressions(value)
+            equations = sum('=' in expression for expression in expressions)
+            list_items = len(re.findall(r'(?m)^\s*(?:[-*•]|\d+[.)])\s+\S', value))
+            if '|' in value or not (equations or list_items):
+                break
+            core.append(following)
+            count += max(equations, list_items)
+            if count > 8 or sum(len(blocks[position]) for position in core) > 2000:
+                break
+        if count < 2:
+            continue
+        size = sum(len(blocks[position]) for position in core)
+        cohorts.append({'anchor': number, 'core': core, 'scope_categories': sorted(scope),
+                        'bounded': count <= 8 and size <= 2000})
+        if len(cohorts) == 3:
+            break
+    return cohorts
+
+
 def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnostics=None):
     """Pack relevant whole paragraphs with neighbors, in source order.
 
@@ -346,10 +402,13 @@ def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnos
     marker = '\n\n[ПРОПУСК АБЗАЦЕВ]\n\n'
     guarded = {number: _equation_guards(blocks, number) for number, block in enumerate(blocks)
                if any('=' in expression for expression in _math_expressions(block))}
+    cohorts = _scoped_cohorts(blocks, question, groups)
+    atomic = {position: cohort['core'] for cohort in cohorts if cohort['bounded'] for position in cohort['core']}
 
     def reserve(positions):
         nonlocal size
         positions = set(positions)
+        positions.update(member for position in list(positions) for member in atomic.get(position, ()))
         positions.update(guard for position in list(positions) for guard in guarded.get(position, ()))
         positions -= selected
         cost = sum(len(blocks[position]) + len(marker) for position in positions)
@@ -359,6 +418,13 @@ def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnos
         size += cost
         return True
 
+    cohort_blocks, incomplete_cohorts = [], []
+    for cohort in cohorts:
+        if cohort['bounded'] and reserve(cohort['core']):
+            cohort_blocks.append(cohort['core'])
+        else:
+            incomplete_cohorts.append({'anchor': cohort['anchor'], 'scope_categories': cohort['scope_categories'],
+                                       'reason': 'payload-budget' if cohort['bounded'] else 'cohort-limit'})
     packages, definitions = _formula_dependencies(blocks, question, groups)
     formula_blocks = []
     # The mandatory equation + its short applicability lead-in is reserved
@@ -375,6 +441,8 @@ def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnos
             if symbol in definitions:
                 reserve([definitions[symbol][1]])
     if diagnostics is not None:
+        diagnostics['scoped_cohort_blocks'] = cohort_blocks
+        diagnostics['scoped_cohort_incomplete'] = incomplete_cohorts
         diagnostics['formula_dependency_blocks'] = formula_blocks
         diagnostics['formula_dependency_max_hops'] = 1
     for number in order:
@@ -423,6 +491,64 @@ def _section_locator(item: dict) -> str:
     leaf = str(item.get('section_title') or item.get('section_path', '').rsplit('>', 1)[-1]).strip(' #*')
     match = re.match(r'(?:пункт\s+|подпункт\s+|раздел\s+)?(\d+(?:\.\d+)*)(?!\d)', leaf, re.I)
     return match[1] if match else ''
+
+
+def _sibling_family(sections, candidates, groups, visible, requested):
+    """Find one compact, topic-governed family, not arbitrary neighboring hits.
+
+    Two independently relevant children or an exact governing topic parent
+    are required. The parent's own topic must cover the full requested subject:
+    one named method must not import all other methods sharing an ancestor.
+    """
+    structural = term_keys('виды способы методы алгоритмы порядок основные возможные выполняется проводится осуществляется работает')
+    subject = tuple(group for group in groups if not group <= structural)
+    if not subject:
+        return None
+    seeds, governing = {}, set()
+    for item in candidates:
+        path = str(item.get('section_path', ''))
+        if item.get('reference_from') or item['evidence_role'] == 'exception':
+            continue
+        revision = tuple(str(item.get(field) or '') for field in _VERSION_FIELDS)
+        if _group_coverage(subject, term_keys(path.rsplit(' > ', 1)[-1])) == 1:
+            key = source_key(item['file']), path, revision
+            governing.add(key)
+            seeds.setdefault(key, []).append(item)
+        if ' > ' in path and (item['selection_reason'] == 'subject-child'
+                               or max(item['_heading_coverage'], item['_local_coverage']) >= 0.65):
+            parent = path.rsplit(' > ', 1)[0]
+            if _group_coverage(subject, term_keys(parent.rsplit(' > ', 1)[-1])) == 1:
+                seeds.setdefault((source_key(item['file']), parent, revision), []).append(item)
+    choices = []
+    for (file, parent, revision), members in seeds.items():
+        if (file, parent, revision) not in governing and len({item['section_path'] for item in members}) < 2:
+            continue
+        children = {}
+        for child in sections:
+            if source_key(child['file']) != file or not visible(child) or not _version_compatible(members[0], child):
+                continue
+            path = str(child.get('section_path', ''))
+            if not path.startswith(parent + ' > ') or ' > ' in path[len(parent) + 3:]:
+                continue
+            scope = _scope_categories(child)
+            if requested and scope and not requested & scope:
+                continue
+            if evidence_role(child) == 'exception' or not _substantive_text(child.get('text', ''), child.get('section_title', '')):
+                continue
+            if any(not _version_compatible(child, previous) for previous in children.values()):
+                children = {}  # An unknown-version seed cannot join conflicting revisions.
+                break
+            children.setdefault(child['section_path'], child)
+        if len(children) < 2:
+            continue
+        ordered = sorted(children.values(), key=lambda child: child.get('position', 100000))
+        identity = hashlib.sha256((file + '\n' + parent + '\n' + repr(revision)).encode()).hexdigest()[:16]
+        choices.append({
+            'id': identity, 'file': members[0]['file'], 'parent_section_path': parent, 'children': ordered,
+            'total_chars': sum(len(child['text']) for child in ordered),
+            'score': sum(item['_score'] for item in members) / len(members) + min(3, len(members)),
+        })
+    return max(choices, key=lambda family: family['score']) if choices else None
 
 
 @lru_cache(maxsize=65536)
@@ -722,6 +848,8 @@ class SectionEvidenceIndex:
             # with the desired topic. Require its positive distinguishing term.
             discriminators = positive_keys - frozenset().union(*(term_keys(value) for value in forbidden)) if forbidden else positive_keys
             discriminators = contrast_keys or (discriminators - _CATEGORY_STEMS - term_keys('ценовая категория'))
+            if forbidden_keys and forbidden_keys <= heading and not positive_keys & heading:
+                return  # An explicitly excluded child heading is not a mixed-topic source paragraph.
             if forbidden_keys & (body | heading) and discriminators and not discriminators & (body | heading):
                 return
             if reason != 'subject-child' and rank is None and reference is None and max(body_coverage, heading_coverage) < 0.65:
@@ -812,6 +940,17 @@ class SectionEvidenceIndex:
                         facet_groups.setdefault(label, ())
                     offer(child, 'subject-child', structural_facet=label)
 
+        # Narrow / negative requests are intentionally not expanded into a
+        # complete sibling family. Ordinary subject children remain unchanged.
+        sibling_family = None
+        if not forbidden and not wants_exception:
+            sibling_family = _sibling_family(sections, list(pool.values()), groups, visible, requested)
+            if sibling_family:
+                for child in sibling_family['children'][:12]:
+                    offer(child, 'subject-child')
+                    if evidence_id(child) in pool:
+                        pool[evidence_id(child)]['_family_id'] = sibling_family['id']
+
         if reference_enabled:
             # One-hop only: origins are frozen before targets are appended.
             # Category applicability can be inherited only through a verbatim,
@@ -889,11 +1028,15 @@ class SectionEvidenceIndex:
         # review decide its utility. Literal named-entity constraints above are
         # separate, and category/source/negative restrictions remain enforced.
         selected, covered, used, families = [], set(), 0, {}
+        family_used = 0
         limit = max(top_k, min(24, len(facet_groups) + min(2, len(roots))))
+        complete_family_fits = bool(sibling_family and len(sibling_family['children']) <= min(12, limit)
+                                   and sibling_family['total_chars'] <= min(6000, max_chars))
         while candidates and len(selected) < limit:
             def priority(item):
                 family = (source_key(item.get('file')), str(item.get('section_path', '')).rsplit(' > ', 1)[0])
                 return (not wants_exception and item['evidence_role'] == 'exception',
+                        not bool(item.get('_family_id')),
                         -(item['_score'] + 2.2 * len(item['_facets'] - covered)
                           - 0.25 * families.get(family, 0)), item['_rank'], item.get('position', 100000))
 
@@ -908,6 +1051,12 @@ class SectionEvidenceIndex:
             # not a quota for different physical documents or a larger top_k.
             remaining_slots = min(limit - len(selected), len(candidates) + 1)
             budget = max(0, remaining // max(1, remaining_slots))
+            if complete_family_fits and candidate.get('_family_id'):
+                # Reserve each complete child's native payload as a bundle,
+                # while retaining separate evidence identities and locators.
+                budget = min(remaining, len(text))
+            if candidate.get('_family_id'):
+                budget = min(budget, max(0, 6000 - family_used))
             excerpt_signals = {}
             if len(text) > budget:
                 excerpt, indices = _focused_excerpt(text, budget, groups, facet_groups,
@@ -924,6 +1073,8 @@ class SectionEvidenceIndex:
             else:
                 actual_facets = candidate['_facets']
             item['coverage_facets'] = sorted(actual_facets)
+            if candidate.get('_family_id'):
+                item['evidence_family_id'] = candidate['_family_id']
             item['selection_score'] = round(candidate['_score'], 4)
             item['selection_signals'] = {
                 'heading_coverage': round(candidate['_heading_coverage'], 4),
@@ -942,9 +1093,32 @@ class SectionEvidenceIndex:
                 item['excluded_topics'] = forbidden
             selected.append(item)
             used += len(item['text'])
+            if candidate.get('_family_id'):
+                family_used += len(item['text'])
             covered.update(actual_facets)
             family = (source_key(item.get('file')), str(item.get('section_path', '')).rsplit(' > ', 1)[0])
             families[family] = families.get(family, 0) + 1
+        if sibling_family and selected:
+            bounded_children = sibling_family['children'][:12]
+            expected = [child['section_path'] for child in bounded_children]
+            members = [item for item in selected if item.get('evidence_family_id') == sibling_family['id']]
+            present = {item['section_path'] for item in members}
+            missing = [path for path in expected if path not in present]
+            excerpted = [item['section_path'] for item in members if item.get('evidence_excerpt')]
+            complete = len(present) == len(sibling_family['children']) and not excerpted
+            anchor = members[0] if members else selected[0]
+            anchor['evidence_family'] = {
+                'id': sibling_family['id'], 'file': sibling_family['file'],
+                'parent_section_path': sibling_family['parent_section_path'],
+                'basis': 'eligible-direct-children', 'complete': complete,
+                'expected_children': expected, 'selected_children': [item['section_path'] for item in members],
+                'missing_children': missing, 'excerpted_children': excerpted,
+                'omitted_children_count': max(0, len(sibling_family['children']) - 12),
+                'total_children': len(sibling_family['children']), 'max_children': 12, 'max_bundle_chars': 6000,
+                'incomplete_reason': (None if complete else 'family-limit' if len(sibling_family['children']) > 12
+                                      else 'family-char-limit' if sibling_family['total_chars'] > 6000
+                                      else 'payload-or-slot-budget'),
+            }
         return selected
 
     def select(

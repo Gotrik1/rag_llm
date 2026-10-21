@@ -1587,6 +1587,8 @@ class Handler(BaseHTTPRequestHandler):
         latest_check = verification.get('after_repair',verification.get('initial',{}))
         if retrieval_trace.get('mode')=='corrective' and latest_check and not latest_check.get('assessment_complete'):
             warnings.append('Автоматическая проверка доказательств выполнена не полностью. Проверьте существенные выводы по ссылкам на документы.')
+        if retrieval_trace.get('mode')=='corrective' and not retrieval_trace.get('coverage_complete'):
+            warnings.append('Не все части вопроса удалось покрыть источниками. Ответ может быть неполным; проверьте ограничения и ссылки на документы.')
         retrieval_trace['conversation_context'] = resolve_conversation_context(
             question,scope.get('messages',[]),chat_id=chat_id,
             occurrence_question=is_document_occurrence_question(question),

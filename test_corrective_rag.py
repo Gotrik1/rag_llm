@@ -83,6 +83,15 @@ def test_planner_json_contract_is_not_user_answer_style():
     assert '"style": "JSON"' not in next(p for s,p in model.calls if s=='answer')
 
 
+def test_incomplete_direct_child_family_cannot_be_certified_as_complete_by_model():
+    data = fragment(evidence_family_id='f',evidence_family={'id':'f','file':'Проверка каналов.md',
+        'expected_children':['Основной порядок','Другой метод'],'total_children':2,'complete':False})
+    result = run_corrective(QUESTION,QUESTION,retrieve=Retrieval([data]),complete=Model())
+    assert result.trace['coverage_complete'] is False
+    assert result.trace['rounds'][0]['coverage']['conflicts']
+    assert result.answer == FACT+' [E1]'
+
+
 def test_string_answer_envelope_is_decoded_before_claim_and_formula_checks():
     model = Model(answers=['```json\n'+json.dumps({'answer':FACT+' [E1]','sources':['E1']},ensure_ascii=False)+'\n```'])
     result = run_corrective(QUESTION,QUESTION,retrieve=Retrieval(),complete=model)

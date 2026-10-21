@@ -116,6 +116,8 @@ def assess_coverage(plan: SearchPlan, evidence: list[dict], complete: Callable[[
 Выбирай только существующие passage_id. Цитаты программа извлечёт дословно сама; не переписывай их в JSON.
 Проверь, что частный случай не подменяет основное правило, а краткое перечисление не выдается за полный справочник.
 Для сравнения нужны обе стороны; для общего обзора — общая структура, не одна произвольно выбранная категория.
+evidence_family перечисляет непосредственные пункты одного порядка. При complete=false нельзя объявлять перечень полным; missing_children и excerpted_children обозначают конкретные пробелы.
+selection_limits.scoped_cohort_incomplete означает, что компактный блок области применения и его списка не поместился целиком. Не выдавай оставшийся кусок за полный порядок.
 Сетевой и покупной компоненты, разные редакции, условия договора не смешивать. Отрицательные ограничения обязательны.
 Если доказательств нет, оставь требование непокрытым и предложи точечный запрос. Не угадывай факты из знаний модели.
 '''+json.dumps({'requirements':requirements,'exclusions':plan.exclusions,
@@ -151,6 +153,12 @@ def assess_coverage(plan: SearchPlan, evidence: list[dict], complete: Callable[[
         conflicts = _strings(data.get('conflicts'),4)
     except Exception:
         assessed=False
+    incomplete_families = [item['evidence_family'] for item in evidence
+                          if item.get('evidence_family') and not item['evidence_family'].get('complete')]
+    if incomplete_families:
+        conflicts.append('Не полностью переданы подразделы релевантного порядка; перечень нельзя объявить полным.')
+    if any(item.get('selection_signals',{}).get('scoped_cohort_incomplete') for item in evidence):
+        conflicts.append('Не целиком передан блок условий и связанного перечня; покрытие может быть неполным.')
     missing = [row for row in requirements if row['id'] not in covered]
     return {'assessed':assessed,'complete':assessed and not missing and not conflicts,
             'covered_requirements':sorted(covered),'missing_requirements':missing,
@@ -163,10 +171,13 @@ def generation_prompt(question: str, plan: SearchPlan, evidence: list[dict], cov
 Ответь по-русски на исходный вопрос, используя только доказательства ниже.
 Сначала основное правило, затем условия и исключения. Сохраняй выбранный пользователем предмет и ограничения.
 Различай определение величины, её цену за единицу и итоговую стоимость: произведение количества на цену — стоимость, не цена.
-Виды услуг не подменяй перечнем всех компонентов цены. Отсылки источника к другому разделу требуют этого раздела, а не догадки.
+Учитывай естественную пользовательскую перефразировку терминов. При нескольких близких трактовках явно обозначь выбранную по источникам трактовку и кратко различи варианты, а не подменяй предмет или отказывай при наличии прямых сведений.
+Отсылки источника к другому разделу требуют этого раздела, а не догадки.
 Каждое существенное утверждение/формула должно иметь ссылку [E1] на конкретное доказательство; никаких выдуманных ID.
 Ссылки на исходники будут сформированы программой. Не выводи внутренний план, JSON или рассуждения.
 Не объединяй разные формулы, не добавляй коэффициенты/слагаемые. Сохраняй исходные обозначения и область применения.
+Обязательные условия включения компонента и настройки его применимости — часть основного правила, а не необязательная деталь.
+Если единицы или редакции противоречат друг другу, явно обозначь конфликт. Не выбирай молча удобную единицу, не придумывай согласование размерностей или коэффициент пересчета.
 Если точная формула не подтверждена, дай подтвержденное словесное объяснение и явно обозначь пробел.
 Неразборчивая OCR-формула не является проверенной. Не угадывай ее индексы.
 В native_formulae программа уже перевела исходные MATH-объекты в LaTeX без изменения знаков и индексов.
@@ -214,6 +225,7 @@ def run_corrective(question: str, search_question: str, *, retrieve: Callable,
                    system_prompt: str='', max_additional_rounds: int=2,
                    max_context_chars: int=36000, corpus_hints: list[dict] | None=None) -> CorrectiveResult:
     from grounding_verifier import verify_grounding, build_grounding_judge_prompt, build_numeric_rules
+    from evidence_anchors import reconcile_evidence_families
     start = time.perf_counter()
     plan = make_plan(search_question,complete,corpus_hints=corpus_hints)
     trace = {'version':'corrective-v1','plan':asdict(plan),'rounds':[],'verification':{},'from_cache':False}
@@ -236,7 +248,12 @@ def run_corrective(question: str, search_question: str, *, retrieve: Callable,
         pool = assign_evidence([*found,*pool],max_chars=2*max_context_chars,id_registry=id_registry)
         packed = select(search_question,pool,list(plan.requirements)) if select else pool
         context = assign_evidence(packed,max_chars=max_context_chars,id_registry=id_registry)
-        assessment_key = tuple(sorted((item['evidence_id'],hashlib.sha256(item['text'].encode()).hexdigest()) for item in context))
+        context = reconcile_evidence_families(context,packed)
+        assessment_key = tuple(sorted((item['evidence_id'],hashlib.sha256(json.dumps(
+            {**{key:item.get(key) for key in ('text','applicability','scope_categories','reference_from','reference_target',
+                                         'evidence_family','version_status','status','section_role')},
+             'scoped_cohort_incomplete':item.get('selection_signals',{}).get('scoped_cohort_incomplete')},
+            ensure_ascii=False,sort_keys=True,default=str).encode()).hexdigest()) for item in context))
         reused = assessment_key in assessments
         coverage = assessments[assessment_key] if reused else assess_coverage(plan,context,complete)
         assessments[assessment_key] = coverage

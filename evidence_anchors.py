@@ -20,6 +20,41 @@ _PARAGRAPH_BREAK = re.compile(r"\r?\n[ \t]*(?:\r?\n)+")
 _SENTENCE_BREAK = re.compile(r"[.!?;][ \t\r\n]+")
 
 
+def reconcile_evidence_families(evidence, provenance=None):
+    """Recheck collection completeness after ACL filtering and budget packing.
+
+    Reattach the single family record if its old carrier was removed, but only
+    to a surviving member from the same source. Fully removed sources expose no
+    family metadata. This does not certify the content's semantic completeness.
+    """
+    records = [dict(item) for item in evidence]
+    families = {item['evidence_family']['id']:dict(item['evidence_family'])
+                for item in (provenance if provenance is not None else evidence)
+                if isinstance(item.get('evidence_family'),dict) and item['evidence_family'].get('id')}
+    for item in records:
+        item.pop('evidence_family',None)
+    for identifier, family in families.items():
+        expected = list(dict.fromkeys(str(path) for path in family.get('expected_children',[])))[:12]
+        members = [item for item in records if item.get('file') == family.get('file') and
+                   (item.get('evidence_family_id') == identifier or item.get('section_path') in expected)]
+        carriers = members or [item for item in records if item.get('file') == family.get('file')]
+        if not carriers:
+            continue
+        present = {item.get('section_path') for item in members}
+        missing = [path for path in expected if path not in present]
+        excerpted = [item.get('section_path') for item in members if item.get('evidence_excerpt')]
+        total = int(family.get('total_children',len(expected)))
+        complete = not missing and not excerpted and len(present) == total and not family.get('omitted_children_count',0)
+        family.update(complete=complete,selected_children=[path for path in expected if path in present],
+                      missing_children=missing,excerpted_children=excerpted)
+        if not complete:
+            family['incomplete_reason'] = family.get('incomplete_reason') or 'post-filter-or-payload-budget'
+        else:
+            family['incomplete_reason'] = None
+        carriers[0]['evidence_family'] = family
+    return records
+
+
 def _escaped(text: str, position: int) -> bool:
     index = position - 1
     while index >= 0 and text[index] == "\\":
@@ -173,7 +208,9 @@ def evidence_anchor_payload(evidence: Sequence[Mapping[str, Any]]) -> list[dict[
     anchors = build_evidence_anchors(records)
     return [{"evidence_id": item["evidence_id"], "file": item.get("file"), "section_path": item.get("section_path"),
              "applicability": item.get("applicability"),
-             **{key:item[key] for key in ('reference_from','reference_target') if item.get(key) is not None},
+             **{key:item[key] for key in ('reference_from','reference_target','evidence_family') if item.get(key) is not None},
+             **({'selection_limits':{'scoped_cohort_incomplete':item['selection_signals']['scoped_cohort_incomplete']}}
+                if item.get('selection_signals',{}).get('scoped_cohort_incomplete') else {}),
              "version_status": item.get("version_status", item.get("status")),
              "passages": [{"passage_id": passage_id, "text": passage["text"]}
                           for passage_id, passage in anchors.items() if passage["evidence_id"] == item["evidence_id"]]}

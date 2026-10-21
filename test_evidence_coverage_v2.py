@@ -522,3 +522,145 @@ def test_dynamic_budget_reserves_payload_for_tenth_formula_after_four_long_hits(
     assert sum(len(item['text']) for item in selected) <= 12000
     assert all(item['selection_signals']['fair_budget_chars'] >= 1200 for item in selected)
     assert selected[0]['selection_signals']['reserved_payload_slots'] == 10
+
+
+@pytest.mark.parametrize('count', [8, 9])
+def test_compact_sibling_family_preserves_every_method_and_locator(count):
+    parent = node('Обслуживание > Регенерация фильтра', 'Регенерация фильтра допускает несколько самостоятельных методов.')
+    children = [node(parent.metadata['section_path'] + f' > Метод {number}',
+                     f'Метод {number}: промыть элемент раствором заданной температуры; выдержать {number + 2} минут.')
+                for number in range(count)]
+    noise = [node(f'Справочник {number}', 'Регенерация фильтра описана в руководстве. ' * 30, f'other-{number}.md')
+             for number in range(8)]
+    index = SectionEvidenceIndex([parent, *children, *noise])
+    selected = index.select_v2('Как выполняется регенерация фильтра?',
+                               [*[hit(item, 1000) for item in noise], hit(parent), hit(children[0]), hit(children[1])],
+                               top_k=10, max_chars=4000)
+    family = next(item['evidence_family'] for item in selected if item.get('evidence_family'))
+    expected = {child.metadata['section_path'] for child in children}
+    assert family['complete'] and set(family['selected_children']) == expected
+    assert not family['missing_children'] and not family['excerpted_children']
+    assert len([item for item in selected if item.get('evidence_family_id')]) == count
+    assert expected <= {item['section_path'] for item in selected}
+    assert sum(len(item['text']) for item in selected) <= 4000
+    assert len(selected) <= 10
+
+
+def test_sibling_family_is_explicitly_incomplete_when_budget_cannot_hold_methods():
+    parent = node('Обслуживание > Регенерация фильтра', 'Регенерация фильтра имеет девять методов.')
+    children = [node(parent.metadata['section_path'] + f' > Метод {number}',
+                     f'Метод {number}: ' + 'Обязательные требования к подготовке, выполнению и завершению процедуры. ' * 5)
+                for number in range(9)]
+    selected = SectionEvidenceIndex([parent, *children]).select_v2('Как выполняется регенерация фильтра?',
+        [hit(parent), hit(children[0]), hit(children[1])], top_k=10, max_chars=500)
+    assert selected
+    family = next(item['evidence_family'] for item in selected if item.get('evidence_family'))
+    assert not family['complete']
+    assert family['missing_children'] and family['total_children'] == 9
+    assert family['incomplete_reason'] == 'payload-or-slot-budget'
+    assert sum(len(item['text']) for item in selected) <= 500
+
+
+def test_specific_named_method_does_not_expand_sibling_family():
+    parent = node('Регенерация фильтра', 'Регенерация фильтра проводится двумя способами.')
+    cold = node('Регенерация фильтра > Холодная промывка', 'Холодная промывка выполняется при комнатной температуре.')
+    hot = node('Регенерация фильтра > Термическая обработка', 'Термическая обработка требует температуры выше 80 градусов.')
+    selected = SectionEvidenceIndex([parent, cold, hot]).select_v2('Как выполняется холодная промывка фильтра?', [hit(cold)])
+    assert selected and all(not item.get('evidence_family') for item in selected)
+    assert all('выше 80' not in item['text'] for item in selected)
+
+
+def test_prohibited_sibling_request_does_not_activate_completeness_bundle():
+    parent = node('Регенерация фильтра', 'Регенерация фильтра проводится двумя способами.')
+    cold = node('Регенерация фильтра > Холодная промывка', 'Холодная промывка фильтра выполняется при комнатной температуре.')
+    hot = node('Регенерация фильтра > Термическая обработка', 'Термическая обработка фильтра требует высокой температуры.')
+    selected = SectionEvidenceIndex([parent, cold, hot]).select_v2(
+        'Регенерация фильтра; не рассматривай термическую обработку.', [hit(parent), hit(cold), hit(hot)])
+    assert selected and all(not item.get('evidence_family') for item in selected)
+    assert all('высокой температуры' not in item['text'] for item in selected)
+
+
+def test_sibling_family_cannot_import_another_source_revision_or_descendant():
+    parent = node('Регенерация фильтра', 'Регенерация фильтра выполняется двумя методами.', content_hash='new')
+    children = [node('Регенерация фильтра > ' + name, name + ': режим обработки.', content_hash='new')
+                for name in ['Промывка', 'Продувка']]
+    excluded = [node('Регенерация фильтра > Секретный', 'Секретная обработка.', file='private.md', content_hash='new'),
+                node('Регенерация фильтра > Старый', 'Старая обработка.', content_hash='old'),
+                node('Регенерация фильтра > Удаленный', 'Удаленная обработка.', status='deleted', content_hash='new'),
+                node('Регенерация фильтра > Промывка > Ограничения', 'Вложенные ограничения.', content_hash='new')]
+    selected = SectionEvidenceIndex([parent, *children, *excluded]).select_v2('Регенерация фильтра', [hit(parent)],
+        allowed_sources={'novel-manual.md'})
+    family = next(item['evidence_family'] for item in selected if item.get('evidence_family'))
+    assert family['complete'] and family['total_children'] == 2
+    assert set(family['expected_children']) == {child.metadata['section_path'] for child in children}
+    assert all('Секретный' not in item['text'] and 'Старая обработка' not in item['text'] for item in selected)
+
+
+def test_sibling_family_has_independent_count_and_character_bounds():
+    parent = node('Регенерация фильтра', 'Регенерация фильтра выполняется несколькими методами.')
+    children = [node(f'Регенерация фильтра > Метод {number}', f'Режим {number}: ' + 'Полная последовательность действий. ' * 20)
+                for number in range(14)]
+    selected = SectionEvidenceIndex([parent, *children]).select_v2('Регенерация фильтра', [hit(parent)],
+        top_k=24, max_chars=20000)
+    family = next(item['evidence_family'] for item in selected if item.get('evidence_family'))
+    assert not family['complete'] and family['incomplete_reason'] == 'family-limit'
+    assert family['omitted_children_count'] == 2 and len(family['expected_children']) == 12
+    assert sum(len(item['text']) for item in selected if item.get('evidence_family_id')) <= 6000
+
+
+def test_overview_keeps_complete_applicability_and_native_calculation_cohort():
+    applicability = 'Режим R4: фильтр отключен, давление ниже 2 бар; требуется полный цикл обработки.'
+    equations = ['Подготовка: [MATH: A=B+C]', 'Промывка: [MATH: D=E*F]', 'Продувка: [MATH: G=H-I]']
+    other_scope = 'Режим R8: допускается сокращенный цикл.'
+    dictionary = 'Этапы обработки фильтра в режиме R4 описаны в терминологическом указателе. ' * 5
+    text = '\n\n'.join([
+        applicability, 'Формула:', *equations,
+        'Где A — длительность подготовки.',
+        other_scope, 'Промывка: [MATH: D=J*K]', 'Сушка: [MATH: L=M*N]',
+        *([dictionary] * 40),
+    ])
+    question = 'Какие этапы обработки фильтра рассчитываются в режиме R4?'
+    signals = {}
+    excerpt, _ = _focused_excerpt(text, 1100, _query_groups(question), {}, question=question, diagnostics=signals)
+    assert applicability in excerpt and all(equation in excerpt for equation in equations)
+    assert signals['scoped_cohort_blocks'] == [[0, 1, 2, 3, 4]]
+    assert not signals['scoped_cohort_incomplete']
+    assert len(excerpt) <= 1100
+
+
+def test_category_cohort_does_not_import_neighbors_scope_instead_of_requested():
+    first = ['Применение 2 ЦК: режим без планирования.', 'Этап альфа: [MATH: A=B]', 'Этап бета: [MATH: C=D]']
+    second = ['Применение 5 ЦК: режим с обязательным планированием.',
+              'Этап гамма: [MATH: E=F]', 'Этап дельта: [MATH: G=H]', 'Этап эпсилон: [MATH: I=J]']
+    text = '\n\n'.join([*first, *second, 'Где E — плановый параметр.', *(['Описание услуг по 5 ЦК. ' * 20] * 40)])
+    question = 'Какие этапы рассчитываются по 5 ЦК?'
+    signals = {}
+    excerpt, _ = _focused_excerpt(text, 900, _query_groups(question), {}, question=question, diagnostics=signals)
+    assert all(block in excerpt for block in second)
+    assert signals['scoped_cohort_blocks'] == [[3, 4, 5, 6]]
+    assert not signals['scoped_cohort_incomplete']
+
+
+def test_too_small_budget_does_not_turn_cohort_into_partial_list():
+    condition = 'Режим R4: требуется одновременное выполнение всех этапов.'
+    equations = ['Подготовка: [MATH: A=B+C]', 'Промывка: [MATH: D=E*F]', 'Продувка: [MATH: G=H-I]']
+    text = '\n\n'.join([condition, *equations, 'Где A — длительность.', 'Обработка фильтра. ' * 100])
+    question = 'Какие этапы обработки в режиме R4?'
+    signals = {}
+    excerpt, _ = _focused_excerpt(text, 85, _query_groups(question), {}, question=question, diagnostics=signals)
+    assert not any(equation in excerpt for equation in equations)
+    assert condition not in excerpt
+    assert signals['scoped_cohort_incomplete'] == [{'anchor': 0, 'scope_categories': [], 'reason': 'payload-budget'}]
+
+
+def test_targeted_quantity_question_keeps_symbolic_dependency_priority_not_whole_cohort():
+    blocks = ['Режим R4: полный цикл обработки фильтра.',
+              'Подготовка: [MATH: M=C*V]', 'Промывка: [MATH: D=E*F]', 'Продувка: [MATH: G=H-I]',
+              '[MATH: C] | Концентрация реагента | мг/л',
+              *(['Концентрация реагента — термин справочника. ' * 10] * 20),
+              'Сумма эталонной величины и поправки:', '[MATH: C=K+Z]']
+    question = 'Как определяется концентрация реагента?'
+    signals = {}
+    excerpt, _ = _focused_excerpt('\n\n'.join(blocks), 800, _query_groups(question), {}, question=question, diagnostics=signals)
+    assert '[MATH: C=K+Z]' in excerpt
+    assert not signals['scoped_cohort_blocks']

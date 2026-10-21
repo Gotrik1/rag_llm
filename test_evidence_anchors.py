@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from evidence_anchors import build_evidence_anchors, evidence_anchor_payload, resolve_passages
+from evidence_anchors import build_evidence_anchors, evidence_anchor_payload, resolve_passages, reconcile_evidence_families
 
 
 def item(text, identifier="E1", **kwargs):
@@ -13,6 +13,54 @@ def item(text, identifier="E1", **kwargs):
 
 def passages(text):
     return [row["text"] for row in build_evidence_anchors([item(text)]).values()]
+
+
+def test_collection_completeness_is_recomputed_after_anchor_or_member_removed():
+    family = {'id':'family-1','file':'Методика.md','expected_children':['A','B','C'],
+              'total_children':3,'complete':True,'omitted_children_count':0}
+    original = [item('Описание '+path,identifier=f'E{i+1}',section_path=path,evidence_family_id='family-1')
+                for i,path in enumerate(['A','B','C'])]
+    original[0]['evidence_family'] = family
+    result = reconcile_evidence_families(original[1:],original)
+    metadata = result[0]['evidence_family']
+    assert metadata['complete'] is False
+    assert metadata['missing_children'] == ['A']
+    assert metadata['selected_children'] == ['B','C']
+    assert 'evidence_family' not in result[1]
+    assert family['complete'] is True  # No mutation of a previously assessed snapshot.
+
+
+def test_removed_source_does_not_leak_collection_metadata_to_other_sources():
+    old = item('Private',file='private.md',evidence_family_id='private-family',
+               evidence_family={'id':'private-family','file':'private.md','expected_children':['secret-title'],'complete':True})
+    result = reconcile_evidence_families([item('Public',file='public.md')],[old])
+    assert 'private' not in json.dumps(result)
+    assert 'secret-title' not in json.dumps(result)
+
+
+def test_family_with_no_remaining_children_is_incomplete_on_surviving_parent():
+    parent = item('Перечень методов.',section_path='Порядок',evidence_family={
+        'id':'f','file':'Методика.md','parent_section_path':'Порядок','expected_children':['Порядок > A'],
+        'total_children':1,'complete':False})
+    result = reconcile_evidence_families([parent])
+    assert result[0]['evidence_family']['complete'] is False
+    assert result[0]['evidence_family']['missing_children'] == ['Порядок > A']
+
+
+def test_excerpted_collection_member_is_not_complete_even_if_all_locators_remain():
+    metadata = {'id':'f','file':'Методика.md','expected_children':['A'],'total_children':1,'complete':True}
+    result = reconcile_evidence_families([item('Fragment',section_path='A',evidence_family_id='f',
+        evidence_excerpt=True,evidence_family=metadata)])
+    assert result[0]['evidence_family']['complete'] is False
+    assert result[0]['evidence_family']['excerpted_children'] == ['A']
+
+
+def test_family_metadata_is_in_payload_only_once():
+    evidence = [item('Описание A',section_path='A',evidence_family_id='f',evidence_family={
+        'id':'f','file':'Методика.md','expected_children':['A','B'],'total_children':2,'complete':True}),
+        item('Описание B',identifier='E2',section_path='B',evidence_family_id='f')]
+    payload = evidence_anchor_payload(reconcile_evidence_families(evidence))
+    assert sum('evidence_family' in row for row in payload) == 1
 
 
 def test_reference_provenance_is_retained_without_claiming_general_applicability():

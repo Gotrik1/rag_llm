@@ -349,6 +349,18 @@ def _agent_with_previous_private_trace():
     return agent
 
 
+def test_supported_claims_do_not_hide_incomplete_question_coverage(monkeypatch):
+    agent = _agent_with_previous_private_trace()
+    def current_ask(*args,**kwargs):
+        agent._generation_state.retrieval_trace = {'mode':'corrective','coverage_complete':False,
+            'verification':{'initial':{'assessment_complete':True}}}
+        agent._generation_state.retrieved_context = [evidence('visible.md')]
+        return FACT,[{'file':'visible.md'}],False
+    agent.ask = current_ask
+    response = _handler_request(monkeypatch,agent,'python')['payload']
+    assert any('Не все части вопроса' in warning for warning in response['warnings'])
+
+
 @pytest.mark.parametrize("mode", ["rust", "hybrid"])
 def test_nonpython_flow_cannot_persist_previous_chats_corrective_trace(monkeypatch, mode):
     agent = _agent_with_previous_private_trace()

@@ -71,7 +71,7 @@ class PipelineFixture:
         self.retrieval_calls = []
         self.judge_calls = 0
 
-    def retrieve(self, question, queries, requirements, trace):
+    def retrieve(self, question, queries, requirements, trace, *, search_focus, constraint_question):
         self.retrieval_calls.append((question, list(queries), list(requirements)))
         return deepcopy(self.sources)
 

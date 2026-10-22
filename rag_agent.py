@@ -53,6 +53,7 @@ from llm_providers import ProviderLLM
 from response_cache import ResponseCache
 from reranker import HttpReranker
 from runtime_paths import DATA_DIR
+from search_focus import SearchFocus
 from opentelemetry.trace import Status, StatusCode
 from telemetry import PIPELINE_SECONDS, tracer
 
@@ -3584,24 +3585,25 @@ class RAGAgent:
                 event['elapsed_s'] = round(time.perf_counter()-started,3)
                 completions.append(event)
 
-        def retrieve(original, queries, facets, trace):
+        def retrieve(original, queries, facets, trace, *, search_focus, constraint_question):
             return self.retrieve_context(original,TOP_K,retrieval_queries=queries,subject_question=original,
-                selection_mode='coverage',evidence_facets=facets,retrieval_trace=trace,**scope)
+                selection_mode='coverage',evidence_facets=facets,retrieval_trace=trace,
+                search_focus=search_focus,constraint_question=constraint_question,**scope)
 
-        def select(original, pool, facets):
+        def select(original, pool, facets, *, search_focus, constraint_question):
             index = getattr(self,'_section_evidence_index',None)
             if index is None:
                 index = SectionEvidenceIndex(self._all_nodes)
-            explicit = matching_explicit_sources(original,scope.get('source_aliases'))
+            explicit = matching_explicit_sources(constraint_question,scope.get('source_aliases'))
             selection_meta = {}  # Fresh per call: never share limits across rounds or chats.
             packed = index.select_v2(original,pool,excluded_sources=scope.get('excluded_sources'),
                 allowed_sources=explicit or (set(scope['source_aliases']) if scope.get('source_aliases') is not None else None),
                 top_k=TOP_K,max_chars=int(os.getenv('RAG_EVIDENCE_MAX_CHARS','36000')),facets=facets,
-                selection_meta=selection_meta)
+                selection_meta=selection_meta,search_focus=search_focus,constraint_question=constraint_question)
             from evidence_anchors import reconcile_evidence_families, inventory_limits_after_filter
-            scoped = filter_scoped_evidence(packed,original,source_aliases=scope.get('source_aliases'),
+            scoped = filter_scoped_evidence(packed,constraint_question,source_aliases=scope.get('source_aliases'),
                 excluded_sources=scope.get('excluded_sources'),source_versions=scope.get('source_versions'),
-                spec=refine_prism_query(original))
+                spec=refine_prism_query(constraint_question))
             scoped = reconcile_evidence_families(scoped,packed)
             return EvidenceSelection(scoped,inventory_limits_after_filter(selection_meta,packed,scoped))
 
@@ -4550,6 +4552,8 @@ class RAGAgent:
         selection_mode: str | None = None,
         evidence_facets: list[str] | None = None,
         retrieval_trace: dict | None = None,
+        search_focus: SearchFocus | None = None,
+        constraint_question: str | None = None,
     ) -> list[dict]:
         """Return chunks after query planning unless a validated plan is supplied."""
         original_question = question
@@ -4561,27 +4565,37 @@ class RAGAgent:
         # search phrase.  Keep the user's positive document-occurrence intent
         # for seeding and final diversification while still using the clearer
         # canonical wording for vector/lexical retrieval.
+        selection_question = subject_question or original_question
+        # Model rewrites/focus may improve recall, but cannot select a new
+        # document, point, category or exclusion on the user's behalf.  The
+        # resolved user context is immutable authority in corrective mode.
+        scope_question = constraint_question if constraint_question is not None else selection_question
         occurrence_question = (
-            original_question
-            if is_document_occurrence_question(original_question)
+            scope_question
+            if constraint_question is not None or is_document_occurrence_question(original_question)
             else question
         )
-        selection_question = subject_question or original_question
+        focus_options = (
+            {"search_focus": search_focus, "constraint_question": scope_question}
+            if constraint_question is not None or search_focus is not None else {}
+        )
         self._refresh_docstore_if_changed()
         section_index = getattr(self, "_section_evidence_index", None)
         if section_index is None or getattr(self, "_section_evidence_nodes", None) is not self._all_nodes:
             section_index = SectionEvidenceIndex(self._all_nodes)
             self._section_evidence_index = section_index
             self._section_evidence_nodes = self._all_nodes
-        spec = spec or refine_prism_query(question)
+        spec = (refine_prism_query(scope_question) if constraint_question is not None
+                else spec or refine_prism_query(question))
         domain_routing = route_query(question, retrieval_focus)
-        explicit_sources = matching_explicit_sources(selection_question, source_aliases)
+        explicit_sources = matching_explicit_sources(scope_question, source_aliases)
         candidate_k = max(top_k * (12 if excluded_sources else 5), 100 if excluded_sources else 40)
         qe = self._build_query_engine(candidate_k)
         merged: dict[str, dict] = {}
         for seed_question in dict.fromkeys((selection_question, question)):
             for item in section_index.body_seeds(seed_question, limit=max(top_k * 3, 24),
-                                                 mode='coverage' if selection_mode=='coverage' else 'legacy'):
+                                                 mode='coverage' if selection_mode=='coverage' else 'legacy',
+                                                 **focus_options):
                 key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
                 merged[key] = item
         for item in self._procedural_seed_results(question):
@@ -4620,7 +4634,15 @@ class RAGAgent:
         ]
         # Deterministic probes precede free-form LLM expansions. Previously the
         # eight-query budget could fill before a regulation probe was reached.
+        focused_queries = (
+            [*(subject.text for subject in search_focus.subjects),
+             *(phrase for subject in search_focus.subjects for phrase in subject.alternatives)]
+            if search_focus is not None else []
+        )
         query_candidates = [
+            # Keep the exact resolved wording before bounded semantic probes:
+            # IDs, units and user constraints must survive any planner error.
+            *((scope_question, *focused_queries) if focus_options else ()),
             *((retrieval_queries or ()) if selection_mode=='coverage' else ()),
             selection_question,
             question,
@@ -4710,7 +4732,9 @@ class RAGAgent:
             retrieval_trace.update(original_question=selection_question,query_plan=query_plan,
                 visible_candidates=len(results),candidates=[{"file":item.get('file'),"section":item.get('section_path'),
                     "score":item.get('score'),"matched_queries":item.get('matched_queries',[])} for item in ranked[:40]])
-        if is_document_occurrence_question(selection_question):
+            if focus_options:
+                retrieval_trace['constraint_question'] = scope_question
+        if is_document_occurrence_question(scope_question):
             # A document-occurrence query asks for a positive set, not for the
             # best explanatory chunks. The general domain router deliberately
             # caps its candidate pool; on a large regulation that cap can be
@@ -4726,7 +4750,7 @@ class RAGAgent:
             )
             diversified = diversify_context_results(
                 ranked,
-                selection_question,
+                scope_question,
                 top_k,
             )
             return [
@@ -4743,7 +4767,7 @@ class RAGAgent:
             ranked = rerank_context_results([*ranked, *related], question)
         # Relationships expand from the raw docstore. Never send inaccessible
         # or injected sibling text to an external reranker/model.
-        ranked = filter_scoped_evidence(ranked,selection_question,source_aliases=source_aliases,
+        ranked = filter_scoped_evidence(ranked,scope_question,source_aliases=source_aliases,
             excluded_sources=excluded_sources,source_versions=source_versions)
         reranker = getattr(self, "reranker", None)
         if reranker is not None:
@@ -4815,7 +4839,7 @@ class RAGAgent:
         # erase the wider pool before the new coverage selector sees it.
         evidence_pool = ranked if selection_mode=='coverage' else [*selected, *(item for item in ranked if item not in selected)]
         selector = section_index.select_v2 if selection_mode=='coverage' else section_index.select
-        selector_options = {"facets":evidence_facets} if selection_mode=='coverage' else {}
+        selector_options = {"facets":evidence_facets, **focus_options} if selection_mode=='coverage' else {}
         packed = selector(
             selection_question, evidence_pool, excluded_sources=excluded_sources,
             allowed_sources=explicit_sources or (set(source_aliases) if source_aliases is not None else None), top_k=top_k,
@@ -4826,7 +4850,7 @@ class RAGAgent:
             ),
             **selector_options,
         )
-        final = filter_scoped_evidence(packed,selection_question,source_aliases=source_aliases,
+        final = filter_scoped_evidence(packed,scope_question,source_aliases=source_aliases,
             excluded_sources=excluded_sources,source_versions=source_versions,spec=spec)
         if retrieval_trace is not None:
             retrieval_trace['selected'] = [{"file":item.get('file'),"section":item.get('section_path'),

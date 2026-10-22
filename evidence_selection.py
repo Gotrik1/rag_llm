@@ -15,6 +15,8 @@ from pathlib import Path
 
 from nltk.stem.snowball import RussianStemmer
 
+from search_focus import SearchFocus, SearchOperation
+
 _STEMMER = RussianStemmer()
 _STOP = {
     "а", "в", "во", "и", "из", "на", "по", "к", "с", "со", "для", "от", "о", "об",
@@ -122,7 +124,7 @@ def _positive_query(question: str) -> tuple[str, list[str]]:
     return value, excluded
 
 
-def _query_groups(question: str) -> tuple[frozenset[str], ...]:
+def _query_groups(question: str, *, subject_phrase: bool = False) -> tuple[frozenset[str], ...]:
     """Slash/parenthesized acronym spellings are alternatives, not AND terms.
 
     This is syntax based, not a maintained dictionary of document-specific
@@ -144,16 +146,40 @@ def _query_groups(question: str) -> tuple[frozenset[str], ...]:
     value = re.sub(r'(?<!\d)([1-6])\s*[-–—]\s*([1-6])\s*цк',
                    lambda m: ' '.join(_CATEGORY_WORDS[str(n)] + ' ценовой категории'
                                       for n in range(int(m[1]), int(m[2]) + 1)), value, flags=re.I)
-    keys = term_keys(value) - _V2_FILLER
-    subject = keys - _LOOKUP_WORDS
-    if subject:
-        keys = subject
+    keys = term_keys(value)
+    if not subject_phrase:
+        keys -= _V2_FILLER
+        subject = keys - _LOOKUP_WORDS
+        if subject:
+            keys = subject
     groups.extend(frozenset((key,)) for key in sorted(keys))
     return tuple(dict.fromkeys(group for group in groups if group))
 
 
 def _group_coverage(groups: tuple[frozenset[str], ...], keys: frozenset[str]) -> float:
     return sum(bool(group & keys) for group in groups) / len(groups) if groups else 0.0
+
+
+def _subject_profiles(question: str, focus: SearchFocus | None = None):
+    """Independent subjects/aliases are alternatives, not one giant AND query.
+
+    These profiles only propose and rank evidence. Applicability and visibility
+    always come from the original request, never from a generated subject.
+    """
+    if focus is not None:
+        profiles = tuple(dict.fromkeys(
+            groups for subject in focus.subjects
+            for phrase in (subject.text, *subject.alternatives)
+            if (groups := _query_groups(phrase, subject_phrase=True))
+        ))
+        if profiles:
+            return profiles
+    return (_query_groups(_positive_query(question)[0]),)
+
+
+def _profile_coverage(profiles, keys, requested=frozenset(), scope=frozenset()):
+    return max((_group_coverage(_applicable_groups(groups, requested, scope), keys)
+                for groups in profiles), default=0.0)
 
 
 def _category_ids(text: str) -> frozenset[str]:
@@ -500,7 +526,8 @@ def _scoped_cohorts(blocks, question, groups):
     return cohorts
 
 
-def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnostics=None):
+def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnostics=None,
+                     subject_profiles=None, formula_subjects=None):
     """Pack relevant whole paragraphs with neighbors, in source order.
 
     A 50k collapsed Markdown section must not contribute its unrelated preface
@@ -512,7 +539,8 @@ def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnos
         return text, []
     blocks = _content_blocks(text)
     keys = [term_keys(re.sub(r'\[SECTION:[^\]]*\]', '', block)) for block in blocks]
-    scores = [2 * _group_coverage(groups, value) + max(
+    profiles = subject_profiles or (groups,)
+    scores = [2 * _profile_coverage(profiles, value) + max(
         (_group_coverage(facet, value) for facet in facet_groups.values() if facet), default=0,
     ) for value in keys]
     order = sorted(range(len(blocks)), key=lambda number: (-scores[number], number))
@@ -545,7 +573,30 @@ def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnos
         else:
             incomplete_cohorts.append({'anchor': cohort['anchor'], 'scope_categories': cohort['scope_categories'],
                                        'reason': 'payload-budget' if cohort['bounded'] else 'cohort-limit'})
-    packages, definitions = _formula_dependencies(blocks, question, groups)
+    # Formatting instructions must not dilute the requested mathematical
+    # subject. Keep the user question separately for category/condition cohorts.
+    if formula_subjects:
+        # Clean phrases retain price/quantity and other semantic nouns. Probe
+        # each independently, interleaving their packages under the same six-
+        # package bound instead of making one comparison side own the budget.
+        probes, definitions = [], {}
+        for phrase in formula_subjects:
+            found, defined = _formula_dependencies(blocks, phrase, _query_groups(phrase, subject_phrase=True))
+            probes.append(found)
+            for symbol, definition in defined.items():
+                if symbol not in definitions or definition[0] > definitions[symbol][0]:
+                    definitions[symbol] = definition
+        packages, seen_packages = [], set()
+        for number in range(max((len(probe) for probe in probes), default=0)):
+            for probe in probes:
+                if number < len(probe) and probe[number]['block'] not in seen_packages:
+                    packages.append(probe[number])
+                    seen_packages.add(probe[number]['block'])
+            if len(packages) >= 6:
+                break
+        packages = packages[:6]
+    else:
+        packages, definitions = _formula_dependencies(blocks, question, groups)
     for _, number in definitions.values():
         guarded[number] = sorted({*guarded.get(number, ()), *_equation_guards(blocks, number)})
     formula_blocks = []
@@ -733,13 +784,13 @@ def evidence_id(item: dict) -> str:
 
 
 
-def _inventory_subject(positive: str, groups=None):
+def _inventory_subject(positive: str, groups=None, *, enumerate_intent=False):
     """Prepare the inventory profile once, separately from domain subjects."""
-    if not re.search(r'какие|перечисл|справочник|перечень|список', positive, re.I):
+    if not enumerate_intent and not re.search(r'какие|перечисл|справочник|перечень|список', positive, re.I):
         return ()
     groups = _query_groups(positive) if groups is None else groups
     kinds = term_keys('виды типы')
-    if not any(group & kinds for group in groups):
+    if not enumerate_intent and not any(group & kinds for group in groups):
         return ()
     framing = term_keys('виды типы перечисли перечислить перечень список справочник '
                         'полный весь основные объясни объяснить различия между ними '
@@ -747,7 +798,8 @@ def _inventory_subject(positive: str, groups=None):
     return tuple(group for group in groups if not group <= framing)
 
 
-def _inventory_enum_rows(item: dict, question: str = '', *, prepared_subject=None) -> list[str]:
+def _inventory_enum_rows(item: dict, question: str = '', *, prepared_subject=None,
+                         enumerate_intent=False) -> list[str]:
     """Atomic matching tables and surrounding source prose, not guessed values.
 
     The leaf/nearest parent must govern the subject. A condition can follow
@@ -762,7 +814,8 @@ def _inventory_enum_rows(item: dict, question: str = '', *, prepared_subject=Non
     if not subject:
         return []
     context = ' > '.join(str(item.get('section_path', '')).split(' > ')[-2:])
-    if _group_coverage(subject, term_keys(context)) != 1:
+    context_keys = term_keys(context)
+    if not enumerate_intent and _group_coverage(subject, context_keys) != 1:
         return []
     kinds, found, matched = term_keys('виды типы'), [], False
     for block in _content_blocks(str(item.get('text', ''))):
@@ -783,7 +836,15 @@ def _inventory_enum_rows(item: dict, question: str = '', *, prepared_subject=Non
         matching = []
         for row in rows:
             label, separator, value = row.lstrip(' \t|').partition('|')
-            if not separator or not term_keys(label) & kinds:
+            if not separator:
+                continue
+            if enumerate_intent:
+                # A subject can be split between a governing heading and the
+                # field label. This is still a source-anchored finite list,
+                # never an inventory inferred from incidental body mentions.
+                if _group_coverage(subject, context_keys | term_keys(label)) != 1:
+                    continue
+            elif not term_keys(label) & kinds:
                 continue
             marker = re.search(r'\b(?:выбор\s+из\s+списка|допустим\w*\s+значени\w*)\s*:', value, re.I)
             if not marker or re.search(r'\bнапример\b|\b(?:и|возможны)\s+други\w*\b|и\s+т\.\s*д\.', value, re.I):
@@ -853,7 +914,9 @@ class SectionEvidenceIndex:
                 group["heading_keys"] = term_keys(group["text"].split("\n\n", 1)[0][:500])
             self.sections.append(group)
 
-    def body_seeds(self, question: str, limit: int = 24, *, mode: str = 'legacy') -> list[dict]:
+    def body_seeds(self, question: str, limit: int = 24, *, mode: str = 'legacy',
+                   search_focus: SearchFocus | None = None,
+                   constraint_question: str | None = None) -> list[dict]:
         """Find positive subject matches, independently of vector similarity.
 
         Generic price/action words cannot anchor a match. Require at least two
@@ -861,7 +924,8 @@ class SectionEvidenceIndex:
         manual do not swamp an exact fact in a small document.
         """
         if mode == 'coverage':
-            return self._body_seeds_v2(question, limit)
+            return self._body_seeds_v2(question, limit, search_focus=search_focus,
+                                       constraint_question=constraint_question)
         keys = term_keys(question) - _LOOKUP_WORDS
         if len(keys) < 2:
             return []
@@ -882,35 +946,38 @@ class SectionEvidenceIndex:
                             'lexical_subject_keys': sorted(keys), 'lexical_coverage': coverage})
         return sorted(results, key=lambda item: (-item['score'], len(item['text']), source_key(item['file'])))[:limit]
 
-    def _body_seeds_v2(self, question: str, limit: int) -> list[dict]:
-        positive, _ = _positive_query(question)
-        groups = _query_groups(positive)
-        if not groups or limit <= 0:
+    def _body_seeds_v2(self, question: str, limit: int, *, search_focus: SearchFocus | None = None,
+                       constraint_question: str | None = None) -> list[dict]:
+        profiles = _subject_profiles(question, search_focus)
+        if not any(profiles) or limit <= 0:
             return []
-        requested = _category_ids(positive)
-        postings = [set().union(*(self.body_postings.get(key, ()) for key in group)) for group in groups]
-        positions = set().union(*postings)
+        authority = constraint_question if constraint_question is not None else question
+        requested = _category_ids(_positive_query(authority)[0])
         count = max(1, len(self.body_items))
-        results = []
-        for position in positions:
-            item = self.body_items[position]
-            scope = _scope_categories(item)
-            if requested and scope and not requested & scope:
+        results = {}
+        for groups in profiles:
+            if not groups:
                 continue
-            applicable = _applicable_groups(groups, requested, scope)
-            eligible = {number for number, group in enumerate(groups) if group in applicable}
-            matched = [number for number, posting in enumerate(postings) if position in posting]
-            coverage = len(set(matched) & eligible) / max(1, len(eligible))
-            # One explicit acronym is a valid subject. A common single word
-            # is not enough to bypass semantic retrieval for an entire corpus.
-            rare = any(len(postings[number]) <= max(2, count * 0.1) for number in matched)
-            if coverage < 0.65 or not rare:
-                continue
-            results.append({**item, 'score': round(3 + coverage, 4),
-                            'matched_queries': ['body-coverage'],
-                            'lexical_subject_groups': [sorted(group) for group in groups],
-                            'lexical_coverage': coverage})
-        return sorted(results, key=lambda item: (-item['score'], len(item['text']), source_key(item['file'])))[:limit]
+            postings = [set().union(*(self.body_postings.get(key, ()) for key in group)) for group in groups]
+            for position in set().union(*postings):
+                item = self.body_items[position]
+                scope = _scope_categories(item)
+                if requested and scope and not requested & scope:
+                    continue
+                applicable = _applicable_groups(groups, requested, scope)
+                eligible = {number for number, group in enumerate(groups) if group in applicable}
+                matched = [number for number, posting in enumerate(postings) if position in posting]
+                coverage = len(set(matched) & eligible) / max(1, len(eligible))
+                # Keep the same rare-anchor gate per independent subject.
+                rare = any(len(postings[number]) <= max(2, count * 0.1) for number in matched)
+                if coverage < 0.65 or not rare:
+                    continue
+                if position not in results or coverage > results[position]['lexical_coverage']:
+                    results[position] = {**item, 'score': round(3 + coverage, 4),
+                                         'matched_queries': ['body-coverage'],
+                                         'lexical_subject_groups': [sorted(group) for group in groups],
+                                         'lexical_coverage': coverage}
+        return sorted(results.values(), key=lambda item: (-item['score'], len(item['text']), source_key(item['file'])))[:limit]
 
     def _coverage_sections(self) -> list[dict]:
         """Keep legacy assembly, repairing only actual revision collisions.
@@ -953,6 +1020,8 @@ class SectionEvidenceIndex:
         facets: list[str] | None = None,
         resolve_references: bool | None = None,
         selection_meta: dict | None = None,
+        search_focus: SearchFocus | None = None,
+        constraint_question: str | None = None,
     ) -> list[dict]:
         """Coverage-aware evidence packing; legacy ``select`` remains unchanged.
 
@@ -971,28 +1040,45 @@ class SectionEvidenceIndex:
                              if resolve_references is None else resolve_references)
         excluded = {source_key(value) for value in (excluded_sources or ())}
         allowed = {source_key(value) for value in (allowed_sources or ())}
-        kind = requested_source_kind(question)
-        positive, forbidden = _positive_query(question)
-        groups = _query_groups(positive)
+        authoritative = constraint_question if constraint_question is not None else question
+        kind = requested_source_kind(authoritative)
+        positive, forbidden = _positive_query(authoritative)
+        profiles = _subject_profiles(question, search_focus)
+        groups = profiles[0]
         requested = _category_ids(positive)
-        positive_keys = frozenset().union(*groups) if groups else frozenset()
+        positive_keys = frozenset().union(*(group for profile in profiles for group in profile))
+        constraint_groups = _query_groups(positive)
+        constraint_keys = frozenset().union(*constraint_groups) if constraint_groups else frozenset()
         # Preserve literal named subjects such as a device/model name. Only
         # enforce them when at least one actual candidate carries the anchor;
         # otherwise semantic retrieval is still allowed to resolve a synonym.
         literal_anchors = term_keys(' '.join(match[0] for match in re.finditer(
             r'\b[А-ЯЁA-Z][а-яёa-z]{2,}\b', positive,
         ) if match.start() > 0)) - _V2_FILLER - _LOOKUP_WORDS
-        forbidden_keys = frozenset().union(*(term_keys(value) for value in forbidden)) - positive_keys
+        forbidden_keys = frozenset().union(*(term_keys(value) for value in forbidden)) - constraint_keys
         contrast_keys = term_keys(' '.join(re.findall(
             r'\b[а-яё]+(?:ую|ая|ое|ые|ый|ий|ыми|ими)\b', positive, re.I,
         ))) - _CATEGORY_STEMS - _V2_FILLER
-        overview = bool(re.search(r'какие|обзор|перечисл|из\s+чего|состав|структур|что\s+ведется', positive, re.I))
+        enumerate_intent = search_focus is not None and search_focus.operation == SearchOperation.ENUMERATE
+        overview = (enumerate_intent or bool(re.search(
+            r'какие|обзор|перечисл|из\s+чего|состав|структур|что\s+ведется', positive, re.I)))
         wants_exception = bool(_EXCEPTION.search(positive))
         historical_intent = bool(re.search(r'истори|раньше|ранее|изменил|изменен|предыдущ|стар\w*\s+редакц|по\s+состоянию', positive, re.I))
-        facet_groups = {label: _query_groups(_positive_query(label)[0])
-                        for label in (facets or ()) if str(label).strip()}
+        # Full requirements stay with coverage/writer. Only typed subjects may
+        # reserve lexical payload slots when the planner supplied this contract.
+        focus_facets = ({f'subject:{number}': _subject_profiles('', SearchFocus(
+            operation=search_focus.operation, subjects=(subject,)))
+                         for number, subject in enumerate(search_focus.subjects)}
+                        if search_focus is not None else {})
+        facet_groups = ({label: values[0] for label, values in focus_facets.items()}
+                        if search_focus is not None else
+                        {label: _query_groups(_positive_query(label)[0])
+                         for label in (facets or ()) if str(label).strip()})
         if len(requested) > 1:
             facet_groups.update({f'{number} ЦК': _query_groups(f'{number} ЦК') for number in sorted(requested)})
+
+        def facet_coverage(label, keys):
+            return _profile_coverage(focus_facets.get(label, (facet_groups[label],)), keys)
 
         def visible(item):
             key = source_key(item.get('file'))
@@ -1041,7 +1127,6 @@ class SectionEvidenceIndex:
             scope = _scope_categories(item)
             if requested and scope and not requested & scope and reference is None:
                 return
-            applicable = _applicable_groups(groups, requested, scope)
             identity = evidence_id(item)
             analysis = analyses.get(identity)
             if analysis is None:
@@ -1052,15 +1137,16 @@ class SectionEvidenceIndex:
                 analysis = body, heading, blocks, block_keys
                 analyses[identity] = analysis
             body, heading, blocks, block_keys = analysis
-            body_coverage, heading_coverage = _group_coverage(applicable, body), _group_coverage(applicable, heading)
-            local_coverage = max((_group_coverage(applicable, keys) for keys in block_keys), default=0)
-            if forbidden_keys & (body | heading) and not positive_keys & (body | heading) - forbidden_keys:
+            body_coverage = _profile_coverage(profiles, body, requested, scope)
+            heading_coverage = _profile_coverage(profiles, heading, requested, scope)
+            local_coverage = max((_profile_coverage(profiles, keys, requested, scope) for keys in block_keys), default=0)
+            if forbidden_keys & (body | heading) and not constraint_keys & (body | heading) - forbidden_keys:
                 return
             # A forbidden-only comparator commonly shares a noun ("мощность")
             # with the desired topic. Require its positive distinguishing term.
-            discriminators = positive_keys - frozenset().union(*(term_keys(value) for value in forbidden)) if forbidden else positive_keys
+            discriminators = constraint_keys - frozenset().union(*(term_keys(value) for value in forbidden)) if forbidden else constraint_keys
             discriminators = contrast_keys or (discriminators - _CATEGORY_STEMS - term_keys('ценовая категория'))
-            if forbidden_keys and forbidden_keys <= heading and not positive_keys & heading:
+            if forbidden_keys and forbidden_keys <= heading and not discriminators & heading:
                 return  # An explicitly excluded child heading is not a mixed-topic source paragraph.
             if forbidden_keys & (body | heading) and discriminators and not discriminators & (body | heading):
                 return
@@ -1068,7 +1154,7 @@ class SectionEvidenceIndex:
                 return
             support = pool.get(identity)
             covered = {label for label, keys in facet_groups.items()
-                       if keys and any(_group_coverage(keys, value | heading) >= 0.7 for value in block_keys)}
+                       if keys and any(facet_coverage(label, value | heading) >= 0.7 for value in block_keys)}
             if structural_facet:
                 covered.add(structural_facet)
             # Whole-section word unions reward collapsed books: unrelated
@@ -1082,6 +1168,11 @@ class SectionEvidenceIndex:
                 # Bounded rank support avoids making incomparable vector,
                 # lexical and reranker score scales additive by accident.
                 score += 1.8 / (1 + rank / 6)
+            if search_focus is not None and literal_anchors:
+                # USER-named objects remain a soft discriminator even if a
+                # model over-generalizes the subject. Generated names never
+                # enter this signal, nor veto semantic/synonym evidence.
+                score += 2.0 * len(literal_anchors & (body | heading)) / len(literal_anchors)
             if reason == 'subject-child':
                 score += 0.8
             if reference is not None:
@@ -1114,13 +1205,14 @@ class SectionEvidenceIndex:
         # matched. Reassemble its own section, not an arbitrary chosen document.
         for rank, item in enumerate(ranked):
             offer(item, 'retrieval-rank', rank=rank)
-        for item in self._body_seeds_v2(positive, max(24, top_k * 3)):
+        for item in self._body_seeds_v2(question, max(24, top_k * 3), search_focus=search_focus,
+                                       constraint_question=authoritative):
             offer(item, 'body-coverage')
         roots = []
         for section in sections:
             if not visible(section):
                 continue
-            coverage = _group_coverage(_applicable_groups(groups, requested, _scope_categories(section)), section['heading_keys'])
+            coverage = _profile_coverage(profiles, section['heading_keys'], requested, _scope_categories(section))
             if coverage >= 0.65:
                 scope = _scope_categories(section)
                 if requested and scope and not requested & scope:
@@ -1155,11 +1247,16 @@ class SectionEvidenceIndex:
         # Finite UI field choices can be stronger inventory evidence than a
         # family of examples. Prepare intent once; all offers retain existing
         # visibility/version/category/negative constraints and source wording.
-        inventory_subject = _inventory_subject(positive, groups)
-        for section in (sections if inventory_subject else ()):
+        inventory_subjects = tuple(dict.fromkeys(
+            subject for profile in profiles
+            if (subject := _inventory_subject(positive, profile, enumerate_intent=enumerate_intent))
+        ))
+        for section in (sections if inventory_subjects else ()):
             if not visible(section):
                 continue
-            rows = _inventory_enum_rows(section, prepared_subject=inventory_subject)
+            rows = next((rows for subject in inventory_subjects
+                         if (rows := _inventory_enum_rows(section, prepared_subject=subject,
+                                                         enumerate_intent=enumerate_intent))), [])
             if not rows:
                 continue
             label = 'inventory:' + source_key(section['file']) + '::' + section['section_path']
@@ -1172,12 +1269,14 @@ class SectionEvidenceIndex:
         # Narrow / negative requests are intentionally not expanded into a
         # complete sibling family. Ordinary subject children remain unchanged.
         sibling_family = None
-        family_intent = bool(re.search(
+        family_intent = enumerate_intent or bool(re.search(
             r'какие|перечисл|обзор|сколько|из\s+чего|состав|структур|порядок|процедур|'
             r'как\s+(?:\w+\s+){0,2}(?:рассчит|рассчитыв|выполн|провод|начисл|организ)', positive, re.I,
         ))
         if family_intent and not forbidden and not wants_exception:
-            sibling_family = _sibling_family(sections, list(pool.values()), groups, visible, requested)
+            families = [family for profile in profiles
+                        if (family := _sibling_family(sections, list(pool.values()), profile, visible, requested))]
+            sibling_family = max(families, key=lambda family: family['score']) if families else None
             if sibling_family:
                 for child in sibling_family['children'][:12]:
                     offer(child, 'subject-child')
@@ -1189,14 +1288,15 @@ class SectionEvidenceIndex:
             # Category applicability can be inherited only through a verbatim,
             # explicit same-source reference, not a loose semantic resemblance.
             origins = sorted(pool.values(), key=lambda item: -item['_score'])[:8]
-            subject_groups = tuple(group for group in groups
-                                   if not group <= (_CATEGORY_STEMS | term_keys('ценовая категория')))
+            subject_profiles = tuple(tuple(group for group in profile
+                                           if not group <= (_CATEGORY_STEMS | term_keys('ценовая категория')))
+                                     for profile in profiles)
             expanded = set()
             for origin in origins:
                 for link in _reference_clauses(str(origin.get('text', ''))):
                     quote_keys = term_keys(link['quote'])
                     origin_heading = term_keys(str(origin.get('section_title', '')))
-                    if subject_groups and _group_coverage(subject_groups, quote_keys | origin_heading) < 0.5:
+                    if any(subject_profiles) and _profile_coverage(subject_profiles, quote_keys | origin_heading) < 0.5:
                         continue
                     targets = []
                     for target in sections:
@@ -1213,12 +1313,12 @@ class SectionEvidenceIndex:
                         if not match:
                             continue
                         target_keys = term_keys(str(target.get('text', ''))) | target['heading_keys']
-                        relevance = _group_coverage(subject_groups, target_keys)
+                        relevance = _profile_coverage(subject_profiles, target_keys)
                         # An exact numbered locator is a narrow structural edge
                         # even when its equation uses symbols rather than the
                         # user's words. A category analogy is broader, so its
                         # target still needs positive subject agreement.
-                        if link['kind'] == 'category' and subject_groups and relevance < 0.5:
+                        if link['kind'] == 'category' and any(subject_profiles) and relevance < 0.5:
                             continue
                         targets.append((relevance, target))
                     targets.sort(key=lambda pair: (-pair[0], len(pair[1]['text']), pair[1]['position']))
@@ -1252,7 +1352,7 @@ class SectionEvidenceIndex:
                 ):
                     item['_score'] -= 1.2
                     item['section_role_penalty'] = -1.2
-        if literal_anchors and any(literal_anchors <= item['_anchors'] for item in candidates):
+        if search_focus is None and literal_anchors and any(literal_anchors <= item['_anchors'] for item in candidates):
             candidates = [item for item in candidates if literal_anchors <= item['_anchors']
                           or item['selection_reason'] == 'subject-child' or item.get('reference_from')]
         # Do not veto semantic evidence solely because a literal/acronym hit
@@ -1267,9 +1367,12 @@ class SectionEvidenceIndex:
         complete_family_fits = bool(sibling_family and len(sibling_family['children']) <= min(12, limit)
                                    and sibling_family['total_chars'] <= min(6000, max_chars))
         while candidates and len(selected) < limit:
+            pending_subjects = set(focus_facets) - covered
+
             def priority(item):
                 family = (source_key(item.get('file')), str(item.get('section_path', '')).rsplit(' > ', 1)[0])
                 return (not wants_exception and item['evidence_role'] == 'exception',
+                        not bool(item['_facets'] & pending_subjects),
                         not bool(item.get('_inventory_rows')),
                         not bool(item.get('_family_id')),
                         -(item['_score'] + 2.2 * len(item['_facets'] - covered)
@@ -1286,7 +1389,16 @@ class SectionEvidenceIndex:
             # not a quota for different physical documents or a larger top_k.
             remaining_slots = min(limit - len(selected), len(candidates) + 1)
             budget = max(0, remaining // max(1, remaining_slots))
-            if complete_family_fits and candidate.get('_family_id'):
+            other_subjects = pending_subjects - candidate['_facets']
+            if candidate['_facets'] & pending_subjects:
+                # Before optional sibling completion, retain space for a native
+                # payload of each independent subject that is still available.
+                reserve_others = sum(min((len(str(item.get('text', ''))) for item in candidates
+                                          if label in item['_facets']), default=0)
+                                     for label in other_subjects)
+                if len(text) <= remaining - reserve_others:
+                    budget = max(budget, len(text))
+            if complete_family_fits and candidate.get('_family_id') and not other_subjects:
                 # Reserve each complete child's native payload as a bundle,
                 # while retaining separate evidence identities and locators.
                 budget = min(remaining, len(text))
@@ -1313,10 +1425,14 @@ class SectionEvidenceIndex:
                     packet_keys = term_keys(packet) | term_keys(str(item.get('section_title', '')))
                     candidate['_facets'] = {label for label in candidate['_facets']
                                             if not facet_groups.get(label)
-                                            or _group_coverage(facet_groups[label], packet_keys) >= 0.7}
+                                            or facet_coverage(label, packet_keys) >= 0.7}
             if len(text) > budget:
                 excerpt, indices = _focused_excerpt(text, budget, groups, facet_groups,
-                                                    question=positive, diagnostics=excerpt_signals)
+                                                    question=positive, diagnostics=excerpt_signals,
+                                                    subject_profiles=profiles if search_focus is not None else None,
+                                                    formula_subjects=tuple(phrase for subject in search_focus.subjects
+                                                        for phrase in (subject.text, *subject.alternatives))
+                                                    if search_focus is not None else None)
                 if not excerpt or not _substantive_text(excerpt, str(item.get('section_title', ''))):
                     continue
                 item['text'] = excerpt
@@ -1325,7 +1441,7 @@ class SectionEvidenceIndex:
                 item['evidence_block_indices'] = indices
                 actual = term_keys(item['text']) | term_keys(str(item.get('section_title', '')))
                 actual_facets = {label for label in candidate['_facets'] if not facet_groups.get(label)
-                                 or _group_coverage(facet_groups[label], actual) >= 0.7}
+                                 or facet_coverage(label, actual) >= 0.7}
             else:
                 actual_facets = candidate['_facets']
             item['coverage_facets'] = sorted(actual_facets)
@@ -1340,6 +1456,7 @@ class SectionEvidenceIndex:
                 'fair_budget_chars': budget,
                 'reserved_payload_slots': remaining_slots,
                 'section_role_penalty': candidate.get('section_role_penalty', 0),
+                'search_focus_used': search_focus is not None,
                 **excerpt_signals,
             }
             item['applicability'] = ('referenced' if candidate.get('reference_from') else

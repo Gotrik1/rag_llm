@@ -156,9 +156,13 @@ def test_all_corrective_search_rounds_and_selection_receive_identical_source_sco
         assert kwargs["selection_mode"] == "coverage"
         assert kwargs["evidence_facets"] == ["Описать этапы контроля"]
         assert kwargs["subject_question"] == QUESTION
+        assert kwargs["constraint_question"] == QUESTION
+        assert kwargs["search_focus"] is None
     for _, _, kwargs in agent._section_evidence_index.calls:
         assert kwargs["allowed_sources"] == set(allowed)
         assert kwargs["excluded_sources"] == excluded
+        assert kwargs["constraint_question"] == QUESTION
+        assert kwargs["search_focus"] is None
     assert [item["file"] for item in sources] == ["Доступная методика.md"]
     assert len(agent.last_retrieval_trace()["rounds"]) == 2
 

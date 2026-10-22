@@ -4,6 +4,7 @@ import json
 import pytest
 
 from corrective_rag import make_plan, run_corrective
+from search_focus import SearchOperation
 
 
 QUESTION = "Какие этапы контроля проходят измерительные каналы?"
@@ -58,10 +59,14 @@ class Retrieval:
     def __init__(self, *batches):
         self.batches = batches or ([fragment()],)
         self.calls = []
+        self.focuses = []
+        self.constraints = []
 
-    def __call__(self, question, queries, requirements, trace):
+    def __call__(self, question, queries, requirements, trace, *, search_focus, constraint_question):
         index = min(len(self.calls), len(self.batches) - 1)
         self.calls.append(list(queries))
+        self.focuses.append(search_focus)
+        self.constraints.append(constraint_question)
         trace["synthetic_test"] = True
         return list(self.batches[index])
 
@@ -89,7 +94,7 @@ def test_missing_definition_cannot_be_certified_by_real_quote_or_model_review():
 def test_changed_definition_limits_invalidate_request_local_assessment_reuse():
     calls = []
     model = Model(reviews=[coverage(queries=['Расшифровка обозначений']), coverage()])
-    def select(question,pool,requirements):
+    def select(question,pool,requirements,*,search_focus,constraint_question):
         calls.append(1)
         return [{**pool[0], 'selection_signals':{
             'definition_closure_incomplete':len(calls)==1,
@@ -148,12 +153,16 @@ def test_resolved_intent_drives_ranking_without_losing_verbatim_query_or_exclusi
                         'queries':[QUESTION],'exclusions':['температура']})
     searches, selections = [],[]
 
-    def retrieve(subject, queries, requirements, trace):
+    def retrieve(subject, queries, requirements, trace, *, search_focus, constraint_question):
         searches.append((subject,queries))
+        assert search_focus is None
+        assert constraint_question == envelope
         return [fragment()]
 
-    def select(subject, pool, requirements):
+    def select(subject, pool, requirements, *, search_focus, constraint_question):
         selections.append(subject)
+        assert search_focus is None
+        assert constraint_question == envelope
         return pool
 
     result = run_corrective(question,envelope,retrieve=retrieve,select=select,complete=model)
@@ -175,7 +184,7 @@ def test_canonical_question_cannot_invent_a_category_absent_from_the_user_contex
 def test_missing_canonical_question_preserves_the_original_ranking_fallback():
     model = Model()
     subjects = []
-    def retrieve(subject,queries,requirements,trace):
+    def retrieve(subject,queries,requirements,trace,*,search_focus,constraint_question):
         subjects.append(subject)
         return [fragment()]
     result = run_corrective(QUESTION,QUESTION,retrieve=retrieve,complete=model)
@@ -267,7 +276,7 @@ def test_evidence_identifiers_stay_stable_when_new_sources_arrive():
     model = Model(reviews=[coverage("Цитата, которой нет в исходном тексте.", queries=["Требования к калибровке"]), coverage()], claims=[])
     retrieval = Retrieval([first], [second])
     snapshots = []
-    def select(question, pool, requirements):
+    def select(question, pool, requirements, *, search_focus, constraint_question):
         snapshots.append({item["file"]: item["evidence_id"] for item in pool})
         return pool
     result = run_corrective(QUESTION, QUESTION, retrieve=retrieval, complete=model, select=select)
@@ -357,3 +366,168 @@ def test_short_unassessed_factual_tail_prevents_whole_answer_certification():
     model = Model(answers=[FACT + " [E1]\n\nПять режимов."], claims=[claim()])
     result = run_corrective(QUESTION, QUESTION, retrieve=Retrieval(), complete=model)
     assert result.trace["verification"]["initial"]["assessment_complete"] is False
+
+
+def focus_payload():
+    return {'operation': 'enumerate', 'subjects': [
+        {'text': 'этапы контроля каналов', 'alternatives': ['процедуры проверки каналов']}
+    ]}
+
+
+def test_valid_search_focus_is_forwarded_explicitly_without_replacing_the_full_task():
+    task = QUESTION + ' Сохрани точные названия и ответь таблицей.'
+    requirements = ['Названия этапов контроля и различия между ними']
+    model = Model(plan={'canonical_question':task, 'requirements':requirements,
+                        'queries':['этапы контроля каналов'], 'search_focus':focus_payload()})
+    retrieval = Retrieval()
+    selections = []
+
+    def select(canonical, pool, facets, *, search_focus, constraint_question):
+        selections.append((canonical, facets, search_focus, constraint_question))
+        return pool
+
+    result = run_corrective(task,task,retrieve=retrieval,select=select,complete=model)
+    focus = retrieval.focuses[0]
+    assert focus.operation is SearchOperation.ENUMERATE
+    assert focus.subjects[0].text == 'этапы контроля каналов'
+    assert focus.subjects[0].alternatives == ('процедуры проверки каналов',)
+    assert selections == [(task,requirements,focus,task)]
+    assert selections[0][2] is focus
+    assert retrieval.constraints == [task]
+    assert task in retrieval.calls[0]
+    assert result.trace['plan']['search_focus_status'] == 'valid'
+    assert result.trace['plan']['search_focus_reason'] is None
+    encoded = json.loads(json.dumps(result.trace,ensure_ascii=False))
+    assert encoded['plan']['search_focus']['operation'] == 'enumerate'
+    prompt = next(prompt for stage,prompt in model.calls if stage == 'answer')
+    assert task in prompt and requirements[0] in prompt
+    assert '"search_focus"' not in prompt
+
+
+@pytest.mark.parametrize('bad_focus',[
+    None, {}, {'operation':'change_acl','subjects':[{'text':'каналы'}]},
+    {'operation':'lookup','subjects':[]},
+    {**focus_payload(),'allowed_sources':['чужой документ.md']},
+    {'operation':'lookup','subjects':[{'text':'каналы','answer':'непроверенный факт'}]},
+])
+def test_rejected_optional_focus_does_not_discard_an_otherwise_valid_plan(bad_focus):
+    model = Model(plan={'canonical_question':QUESTION, 'requirements':['Этапы контроля'],
+                        'queries':['контроль каналов'], 'search_focus':bad_focus})
+    plan = make_plan(QUESTION,model)
+    assert not plan.fallback
+    assert plan.canonical_question == QUESTION
+    assert plan.requirements == ('Этапы контроля',)
+    assert plan.queries == (QUESTION,'контроль каналов')
+    assert plan.search_focus is None and plan.search_focus_status == 'rejected'
+    assert plan.search_focus_reason
+    assert len(model.calls) == 1
+
+
+def test_rejected_focus_is_traceable_while_callbacks_receive_none_and_original_constraints():
+    model = Model(plan={'requirements':['Этапы контроля'], 'queries':['контроль каналов'],
+                        'search_focus':{'operation':'unsupported','subjects':[]}})
+    retrieval = Retrieval()
+    result = run_corrective(QUESTION,QUESTION,retrieve=retrieval,complete=model)
+    assert retrieval.focuses == [None]
+    assert retrieval.constraints == [QUESTION]
+    assert result.trace['plan']['search_focus_status'] == 'rejected'
+    assert result.trace['plan']['search_focus_reason'] == 'invalid-operation'
+    assert result.trace['plan']['fallback'] is False
+
+
+def test_legacy_missing_focus_is_absent_not_an_invalid_plan():
+    model, retrieval = Model(), Retrieval()
+    result = run_corrective(QUESTION,QUESTION,retrieve=retrieval,complete=model)
+    assert result.trace['plan']['search_focus'] is None
+    assert result.trace['plan']['search_focus_status'] == 'absent'
+    assert result.trace['plan']['search_focus_reason'] is None
+    assert not result.trace['plan']['fallback']
+    assert retrieval.focuses == [None]
+    assert retrieval.constraints == [QUESTION]
+
+
+def test_focus_cannot_add_an_unrequested_category_but_rejection_is_local_to_focus():
+    model = Model(plan={'requirements':['Этапы контроля'], 'queries':['контроль каналов'],
+                        'search_focus':{'operation':'lookup','subjects':[{'text':'четвертая ценовая категория'}]}})
+    plan = make_plan(QUESTION,model)
+    assert not plan.fallback
+    assert plan.requirements == ('Этапы контроля',)
+    assert plan.search_focus is None
+    assert plan.search_focus_status == 'rejected'
+    assert plan.search_focus_reason == 'invented-category'
+
+
+def test_requested_comparison_categories_remain_valid_in_separate_search_subjects():
+    question = 'Сравни 3 и 6 ЦК, не описывай историю.'
+    model = Model(plan={'canonical_question':'Сравни 3 и 6 ЦК',
+                        'requirements':['Сравнение 3 и 6 ЦК'], 'queries':['3 ЦК','6 ЦК'],
+                        'exclusions':['история'],
+                        'search_focus':{'operation':'compare','subjects':[{'text':'3 ЦК'},{'text':'6 ЦК'}]}})
+    plan = make_plan(question,model)
+    assert not plan.fallback and plan.search_focus_status == 'valid'
+    assert [subject.text for subject in plan.search_focus.subjects] == ['3 ЦК','6 ЦК']
+    assert plan.exclusions == ('история',)
+
+
+def test_original_user_scope_not_rewritten_task_is_forwarded_in_every_round():
+    user_scope = ('Тема диалога — вопрос пользователя: Контроль QX-42 по методике Датчик.md на 2020 год\n'
+                  'Условия и уточнения пользователя: при −2,5 °C без подогрева\n'
+                  'Исключить из предмета ответа: давление\n'
+                  'Текущий запрос пользователя: А теперь перечисли их точные названия.')
+    model = Model(plan={'canonical_question':QUESTION, 'requirements':['Этапы контроля'],
+                        'queries':['контроль QX-42'], 'exclusions':['давление'], 'search_focus':focus_payload()},
+                  reviews=[{'coverage':[], 'missing_queries':['Первый контроль','Второй контроль']}])
+    retrieval, selections = Retrieval(), []
+
+    def select(task,pool,facets,*,search_focus,constraint_question):
+        selections.append((search_focus,constraint_question))
+        return pool
+
+    result = run_corrective('А теперь перечисли их точные названия.',user_scope,
+                            retrieve=retrieval,select=select,complete=model)
+    assert len(retrieval.calls) == 3
+    assert retrieval.constraints == [user_scope] * 3
+    assert all(focus is retrieval.focuses[0] for focus in retrieval.focuses)
+    assert all(focus is retrieval.focuses[0] and constraints == user_scope for focus,constraints in selections)
+    assert result.trace['ranking_question'] != user_scope
+    assert user_scope in retrieval.calls[0]
+
+
+def test_planner_outage_keeps_legacy_fallback_and_explicit_callback_contract():
+    model = Model()
+
+    def complete(prompt,stage):
+        if stage == 'planning':
+            raise TimeoutError('Synthetic planner outage')
+        return model(prompt,stage)
+
+    retrieval = Retrieval()
+    result = run_corrective(QUESTION,QUESTION,retrieve=retrieval,complete=complete)
+    assert result.trace['plan']['fallback']
+    assert result.trace['plan']['search_focus_status'] == 'absent'
+    assert retrieval.focuses == [None]
+    assert retrieval.constraints == [QUESTION]
+    assert retrieval.calls == [[QUESTION]]
+
+
+def test_callback_type_error_is_not_misinterpreted_as_signature_fallback_or_retried():
+    calls = []
+
+    def retrieve(task,queries,requirements,trace,*,search_focus,constraint_question):
+        calls.append((search_focus,constraint_question))
+        raise TypeError('Synthetic callback implementation failure')
+
+    with pytest.raises(TypeError,match='implementation failure'):
+        run_corrective(QUESTION,QUESTION,retrieve=retrieve,complete=Model())
+    assert calls == [(None,QUESTION)]
+
+
+def test_planner_focus_contract_is_bounded_subject_only_and_does_not_supplant_answer_format():
+    model = Model()
+    make_plan(QUESTION,model)
+    prompt = model.calls[0][1]
+    assert '"search_focus"' in prompt
+    assert 'lookup, enumerate, compare, calculate, procedure или locate_documents' in prompt
+    assert 'от 1 до 6' in prompt and 'до 3' in prompt and '120 символов и 12 слов' in prompt
+    assert 'не ограничение области доступа' in prompt
+    assert 'Не включай в subjects просьбы о формате' in prompt

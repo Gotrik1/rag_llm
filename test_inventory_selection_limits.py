@@ -13,6 +13,7 @@ from evidence_anchors import (evidence_anchor_payload, inventory_limits_after_fi
                               inventory_carrier_signals, normalize_inventory_evidence,
                               normalize_inventory_selection_limits)
 from evals import oracle_ablation
+from search_focus import SearchFocus
 
 
 FACT = 'Канал проходит два этапа контроля.'
@@ -61,7 +62,7 @@ class LocalModel:
 
 def run(select=None, rounds=0, **options):
     model = LocalModel()
-    result = run_corrective(QUESTION, QUESTION, retrieve=lambda *args: [fragment()],
+    result = run_corrective(QUESTION, QUESTION, retrieve=lambda *args, **kwargs: [fragment()],
                             complete=model, select=select, max_additional_rounds=rounds, **options)
     return result, model
 
@@ -84,7 +85,7 @@ def test_known_missing_inventory_cannot_be_certified_by_valid_quote_or_model(wit
 
 
 def test_source_free_limits_reach_coverage_trace_and_generation_without_fake_evidence():
-    def select(*args):
+    def select(*args, **kwargs):
         return EvidenceSelection([fragment()], limits(source='HIDDEN-SOURCE', section_path='HIDDEN-PATH',
                                                      text='HIDDEN-TEXT', title='HIDDEN-TITLE'))
     result, model = run(select)
@@ -102,7 +103,7 @@ def test_source_free_limits_reach_coverage_trace_and_generation_without_fake_evi
 
 def test_changed_source_free_limits_invalidate_assessment_reuse_for_same_text():
     calls = []
-    def select(*args):
+    def select(*args, **kwargs):
         calls.append(1)
         return EvidenceSelection([fragment()], limits(100 * len(calls)) if len(calls) < 3 else {})
     result, model = run(select, rounds=2)
@@ -116,7 +117,7 @@ def test_changed_source_free_limits_invalidate_assessment_reuse_for_same_text():
 
 def test_changed_carrier_missing_list_invalidates_assessment_reuse():
     calls = []
-    def select(*args):
+    def select(*args, **kwargs):
         calls.append(1)
         return [fragment(selection_signals=carrier(f'Контроль > Перечень {len(calls)}'))]
     result, model = run(select, rounds=1)
@@ -127,15 +128,15 @@ def test_changed_carrier_missing_list_invalidates_assessment_reuse():
 
 
 def test_legacy_list_selector_and_unlimited_typed_selection_remain_supported():
-    for select in (lambda *args: [fragment()], lambda *args: EvidenceSelection([fragment()])):
+    for select in (lambda *args, **kwargs: [fragment()], lambda *args, **kwargs: EvidenceSelection([fragment()])):
         result, model = run(select)
         assert result.trace['coverage_complete'] and model.assessments == 1
         assert result.context[0]['text'] == FACT
 
 
 def test_independent_requests_do_not_retain_prior_selection_limits():
-    first, _ = run(lambda *args: EvidenceSelection([fragment()], limits()))
-    second, _ = run(lambda *args: EvidenceSelection([fragment()]))
+    first, _ = run(lambda *args, **kwargs: EvidenceSelection([fragment()], limits()))
+    second, _ = run(lambda *args, **kwargs: EvidenceSelection([fragment()]))
     assert not first.trace['coverage_complete']
     assert second.trace['coverage_complete'] and second.trace['selection_limits'] == {}
 
@@ -148,7 +149,7 @@ def test_removed_carrier_is_coarsened_not_reattached_to_another_source():
     assert cleaned == limits()
     assert 'PRIVATE' not in json.dumps(cleaned) and 'removed.md' not in json.dumps(cleaned)
     assert 'selection_signals' not in kept
-    result, model = run(lambda *args: EvidenceSelection([removed, fragment()]), max_context_chars=100)
+    result, model = run(lambda *args, **kwargs: EvidenceSelection([removed, fragment()]), max_context_chars=100)
     assert len(result.context) == 1 and result.context[0]['file'] == 'public.md'
     assert not result.trace['coverage_complete']
     assert result.trace['selection_limits'] == limits()
@@ -175,7 +176,7 @@ def test_unknown_warning_reason_cannot_smuggle_source_names():
 
 
 def test_empty_selection_preserves_coarse_trace_without_generating_evidence():
-    result, model = run(lambda *args: EvidenceSelection([], limits()))
+    result, model = run(lambda *args, **kwargs: EvidenceSelection([], limits()))
     assert result.context == [] and result.trace['selection_limits'] == limits()
     assert not result.trace['coverage_complete']
     assert all(purpose != 'answer' for purpose, _ in model.calls)
@@ -201,9 +202,11 @@ def test_agent_select_callback_allocates_fresh_metadata_for_every_invocation(mon
     namespace = {'self': SimpleNamespace(_section_evidence_index=Index()), 'scope': {},
                  'matching_explicit_sources': lambda *args: set(), 'TOP_K': 10, 'os': os,
                  'filter_scoped_evidence': lambda evidence, *args, **kwargs: evidence,
-                 'refine_prism_query': lambda *args: None, 'EvidenceSelection': EvidenceSelection}
+                 'refine_prism_query': lambda *args: None, 'EvidenceSelection': EvidenceSelection,
+                 'SearchFocus': SearchFocus}
     exec(compile(ast.Module(body=[callback], type_ignores=[]), '<agent select callback>', 'exec'), namespace)
-    first, second = (namespace['select'](QUESTION, [], []) for _ in range(2))
+    first, second = (namespace['select'](QUESTION, [], [], search_focus=None, constraint_question=QUESTION)
+                     for _ in range(2))
     assert snapshots[0] is not snapshots[1]
     assert first.selection_limits == limits() and second.selection_limits == {}
 
@@ -398,7 +401,7 @@ def test_400_warning_rounds_remain_isolated_after_budget_filter():
     raw_limits = {'inventory_enumeration_scoped_warnings': many_warnings()}
     frozen = deepcopy((removed, raw_limits))
     invocations = []
-    def select(*args):
+    def select(*args, **kwargs):
         invocations.append(1)
         return (EvidenceSelection([removed, fragment()], raw_limits) if len(invocations) == 1
                 else EvidenceSelection([fragment()]))
@@ -414,7 +417,7 @@ def test_400_warning_rounds_remain_isolated_after_budget_filter():
 
 def test_changed_nonrepresentative_carrier_row_still_invalidates_coverage_reuse():
     snapshots = []
-    def select(*args):
+    def select(*args, **kwargs):
         rows = many_carrier_rows()
         rows[0]['section_path'] = f'Area > Low priority {len(snapshots)}'
         item = fragment(selection_signals={'missing_inventory_sections': rows})

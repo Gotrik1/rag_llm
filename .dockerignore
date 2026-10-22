@@ -1,6 +1,12 @@
 .git
 .github
 .venv
+.venv312/
+# Local QA data and generated deliverables are never application image input.
+output/
+tmp/
+artifacts/
+.playwright-cli/
 __pycache__
 .ingestion_cache
 .data

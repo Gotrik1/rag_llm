@@ -53,6 +53,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { clearCsrfToken, deleteJson, getJson, patchJson, postFormData, postJson, setCsrfToken } from "./api";
+import { contextFromCompletedJob, preserveContextSnapshot } from "./debugSnapshot";
 
 type Role = "user" | "assistant";
 type UploadTarget = "global" | "project" | "chat";
@@ -94,6 +95,7 @@ type ApiContextChunk = {
 
 type AskResponse = {
   answer: string;
+  chat_id?: string;
   message_id?: string;
   job_id?: string;
   status?: "running" | "complete";
@@ -317,6 +319,13 @@ function messageFromRecord(record: MessageRecord): ChatEntry {
   };
 }
 
+function isApiContextChunk(value: unknown): value is ApiContextChunk {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const chunk = value as Record<string, unknown>;
+  return typeof chunk.file === "string" && typeof chunk.text === "string"
+    && typeof chunk.score === "number" && Number.isFinite(chunk.score);
+}
+
 export function resultFromMessageRecord(record: MessageRecord): AskResponse | null {
   if (record.role !== "assistant" || record.status === "running") return null;
   const metadata = record.metadata ?? {};
@@ -333,7 +342,9 @@ export function resultFromMessageRecord(record: MessageRecord): AskResponse | nu
     : undefined;
   return {
     answer: record.content,
+    chat_id: record.chat_id,
     message_id: record.id,
+    job_id: typeof metadata.job_id === "string" && metadata.job_id.trim() ? metadata.job_id : undefined,
     status: record.status === "error" ? undefined : "complete",
     html_answer: record.content_html,
     from_cache: metadata.from_cache === true,
@@ -692,6 +703,8 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
   const [activeChatId, setActiveChatId] = useState("");
   const [managedProjectId, setManagedProjectId] = useState<string | null>(null);
   const activeChatIdRef = useRef("");
+  const lastResultRef = useRef<AskResponse | null>(null);
+  const debugRequestRef = useRef({ sequence: 0, inFlight: false });
   const [workspaceSettings, setWorkspaceSettings] = useState<Record<string, unknown>>({});
   const [workspaceError, setWorkspaceError] = useState("");
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
@@ -727,6 +740,8 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     activeChatIdRef.current = activeChatId;
   }, [activeChatId]);
 
+  useEffect(() => () => { debugRequestRef.current.sequence += 1; }, []);
+
   useEffect(() => {
     window.localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
@@ -735,21 +750,34 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     window.localStorage.setItem(SIDEBAR_COLLAPSED_KEY, JSON.stringify(isSidebarCollapsed));
   }, [isSidebarCollapsed]);
 
+  const updatePanelResult = useCallback((update: AskResponse | null | ((current: AskResponse | null) => AskResponse | null)) => {
+    const current = lastResultRef.current;
+    const next = typeof update === "function" ? update(current) : update;
+    if (current?.chat_id !== next?.chat_id || current?.message_id !== next?.message_id || current?.job_id !== next?.job_id) {
+      debugRequestRef.current = { sequence: debugRequestRef.current.sequence + 1, inFlight: false };
+      setDebugResult(null);
+      setDebugError("");
+      setIsDebugging(false);
+    }
+    lastResultRef.current = next;
+    setLastResult(next);
+  }, []);
+
   const resetThreadState = useCallback(() => {
     setMessages([]);
-    setLastResult(null);
+    updatePanelResult(null);
     setLastQuestion("");
     setDebugResult(null);
     setDebugError("");
     setActiveTab("system");
-  }, []);
+  }, [updatePanelResult]);
 
   const loadMessages = useCallback(async (chatId: string) => {
     const data = await getJson<{ items: MessageRecord[] }>(`/api/chats/${chatId}/messages`, API_TIMEOUT_MS);
     if (activeChatIdRef.current === chatId) {
       const restored = panelStateFromMessageRecords(data.items);
       setMessages(data.items.map(messageFromRecord));
-      setLastResult(restored.result);
+      updatePanelResult((current) => preserveContextSnapshot(restored.result, current));
       setLastQuestion(restored.question);
     }
     setRunningChatIds((current) => {
@@ -759,7 +787,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
       }
       return current.filter((runningChatId) => runningChatId !== chatId);
     });
-  }, []);
+  }, [updatePanelResult]);
 
   const loadDocuments = useCallback(async (projectId: string, chatId: string) => {
     if (!projectId && !chatId) {
@@ -920,14 +948,14 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     setActiveChatId(chat.id);
     activeChatIdRef.current = chat.id;
     replaceChatUrl(chat.id);
-    setLastResult(null);
+    updatePanelResult(null);
     setLastQuestion("");
     setDebugResult(null);
     setDebugError("");
     setActiveTab("system");
     await syncWorkspace(chat.projectId, chat.id);
     await loadMessages(chat.id);
-  }, [loadMessages, syncWorkspace]);
+  }, [loadMessages, syncWorkspace, updatePanelResult]);
 
   const selectProject = useCallback(async (projectId: string) => {
     const chat = chats.find((item) => item.projectId === projectId);
@@ -1156,7 +1184,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
 
     setMessages((current) => [...current, userMessage, assistantMessage]);
     setRunningChatIds((current) => current.includes(requestChatId) ? current : [...current, requestChatId]);
-    setLastResult(null);
+    updatePanelResult(null);
     setLastQuestion(question);
     setDebugResult(null);
     setDebugError("");
@@ -1181,7 +1209,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
       }
 
       if (activeChatIdRef.current === requestChatId) {
-        setLastResult(data);
+        updatePanelResult({ ...data, chat_id: requestChatId });
         await loadMessages(requestChatId);
       }
     } catch (error) {
@@ -1200,7 +1228,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
         setRunningChatIds((current) => current.filter((chatId) => chatId !== requestChatId));
       }
     }
-  }, [activeChatId, chats, loadMessages]);
+  }, [activeChatId, chats, loadMessages, updatePanelResult]);
 
   const adapter = useMemo<ExternalStoreAdapter<ChatEntry>>(
     () => ({
@@ -1224,35 +1252,46 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
   }, [createFreeChat]);
 
   const runDebug = useCallback(async () => {
-    if (!lastQuestion || isRunning || isDebugging) return;
+    if (isRunning || debugRequestRef.current.inFlight) return;
     setDebugError("");
     setActiveTab("debug");
-
-    // Debug must describe the same evidence that generated the visible
-    // answer.  The response already contains it, so a second retrieval would
-    // be slower and could select a different set of chunks.
-    if (lastResult) {
-      setDebugResult({
-        formulas: lastResult.formulas,
-        context: lastResult.context,
-        warnings: lastResult.warnings,
-        elapsed_s: lastResult.elapsed_s,
-        usage: lastResult.usage
-      });
+    const result = lastResultRef.current;
+    if (!result || result.chat_id !== activeChatId || !result.message_id) {
+      setDebugError("Нет сохранённого ответа для проверки. Новый поиск не выполнялся.");
       return;
     }
-
-    setIsDebugging(true);
-
-    try {
-      const data = await postJson<DebugResponse>("/api/debug", { question: lastQuestion, chat_id: activeChatId }, DEBUG_TIMEOUT_MS);
-      setDebugResult(data);
-    } catch (error) {
-      setDebugError(error instanceof Error ? error.message : "Ошибка debug-запроса");
-    } finally {
-      setIsDebugging(false);
+    if (Array.isArray(result.context)) {
+      setDebugResult({ ...result, context: result.context });
+      return;
     }
-  }, [activeChatId, isDebugging, isRunning, lastQuestion, lastResult]);
+    if (!result.job_id) {
+      setDebugError("Исходный контекст этого старого ответа не сохранён. Проверить его можно по ссылкам на документы; новый поиск не подменяет исходные данные.");
+      return;
+    }
+    const target = { chatId: activeChatId, messageId: result.message_id, jobId: result.job_id };
+    const sequence = debugRequestRef.current.sequence + 1;
+    debugRequestRef.current = { sequence, inFlight: true };
+    const isCurrent = () => activeChatIdRef.current === target.chatId
+      && lastResultRef.current?.chat_id === target.chatId
+      && lastResultRef.current?.message_id === target.messageId
+      && lastResultRef.current?.job_id === target.jobId
+      && debugRequestRef.current.sequence === sequence;
+    setIsDebugging(true);
+    try {
+      const job = await getJson<unknown>(`/api/jobs/${encodeURIComponent(target.jobId)}`, DEBUG_TIMEOUT_MS);
+      if (!isCurrent()) return;
+      const context = contextFromCompletedJob(job, target, isApiContextChunk);
+      updatePanelResult((current) => current ? { ...current, context } : current);
+      setDebugResult({ ...result, context });
+    } catch (error) {
+      if (isCurrent()) setDebugError(error instanceof Error ? error.message : "Не удалось загрузить исходный контекст ответа. Попробуйте ещё раз.");
+    } finally {
+      if (isCurrent()) {
+        debugRequestRef.current.inFlight = false;
+        setIsDebugging(false);
+      }
+    }
+  }, [activeChatId, isRunning, updatePanelResult]);
 
   const uploadFiles = useCallback(async (target: UploadTarget) => {
     if (target !== uploadTarget || !selectedFiles.length || isUploading) return;
@@ -3179,7 +3218,7 @@ function DebugPanel({
   lastQuestion: string;
   onDebug: () => void;
 }) {
-  const context = debugResult?.context ?? fallbackContext ?? [];
+  const context = debugResult?.context ?? fallbackContext;
 
   return (
     <>
@@ -3190,13 +3229,13 @@ function DebugPanel({
         type="button"
       >
         <Bug size={15} />
-        {isDebugging ? "Debug..." : "Debug context"}
+        {isDebugging ? "Загружаю контекст..." : "Debug context"}
       </button>
 
       {debugError ? <div className="warning">{debugError}</div> : null}
 
       <PanelSection title="Найденный контекст">
-        {context.length ? (
+        {context?.length ? (
           context.map((chunk, index) => (
             <div className="context-item" key={`${chunk.file}-${index}`}>
               <div className="source-file">
@@ -3218,7 +3257,13 @@ function DebugPanel({
             </div>
           ))
         ) : (
-          <div className="muted">Нажми Debug context, чтобы получить фрагменты без вызова модели.</div>
+          <div className="muted" role="status">
+            {isDebugging
+              ? "Загружается сохранённый контекст именно этого ответа. Новый поиск не выполняется."
+              : context
+                ? "Сохранённый контекст этого ответа пуст: фрагменты документов не передавались."
+                : "Нажмите Debug context, чтобы загрузить исходные фрагменты этого ответа, если они сохранены."}
+          </div>
         )}
       </PanelSection>
     </>

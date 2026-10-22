@@ -389,6 +389,7 @@ def list_messages(chat_id: str) -> list[dict]:
 def get_project_conversation(chat_id: str, limit: int = 40) -> dict | None:
     """Return project history, or only the active chat history for a free chat."""
     subject = current_subject()
+    active_user_history_limit = max(1, min(limit, 100))
     with read_cursor() as cur:
         ownership = " AND c.owner_subject = %s" if subject else ""
         scope_params: tuple[object, ...] = (chat_id, subject) if subject else (chat_id,)
@@ -445,7 +446,36 @@ def get_project_conversation(chat_id: str, limit: int = 40) -> dict | None:
                 message_params,
             )
         messages = [dict(row) for row in reversed(cur.fetchall())]
-    return {**dict(scope), "messages": messages}
+        # Resolve intent from this chat's user turns independently of the
+        # project feed: assistant replies and busy sibling chats must not
+        # consume its history budget. Retain IDs for exact clause provenance.
+        active_params: tuple[object, ...] = (
+            (chat_id, subject, active_user_history_limit + 1)
+            if subject else (chat_id, active_user_history_limit + 1)
+        )
+        cur.execute(
+            f"""
+            SELECT m.id AS id, c.id AS chat_id, m.role, m.content, m.created_at
+            FROM messages m
+            JOIN chats c ON c.id = m.chat_id
+            WHERE c.id = %s AND c.deleted_at IS NULL
+              {ownership}
+              AND m.deleted_at IS NULL AND m.status = 'complete'
+              AND m.role = 'user'
+            ORDER BY m.created_at DESC, m.id DESC
+            LIMIT %s
+            """,
+            active_params,
+        )
+        active_rows = cur.fetchall()
+        active_user_messages = [dict(row) for row in reversed(active_rows[:active_user_history_limit])]
+    return {
+        **dict(scope),
+        "messages": messages,
+        "active_user_messages": active_user_messages,
+        "active_user_history_limit": active_user_history_limit,
+        "active_user_history_truncated": len(active_rows) > active_user_history_limit,
+    }
 
 
 def create_message(chat_id: str, payload: dict) -> dict:

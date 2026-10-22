@@ -259,6 +259,53 @@ def storage_defaults() -> tuple[str, str, str]:
     )
 
 
+def current_chat_user_messages(scope: dict, chat_id: str) -> list[dict]:
+    """Prefer the dedicated chat window, never replenish it from a project feed.
+
+    An explicitly empty or malformed active window must fail closed. The
+    legacy feed fallback is only for callers that do not supply the new field.
+    """
+    if not chat_id:
+        return []
+    messages = scope.get("active_user_messages") if "active_user_messages" in scope else scope.get("messages", [])
+    if not isinstance(messages, (list, tuple)):
+        return []
+    return [message for message in messages
+            if isinstance(message, dict) and message.get("role") == "user"
+            and str(message.get("chat_id") or "") == str(chat_id)]
+
+
+def request_conversation_context(question: str, scope: dict, chat_id: str):
+    return resolve_conversation_context(
+        question, current_chat_user_messages(scope, chat_id), chat_id=chat_id,
+        occurrence_question=is_document_occurrence_question(question),
+    )
+
+
+def _writer_history(scope: dict, chat_id: str) -> tuple[list[str], dict]:
+    """Render the existing writer budget and report every resulting omission."""
+    messages = [message for message in current_chat_user_messages(scope, chat_id)
+                if str(message.get("content", "")).strip()]
+    entries, used, clipped = [], 0, 0
+    for message in reversed(messages):
+        content = str(message.get("content", "")).strip()
+        title = str(message.get("chat_title", "Чат"))[:120]
+        entry = f"[{title} | user] {content[:1800]}"
+        if used + len(entry) > 12_000:
+            break
+        entries.append(entry)
+        used += len(entry)
+        clipped += len(content) > 1800
+    entries.reverse()
+    omitted = len(messages) - len(entries)
+    return entries, {
+        "eligible_user_turns": len(messages), "included_user_turns": len(entries),
+        "omitted_user_turns": omitted, "clipped_user_turns": clipped,
+        "rendered_chars": used, "per_turn_char_limit": 1800, "total_char_limit": 12_000,
+        "truncated": bool(omitted or clipped),
+    }
+
+
 def project_context_prompt(scope: dict, chat_id: str = "") -> str:
     """Share project notes, but only this chat's user-authored conversation.
 
@@ -269,26 +316,7 @@ def project_context_prompt(scope: dict, chat_id: str = "") -> str:
     """
     memory = scope.get("memory") if isinstance(scope.get("memory"), dict) else {}
     memory_text = str(memory.get("text", "")).strip()
-    entries: list[str] = []
-    used = 0
-    for message in reversed(scope.get("messages", [])):
-        if not chat_id or str(message.get("chat_id") or "") != str(chat_id):
-            continue
-        # Prior model assertions are not evidence. The retrieval resolver and
-        # generator retain user intent without promoting old answers to facts.
-        if message.get("role") != "user":
-            continue
-        content = str(message.get("content", "")).strip()
-        if not content:
-            continue
-        title = str(message.get("chat_title", "Чат"))[:120]
-        role = str(message.get("role", "user"))
-        entry = f"[{title} | {role}] {content[:1800]}"
-        if used + len(entry) > 12_000:
-            break
-        entries.append(entry)
-        used += len(entry)
-    entries.reverse()
+    entries, writer_history = _writer_history(scope, chat_id)
     parts = [
         f"КОНТЕКСТ ПРОЕКТА: {scope.get('project_name', 'Проект')}",
         "Используй этот контекст только для продолжения работы в проекте. "
@@ -298,6 +326,9 @@ def project_context_prompt(scope: dict, chat_id: str = "") -> str:
     ]
     if memory_text:
         parts.append(f"ПАМЯТЬ ПРОЕКТА:\n{memory_text[:4000]}")
+    if scope.get("active_user_history_truncated") or writer_history["truncated"]:
+        parts.append("История запросов для ответа ограничена последними сообщениями и текстовым бюджетом. "
+                     "Не считай её полной и не придумывай отсутствующие предыдущие условия.")
     if entries:
         parts.append("ИСТОРИЯ ЗАПРОСОВ ТЕКУЩЕГО ЧАТА:\n" + "\n".join(entries))
     return "\n\n".join(parts)
@@ -305,12 +336,7 @@ def project_context_prompt(scope: dict, chat_id: str = "") -> str:
 
 def contextualize_retrieval_question(question: str, scope: dict, chat_id: str) -> str:
     """Reconstruct user intent from persisted same-chat turns, not model claims."""
-    return resolve_conversation_context(
-        question,
-        scope.get("messages", []),
-        chat_id=chat_id,
-        occurrence_question=is_document_occurrence_question(question),
-    ).retrieval_question
+    return request_conversation_context(question, scope, chat_id).retrieval_question
 
 
 def enrich_source_links(sources: list[dict]) -> list[dict]:
@@ -1626,10 +1652,14 @@ class Handler(BaseHTTPRequestHandler):
             warnings.append('Автоматическая проверка доказательств выполнена не полностью. Проверьте существенные выводы по ссылкам на документы.')
         if retrieval_trace.get('mode')=='corrective' and not retrieval_trace.get('coverage_complete'):
             warnings.append('Не все части вопроса удалось покрыть источниками. Ответ может быть неполным; проверьте ограничения и ссылки на документы.')
-        retrieval_trace['conversation_context'] = resolve_conversation_context(
-            question,scope.get('messages',[]),chat_id=chat_id,
-            occurrence_question=is_document_occurrence_question(question),
-        ).to_dict()
+        retrieval_trace['conversation_context'] = request_conversation_context(question,scope,chat_id).to_dict()
+        retrieval_trace['conversation_context']['history_window'] = {
+            'source':'active_chat_user_messages' if 'active_user_messages' in scope else 'legacy_message_feed',
+            'retained_user_turns':len(current_chat_user_messages(scope,chat_id)),
+            'limit':scope.get('active_user_history_limit'),
+            'truncated':bool(scope.get('active_user_history_truncated',False)),
+        }
+        retrieval_trace['conversation_context']['writer_history_window'] = _writer_history(scope,chat_id)[1]
         response_llm = llm_label({"provider":retrieval_trace['provider'],"model":retrieval_trace['model']}) \
             if retrieval_trace.get('mode')=='corrective' and retrieval_trace.get('model') else llm_label()
         self.send_json({

@@ -22,6 +22,7 @@ from evidence_anchors import (
     reconcile_evidence_families,
     resolve_passages,
 )
+from user_task import UserTask
 
 
 MAX_SOURCE_INPUT_CHARS = 96000
@@ -88,10 +89,11 @@ class SourceReading:
     unassessed_evidence_ids: tuple[str, ...] = ()
     unselected_passage_count: int = 0
     selection_limits: dict[str, Any] | None = None
+    user_task: UserTask | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-safe data, keeping selection judgments separate from proof."""
-        return {
+        result = {
             "snapshot_id": self.snapshot_id,
             "assessed": self.assessed,
             "assessment_kind": "source-selection-not-entailment",
@@ -110,6 +112,9 @@ class SourceReading:
             "unselected_passage_count": self.unselected_passage_count,
             "selection_limits": deepcopy(self.selection_limits or {}),
         }
+        if self.user_task is not None:
+            result["user_task"] = self.user_task.to_payload()
+        return result
 
 
 @dataclass(frozen=True)
@@ -121,6 +126,7 @@ class _Prepared:
     source_payload: list[dict[str, Any]]
     selection_limits: dict[str, Any]
     anchors: dict[str, dict[str, Any]]
+    user_task: UserTask | None = None
 
 
 def _json(value: Any) -> str:
@@ -146,9 +152,11 @@ def _plan_payload(plan: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _prepare(question, plan_payload, evidence, selection_limits) -> _Prepared:
+def _prepare(question, plan_payload, evidence, selection_limits, *, user_task: UserTask | None = None) -> _Prepared:
     if not isinstance(question, str):
         raise _ReaderFailure("invalid-question")
+    if user_task is not None and (not isinstance(user_task, UserTask) or user_task.question != question):
+        raise _ReaderFailure("invalid-user-task")
     plan = _plan_payload(plan_payload)
     if not isinstance(evidence, (list, tuple)) or any(not isinstance(item, Mapping) for item in evidence):
         raise _ReaderFailure("invalid-evidence")
@@ -162,11 +170,13 @@ def _prepare(question, plan_payload, evidence, selection_limits) -> _Prepared:
         row.update({key: deepcopy(record[key]) for key in _SOURCE_FIELDS if record.get(key) is not None})
     limits = normalize_inventory_selection_limits(selection_limits)
     data = {"question": question, "plan": plan, "evidence": payload, "selection_limits": limits}
+    if user_task is not None:
+        data["user_task"] = user_task.to_payload()
     serialized = _json(data)
     snapshot_id = "sha256:" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()
     if len(serialized) > MAX_SOURCE_INPUT_CHARS:
         raise _ReaderFailure("source-input-budget-exceeded")
-    return _Prepared(snapshot_id, question, plan, records, payload, limits, build_evidence_anchors(records))
+    return _Prepared(snapshot_id, question, plan, records, payload, limits, build_evidence_anchors(records), user_task)
 
 
 _INSTRUCTIONS = """Прочитай источники перед написанием ответа. Это отдельный этап выбора исходных фрагментов, а не ответ пользователю.
@@ -191,13 +201,24 @@ evidence_family.complete=false, evidence_excerpt, scoped_cohort_incomplete, defi
 
 
 def _prompt(prepared: _Prepared) -> str:
-    return _INSTRUCTIONS + _json({
+    data = {
         "snapshot_id": prepared.snapshot_id,
         "question": prepared.question,
         "plan": prepared.plan,
         "evidence": prepared.source_payload,
         "selection_limits": prepared.selection_limits,
-    })
+    }
+    instructions = _INSTRUCTIONS
+    if prepared.user_task is not None:
+        data["user_task"] = prepared.user_task.to_payload()
+        instructions = instructions.replace("ДАННЫЕ ЧТЕНИЯ:\n", (
+            "user_task содержит точный исходный вопрос и разрешённый контекст пользователя. "
+            "Это отдельная задача пользователя, а не пересказ модели из plan. "
+            "Предмет, уточнения и смысл ссылок вроде «это» определяй по user_task; "
+            "план может помогать поиску, но не заменяет и не изменяет эту задачу. "
+            "Факты по-прежнему бери только из evidence, не из пользовательского контекста.\n"
+            "ДАННЫЕ ЧТЕНИЯ:\n"))
+    return instructions + _json(data)
 
 
 def build_source_reading_prompt(
@@ -205,9 +226,11 @@ def build_source_reading_prompt(
     plan_payload: Mapping[str, Any],
     evidence: Sequence[Mapping[str, Any]],
     selection_limits: Mapping[str, Any] | None = None,
+    *,
+    user_task: UserTask | None = None,
 ) -> str:
     """Build a bounded prompt, raising ValueError without truncating sources."""
-    return _prompt(_prepare(question, plan_payload, evidence, selection_limits))
+    return _prompt(_prepare(question, plan_payload, evidence, selection_limits, user_task=user_task))
 
 
 def _unique_strings(value, *, maximum: int) -> tuple[str, ...]:
@@ -338,6 +361,7 @@ def _resolved_reading(prepared, cards, unresolved) -> SourceReading:
         _warnings(prepared),
         tuple(item["evidence_id"] for item in prepared.evidence if item["evidence_id"] not in selected_evidence),
         len(prepared.anchors) - len(selected), prepared.selection_limits,
+        prepared.user_task,
     )
     # Bound repeated provenance as well as unique quoted text. Exceeding this
     # limit discards the reading atomically, never a condition inside a quote.
@@ -353,6 +377,8 @@ def validated_writer_payload(
     evidence: Sequence[Mapping[str, Any]],
     selection_limits: Mapping[str, Any] | None = None,
     max_chars: int = 8192,
+    *,
+    user_task: UserTask | None = None,
 ) -> dict[str, Any] | None:
     """Rebind an entire reading to current sources, or omit the entire guide.
 
@@ -368,7 +394,7 @@ def validated_writer_payload(
         data = reading.to_dict() if isinstance(reading, SourceReading) else deepcopy(dict(reading))
         if data.get("assessed") is not True:
             return None
-        prepared = _prepare(question, plan_payload, evidence, selection_limits)
+        prepared = _prepare(question, plan_payload, evidence, selection_limits, user_task=user_task)
         judgments = data["judgments"]
         if not isinstance(judgments, dict) or set(judgments) != {"cards", "unresolved_requirement_ids"}:
             return None
@@ -414,6 +440,7 @@ def read_sources(
     complete: Callable[[str, str], str],
     *,
     selection_limits: Mapping[str, Any] | None = None,
+    user_task: UserTask | None = None,
 ) -> SourceReading:
     """Make at most one bounded selection call; fail closed without new facts.
 
@@ -422,7 +449,7 @@ def read_sources(
     """
     prepared = None
     try:
-        prepared = _prepare(question, plan_payload, evidence, selection_limits)
+        prepared = _prepare(question, plan_payload, evidence, selection_limits, user_task=user_task)
         if not prepared.anchors:
             raise _ReaderFailure("no-source-passages")
         try:
@@ -449,4 +476,6 @@ def read_sources(
             warnings=(code,), unassessed_evidence_ids=identifiers,
             unselected_passage_count=len(prepared.anchors) if prepared else 0,
             selection_limits=prepared.selection_limits if prepared else {},
+            user_task=prepared.user_task if prepared else (
+                user_task if isinstance(user_task, UserTask) and user_task.question == question else None),
         )

@@ -57,7 +57,7 @@ def source_selection(data):
 
 class PipelineFixture:
     def __init__(self, *, sources=None, plan=None, reading=None, covered=True,
-                 answers=None, repair=False, barrier=None):
+                 answers=None, repair=False, barrier=None, answer_assessed=True):
         self.sources = sources if sources is not None else [fragment()]
         self.plan = deepcopy(plan if plan is not None else PLAN)
         self.reading = reading
@@ -70,6 +70,7 @@ class PipelineFixture:
         self.answers_seen = []
         self.retrieval_calls = []
         self.judge_calls = 0
+        self.answer_assessed = answer_assessed
 
     def retrieve(self, question, queries, requirements, trace, *, search_focus, constraint_question):
         self.retrieval_calls.append((question, list(queries), list(requirements)))
@@ -95,14 +96,26 @@ class PipelineFixture:
         assert purpose == "evidence-review"
         if "Проверь доказательность ответа" in prompt:
             self.judge_calls += 1
-            # The first unsupported verdict drives bounded repair. Other prose
-            # deliberately remains unassessed; this fixture proves no facts.
-            claims = ([{"claim_id": "C1", "support": "unsupported", "passage_ids": []}]
-                      if self.repair and self.judge_calls == 1 else [])
+            # Explicit synthetic verdicts test stage transport, not judge
+            # accuracy. The unassessed-answer scenario opts out separately.
+            data = writer_data(prompt)
+            claims = []
+            if self.answer_assessed:
+                for candidate in data['answer_claims']:
+                    unsupported = self.repair and self.judge_calls == 1
+                    passages = [passage['passage_id'] for source in data['evidence']
+                                if source['evidence_id'] in candidate['cited_evidence_ids']
+                                for passage in source['passages']]
+                    claims.append({'claim_id': candidate['claim_id'],
+                        'support': 'unsupported' if unsupported else 'supported',
+                        'passage_ids': [] if unsupported else passages,
+                        'task_relevance': 'matched'})
             return json.dumps({"claims": claims})
         rows = ([{"requirement_id": "R1", "passage_ids": ["E1:P1"], "applicable": True}]
                 if self.covered else [])
-        return json.dumps({"coverage": rows, "missing_queries": [], "conflicts": []})
+        return json.dumps({"coverage": rows, "missing_queries": [], "conflicts": [],
+            'task_alignment': {'status': 'matched' if self.sources else 'uncertain',
+                               'passage_ids': ['E1:P1'] if self.sources else []}})
 
     def run(self, question=QUESTION, **options):
         return run_corrective(question, question, retrieve=self.retrieve, complete=self.complete,
@@ -224,7 +237,7 @@ def test_writer_budget_rejects_entire_valid_reading_without_pruning_sources():
 
 
 def test_reading_does_not_promote_incomplete_coverage_or_unassessed_answer():
-    model = PipelineFixture(covered=False)
+    model = PipelineFixture(covered=False, answer_assessed=False)
     result = model.run(read_before_answer=True)
     data = model.answers_seen[0]
     assert result.trace["source_reading"]["applied"] is True

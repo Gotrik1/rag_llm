@@ -17,8 +17,8 @@ from test_corrective_integration import FakeModel, agent_with_fake_dependencies,
 
 
 class PlannedModel(FakeModel):
-    def __init__(self, plan):
-        super().__init__()
+    def __init__(self, plan, **fixture_judgments):
+        super().__init__(**fixture_judgments)
         self.plan = plan
 
     def complete(self, prompt, **kwargs):
@@ -87,7 +87,10 @@ def test_model_document_name_does_not_create_a_new_single_source_filter(focus):
 def test_constraints_use_resolved_user_context_not_short_followup_or_model_rewrite():
     resolved = "Тема: Сравни режимы датчика 17 и 28\nНе рассматривай аварийное отключение."
     canonical = "Сравнение режимов датчика"
-    agent = agent_with_fake_dependencies(PlannedModel(plan(canonical)))
+    # The channel-control fixture does not establish sensor-mode facts. This
+    # test checks task transport only, so do not fake a semantic match to it.
+    agent = agent_with_fake_dependencies(PlannedModel(
+        plan(canonical), task_alignment="uncertain", assess_claims=False))
 
     agent.ask("А между ними какая разница?", retrieval_query=resolved, pipeline_mode="on")
 

@@ -169,12 +169,20 @@ def test_pipeline_reuses_existing_repair_for_source_supported_but_excluded_text(
                 self.judge_calls += 1
                 data = json.JSONDecoder().raw_decode(prompt[prompt.index('{"question":'):])[0]
                 rows = [{"claim_id":item["claim_id"],"support":"supported","passage_ids":["E1:P1"],
+                         # This fixture isolates the separate exclusion check;
+                         # it is not a semantic quality assessment of either model verdict.
+                         "task_relevance":"matched",
                          "scope_disposition":"excluded" if extra in item["text"] else "in_scope",
                          "excluded_topic_ids":["X1"] if extra in item["text"] else []}
                         for item in data["answer_claims"]]
                 assert ("task_scope" in data) == scope_enabled
                 return json.dumps({"claims":rows})
-            return super().complete(prompt,purpose)
+            response = super().complete(prompt,purpose)
+            if purpose == "evidence-review":
+                data = json.loads(response)
+                data["task_alignment"] = {"status":"matched","passage_ids":["E1:P1"]}
+                return json.dumps(data)
+            return response
 
     model = TaskJudge(answers=[bad,FACT + " [E1]"])
     model.sources[0]["text"] = FACT + " " + extra

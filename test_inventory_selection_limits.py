@@ -14,6 +14,7 @@ from evidence_anchors import (evidence_anchor_payload, inventory_limits_after_fi
                               normalize_inventory_selection_limits)
 from evals import oracle_ablation
 from search_focus import SearchFocus
+from grounding_verifier import extract_answer_claims
 
 
 FACT = 'Канал проходит два этапа контроля.'
@@ -53,11 +54,25 @@ class LocalModel:
             return FACT + ' [E1]'
         if prompt.startswith('Оцени полноту'):
             self.assessments += 1
-            return json.dumps({'coverage': [{'requirement_id': 'R1', 'passage_ids': ['E1:P1'],
-                                            'applicable': True}],
+            payload = json.loads(prompt.splitlines()[-1])
+            passage_ids = [passage['passage_id'] for item in payload['evidence']
+                           for passage in item['passages'] if passage['text'] == FACT]
+            return json.dumps({'coverage': ([{'requirement_id': 'R1', 'passage_ids': passage_ids,
+                                             'applicable': True}] if passage_ids else []),
+                               'task_alignment': {'status': 'matched' if passage_ids else 'uncertain',
+                                                  'passage_ids': passage_ids},
                                'missing_queries': [f'Уточнение этапов {self.assessments}'], 'conflicts': []})
-        return json.dumps({'claims': [{'claim': FACT, 'support': 'supported',
-                                      'passage_ids': ['E1:P1']}]})
+        payload = json.JSONDecoder().raw_decode(prompt[prompt.index('{"question":'):])[0]
+        if payload['answer'] != FACT + ' [E1]':
+            pytest.fail('Positive inventory fake received an unexpected answer')
+        passage_ids = [passage['passage_id'] for item in payload['evidence']
+                       if item['evidence_id'] == 'E1'
+                       for passage in item['passages'] if passage['text'] == FACT]
+        if not passage_ids:
+            pytest.fail('Positive inventory fake requires the cited fixture fact')
+        return json.dumps({'claims': [{'claim_id': claim['claim_id'], 'support': 'supported',
+                                      'passage_ids': passage_ids, 'task_relevance': 'matched'}
+                                     for claim in extract_answer_claims(payload['answer'])]})
 
 
 def run(select=None, rounds=0, **options):

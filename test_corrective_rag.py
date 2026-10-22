@@ -19,11 +19,13 @@ def coverage(quote=FACT, identifier="E1", *, queries=None, applicable=True):
     return {"coverage": [{"requirement_id": "R1", "evidence_ids": [identifier],
                            "quotes": [{"evidence_id": identifier, "quote": quote}],
                            "applicable": applicable}],
+            "task_alignment": {"status":"matched", "passage_ids":[f"{identifier}:P1"]},
             "missing_queries": queries or [], "conflicts": []}
 
 
 def claim(quote=FACT, identifier="E1", text=FACT, support="supported"):
-    return {"claim": text, "support": support, "evidence_ids": [identifier],
+    return {"claim_id":"C1", "task_relevance":"matched",
+            "claim": text, "support": support, "evidence_ids": [identifier],
             "quotes": [{"evidence_id": identifier, "quote": quote}]}
 
 
@@ -52,7 +54,11 @@ class Model:
             return json.dumps({"claims": self.claims}, ensure_ascii=False)
         index = min(self.review_count, len(self.reviews) - 1)
         self.review_count += 1
-        return json.dumps(self.reviews[index], ensure_ascii=False)
+        # This positive fake explicitly assesses the original task. Tests for
+        # missing/malformed authority judgments use the dedicated strict suite.
+        review = {"task_alignment":{"status":"matched","passage_ids":["E1:P1"]},
+                  **self.reviews[index]}
+        return json.dumps(review, ensure_ascii=False)
 
 
 class Retrieval:
@@ -295,7 +301,7 @@ def test_wrong_formula_gets_one_repair_then_only_bad_span_is_removed():
     assert result.trace["verification"]["partial_answer"] is True
     assert FACT in result.answer
     assert "D=A+B+G" not in result.answer
-    assert "Не удалось подтвердить часть ответа" in result.answer
+    assert "Часть ответа не включена" in result.answer
 
 
 def test_planner_cannot_invent_category_for_general_question():
@@ -340,24 +346,33 @@ def test_no_evidence_never_generates_an_invented_answer():
     assert result.trace["coverage_complete"] is False
 
 
-def test_judge_outage_does_not_certify_answer_or_discard_useful_prose():
+def test_judge_outage_does_not_certify_or_publish_a_task_unassessed_draft():
     model = Model(judge_error=RuntimeError("Synthetic judge outage"))
     result = run_corrective(QUESTION, QUESTION, retrieve=Retrieval(), complete=model)
     assert result.trace["verification"]["initial"]["assessment_complete"] is False
-    assert FACT in result.answer
+    assert FACT not in result.answer
+    assert "Не удалось надёжно сопоставить" in result.answer
+    assert model.answer_count == 2
 
 
 def test_judge_timeout_is_degraded_verification_not_a_crashed_session():
     model = Model(judge_error=TimeoutError("Synthetic judge timeout"))
     result = run_corrective(QUESTION, QUESTION, retrieve=Retrieval(), complete=model)
     assert result.trace["verification"]["initial"]["assessment_complete"] is False
-    assert FACT in result.answer
+    assert FACT not in result.answer
+    assert "Не удалось надёжно сопоставить" in result.answer
+    assert model.answer_count == 2
 
 
 def test_user_answer_length_is_not_artificially_capped_by_orchestrator():
-    long_answer = (FACT + " [E1]\n\n") * 600
-    model = Model(answers=[long_answer], claims=[])
-    result = run_corrective(QUESTION, QUESTION, retrieve=Retrieval(), complete=model)
+    # One fully assessed long factual span: this tests length, not permission to
+    # publish hundreds of claims that the judge never assessed.
+    long_fact = ('контроль ' * 5000).strip() + '.'
+    long_answer = long_fact + ' [E1]'
+    model = Model(answers=[long_answer], reviews=[coverage(long_fact)],
+                  claims=[claim(long_fact,text=long_fact)])
+    result = run_corrective(QUESTION, QUESTION, retrieve=Retrieval([fragment(long_fact)]), complete=model,
+                            max_context_chars=len(long_fact)+100)
     assert len(result.answer) == len(long_answer.strip())
     assert model.answer_count == 1
 

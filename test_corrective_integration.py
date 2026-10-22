@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from rag_agent import RAGAgent, human_source_reference
+from grounding_verifier import extract_answer_claims
 
 
 def test_explicit_request_model_label_does_not_reread_other_chats_settings(monkeypatch):
@@ -36,9 +37,12 @@ def evidence(name="Проверка каналов.md", section="Основно�
 class FakeModel:
     """Deterministic completions with the same prompt API as provider wrappers."""
 
-    def __init__(self, *, answer=None, additional_search=False):
+    def __init__(self, *, answer=None, additional_search=False, assess_claims=True,
+                 task_alignment="matched"):
         self.answer = answer or FACT + " [E1]"
         self.additional_search = additional_search
+        self.assess_claims = assess_claims
+        self.task_alignment = task_alignment
         self.local = threading.local()
         self.calls = []
         self.metadata = SimpleNamespace(context_window=32768)
@@ -49,21 +53,46 @@ class FakeModel:
             self.local.reviews = 0
             value = {"requirements": ["Описать этапы контроля"], "queries": ["Контроль измерительных каналов"]}
         elif "Проверь доказательность ответа" in prompt:
-            # Grounding semantics are tested separately; this contract verifies
-            # transport wiring and resolution only, not a fake judge's accuracy.
-            value = {"claims": []}
+            # Positive wiring fixtures explicitly assess their sole known fact.
+            # This is test intent, not a substitute for a real semantic judge.
+            payload = json.JSONDecoder().raw_decode(prompt[prompt.index('{"question":'):])[0]
+            claim_inputs = {row["claim_id"]: row for row in payload["answer_claims"]}
+            rows = []
+            if self.assess_claims:
+                for claim in extract_answer_claims(payload["answer"]):
+                    if re.sub(r"\[[^\]]+\]", "", claim["text"]).strip() != FACT:
+                        pytest.fail("Positive fake judge received an unexpected factual claim")
+                    cited = claim_inputs[claim["claim_id"]]["cited_evidence_ids"]
+                    passage_ids = self._fact_passages(payload, cited)
+                    if not passage_ids:
+                        pytest.fail("Positive fake judge requires the cited fixture fact")
+                    rows.append({"claim_id": claim["claim_id"], "support": "supported",
+                                 "passage_ids": passage_ids,
+                                 "task_relevance": self.task_alignment})
+            value = {"claims": rows}
         elif prompt.startswith("Оцени полноту"):
+            payload = json.loads(prompt.splitlines()[-1])
+            passage_ids = self._fact_passages(payload)
             count = getattr(self.local, "reviews", 0)
             self.local.reviews = count + 1
             if self.additional_search and count == 0:
                 value = {"coverage": [], "missing_queries": ["Порядок дополнительной проверки канала"], "conflicts": []}
             else:
-                value = {"coverage": [{"requirement_id": "R1", "evidence_ids": ["E1"],
-                                       "quotes": [{"evidence_id": "E1", "quote": FACT}], "applicable": True}],
+                value = {"coverage": ([{"requirement_id": "R1", "passage_ids": passage_ids,
+                                        "applicable": True}] if passage_ids else []),
                          "missing_queries": [], "conflicts": []}
+            value["task_alignment"] = {
+                "status": self.task_alignment if passage_ids else "uncertain",
+                "passage_ids": passage_ids if self.task_alignment == "matched" else []}
         else:
             return self.answer
         return json.dumps(value, ensure_ascii=False)
+
+    @staticmethod
+    def _fact_passages(payload, cited=None):
+        return [passage["passage_id"] for item in payload["evidence"]
+                if cited is None or item["evidence_id"] in cited
+                for passage in item["passages"] if passage["text"] == FACT]
 
 
 class FakeIndex:
@@ -237,6 +266,21 @@ def test_environment_switch_enables_corrective_mode_without_signature_change(mon
     assert agent.last_retrieval_trace()["mode"] == "corrective"
 
 
+def test_unassessed_claims_are_withheld_after_one_bounded_repair():
+    model = FakeModel(assess_claims=False)
+    agent = agent_with_fake_dependencies(model)
+    answer, _, _ = agent.ask(QUESTION, pipeline_mode="on")
+    assert FACT not in answer
+    assert "Не удалось надёжно сопоставить" in answer
+    verification = agent.last_retrieval_trace()["verification"]
+    for stage in ("initial", "after_repair"):
+        assert verification[stage]["assessment_complete"] is False
+        assert verification[stage]["task_relevance"]["claim_counts"]["unassessed"] == 1
+    assert verification["partial_answer"] is True
+    assert len(model.calls) == 6  # Plan, coverage, writer/judge, one repair writer/judge.
+    assert len(agent.retrieve_calls) == 1
+
+
 def test_later_legacy_request_does_not_reuse_previous_corrective_trace():
     agent = agent_with_fake_dependencies()
     agent.ask(QUESTION, pipeline_mode="on")
@@ -251,7 +295,7 @@ def test_later_legacy_request_does_not_reuse_previous_corrective_trace():
 def test_structured_retrieval_context_reaches_planner_without_changing_original_question():
     enriched = "Тема: Сравни 3 и 6 ЦК\nТолько покупную мощность; сетевую не смотри"
     original = "Ответь точно и кратко"
-    agent = agent_with_fake_dependencies()
+    agent = agent_with_fake_dependencies(FakeModel(task_alignment="uncertain", assess_claims=False))
     agent.ask(original, pipeline_mode="on", retrieval_query=enriched)
     planning = [prompt for _, prompt, _ in agent.llm.calls if prompt.startswith("Планируй поиск")]
     assert len(planning) == 1

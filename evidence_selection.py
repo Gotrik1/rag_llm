@@ -9,6 +9,8 @@ import hashlib
 import math
 import os
 import re
+import unicodedata
+from bisect import bisect_left
 from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
@@ -758,6 +760,189 @@ def source_key(value: object) -> str:
     return Path(str(value or "")).name.casefold()
 
 
+_SOURCE_REFERENCE_EXTENSIONS = frozenset({
+    '.docx', '.pdf', '.md', '.txt', '.png', '.jpg', '.jpeg', '.webp', '.tif', '.tiff', '.bmp',
+})
+_SOURCE_REFERENCE_CUE = (
+    r'(?:документ[^\W\d_]*|файл[^\W\d_]*|методик[^\W\d_]*|постановлен[^\W\d_]*|пп|'
+    r'регламент[^\W\d_]*|инструкц[^\W\d_]*|'
+    r'documents?|files?|regulations?|instructions?|standards?|protocols?)'
+)
+_SOURCE_VERSION_ID = re.compile(r'(?:v|ver|version|rev|revision|вер|версия|ред|редакция)\d+', re.I)
+
+
+def _source_reference_normalize(value: object) -> str:
+    return unicodedata.normalize('NFC', str(value or '')).casefold().replace('ё', 'е').replace('\\', '/')
+
+
+def _source_reference_basename(value: object) -> str:
+    return str(value or '').replace('\\', '/').rsplit('/', 1)[-1]
+
+
+def _source_reference_stem(value: str) -> str:
+    name = _source_reference_normalize(_source_reference_basename(value))
+    suffix = Path(name).suffix
+    if suffix in _SOURCE_REFERENCE_EXTENSIONS:
+        name = name[:-len(suffix)]
+    return re.sub(r'^[0-9a-f]{32}_', '', name)
+
+
+def _source_reference_is_filename(value: str) -> bool:
+    suffix = Path(_source_reference_basename(value)).suffix
+    return bool(re.fullmatch(r'\.[^\W\d_]\w{0,15}', suffix))
+
+
+def _source_reference_words(value: str) -> list[tuple[str, int, int]]:
+    # Keep the entire question: treating it as Path(...).stem loses a second
+    # reference after the first embedded filename's dot.
+    return [(_stem_word(match[0]), match.start(), match.end())
+            for match in re.finditer(r'[^\W_]+', value)]
+
+
+def _source_catalogue_records(source_aliases: dict[str, str] | None):
+    return tuple((_source_reference_basename(source).casefold(), tuple(dict.fromkeys(
+        _source_reference_normalize(name) for value in (alias, source)
+        for name in (value, _source_reference_basename(value)) if name)))
+        for source, alias in (source_aliases or {}).items())
+
+
+def _source_exact_mentions(query: str, records):
+    exact = []
+    named = set()
+    for key, names in records:
+        for name in names:
+            pattern = r'(?<![\w.\-])' + re.escape(name) + r'(?!\w|[-.]\w)'
+            for match in re.finditer(pattern, query):
+                start, end = match.span()
+                exact.append((start, end, key))
+                filename = _source_reference_is_filename(name)
+                local_cue = re.search(r'(?<!\w)' + _SOURCE_REFERENCE_CUE + r'[ \t:№"«]*$', query[:start], re.I)
+                quoted = start > 0 and query[start - 1] in '"«“\'' and end < len(query) and query[end] in '"»”\''
+                # A topic or a year is not an identity just because somebody
+                # registered it as a caption. It must be locally *named*.
+                if filename or local_cue or quoted:
+                    named.add((start, end))
+
+    # Extensionless captions can join a directly coordinated document list,
+    # e.g. "Alpha.docx and Beta Handbook". Only connector text is allowed in
+    # the gap: a source cue elsewhere cannot turn the answer's topic into a ref.
+    spans = sorted({(start, end) for start, end, _ in exact})
+    starts = [start for start, _ in spans]
+    links = {span: [] for span in spans}
+    connector = re.compile(r'\s*,?\s*(?:и|или|а\s+также|and|or|with|с|versus|vs\.?)\s*', re.I)
+    for span in spans:
+        next_index = bisect_left(starts, span[1])
+        if next_index == len(spans) or not connector.fullmatch(query[span[1]:spans[next_index][0]]):
+            continue
+        next_start = spans[next_index][0]
+        while next_index < len(spans) and spans[next_index][0] == next_start:
+            adjacent = spans[next_index]
+            links[span].append(adjacent)
+            links[adjacent].append(span)
+            next_index += 1
+    pending = list(named)
+    while pending:
+        for adjacent in links[pending.pop()]:
+            if adjacent not in named:
+                named.add(adjacent)
+                pending.append(adjacent)
+    return [row for row in exact if row[:2] in named]
+
+
+def source_reference_remainder(question: str, source_aliases: dict[str, str] | None) -> str:
+    """Leave only independent references for legacy abbreviated-name handling."""
+    query = _source_reference_normalize(question)
+    parts, cursor = [], 0
+    for start, end, _ in sorted(_source_exact_mentions(query, _source_catalogue_records(source_aliases))):
+        if start >= cursor:
+            parts.extend((query[cursor:start], ' ' * (end - start)))
+        elif end > cursor:
+            parts.append(' ' * (end - cursor))
+        cursor = max(cursor, end)
+    return ''.join((*parts, query[cursor:]))
+
+
+def matching_catalogue_sources(question: str, source_aliases: dict[str, str] | None) -> set[str]:
+    """Resolve named references only from the caller's already-visible catalogue.
+
+    Full names win *at the same occurrence*, not globally: a separately named
+    second source still joins the set. Years, versions and partial business
+    descriptions never become document identities by loose token overlap.
+    """
+    query = _source_reference_normalize(question)
+    if not query or not source_aliases:
+        return set()
+    records = _source_catalogue_records(source_aliases)
+    exact = _source_exact_mentions(query, records)
+
+    matched = set()
+    occupied: list[tuple[int, int]] = []
+
+    def overlaps(start, end):
+        return any(start < right and end > left for left, right in occupied)
+
+    # Prefer a complete long filename over another catalogue name occurring as
+    # its suffix, but preserve duplicate visible aliases at exactly the same span.
+    for start, end, key in sorted(exact, key=lambda row: (-(row[1] - row[0]), row[0])):
+        if (start, end) in occupied or not overlaps(start, end):
+            matched.add(key)
+            if (start, end) not in occupied:
+                occupied.append((start, end))
+
+    query_words = _source_reference_words(query)
+    numeric_mentions = []
+    number_list = r'\d+(?:[ \t]*(?:,|/|и\b|или\b|and\b)[ \t]*(?:(?:№|n(?:o)?\.?)\s*)?\d+)*'
+    numeric_pattern = (r'(?<!\w)' + _SOURCE_REFERENCE_CUE
+                       + r'[ \t]*(?:(?:№|n(?:o)?\.?)\s*)?(' + number_list + r')(?!\w)')
+    for mention in re.finditer(numeric_pattern, query, re.I):
+        if not overlaps(mention.start(), mention.end()):
+            numeric_mentions.append(set(re.findall(r'\d+', mention[1])))
+
+    for key, names in records:
+        compact_ids = set()
+        numbers = set()
+        titles = set()
+        for name in names:
+            stem = _source_reference_stem(name)
+            for token in re.findall(r'[^\W_]+', stem):
+                if (re.fullmatch(r'[^\W\d_]+\d+', token)
+                        and not _SOURCE_VERSION_ID.fullmatch(token)):
+                    compact_ids.add(token)
+            numbers.update(re.findall(r'(?<!\w)(?:№|n(?:o)?\.?)\s*(\d+)(?!\w)', stem))
+            if stem.isdigit():
+                numbers.add(stem)
+            # A full inflected title may omit a trailing version label. This is
+            # a contiguous title match, never a bag of two generic shared words.
+            title = re.sub(r'(?:[ _-]+(?:v|ver|version|rev|revision|версия|редакция)\s*\d+)+$', '', stem)
+            words = tuple(word for word, _, _ in _source_reference_words(title))
+            if len(words) >= 2:
+                titles.add((words, _source_reference_is_filename(name)))
+
+        for compact in compact_ids:
+            identity = re.fullmatch(r'([^\W\d_]+)(\d+)', compact)
+            pattern = (r'(?<!\w)' + re.escape(identity[1]) + r'[ \t]*[-\u2010\u2011\u2013\u2014]?[ \t]*'
+                       + re.escape(identity[2]) + r'(?!\w|[-.]\w)')
+            if any(not overlaps(match.start(), match.end()) for match in re.finditer(pattern, query)):
+                matched.add(key)
+        if any(numbers & mentioned for mentioned in numeric_mentions):
+            matched.add(key)
+        for title, filename_title in titles:
+            width = len(title)
+            for index in range(len(query_words) - width + 1):
+                window = query_words[index:index + width]
+                if tuple(word for word, _, _ in window) != title or overlaps(window[0][1], window[-1][2]):
+                    continue
+                start, end = window[0][1], window[-1][2]
+                # Extensionless prose is named only locally: a source-kind word
+                # in the title, quotation, or an immediately preceding source cue.
+                local_cue = re.search(_SOURCE_REFERENCE_CUE + r'[ \t:№"«]*$', query[:start], re.I)
+                title_cue = filename_title and re.match(_SOURCE_REFERENCE_CUE + r'\b', query[start:end], re.I)
+                quoted = start > 0 and query[start - 1] in '"«“\'' and end < len(query) and query[end] in '"»”\''
+                if local_cue or title_cue or quoted:
+                    matched.add(key)
+    return matched
+
+
 def requested_source_kind(question: str) -> str | None:
     value = question.casefold()
     if re.search(r"(?:по|согласно|из|смотреть|только)\s+(?:норм\w*\s+)?постановлен\w*", value):
@@ -916,27 +1101,41 @@ class SectionEvidenceIndex:
 
     def body_seeds(self, question: str, limit: int = 24, *, mode: str = 'legacy',
                    search_focus: SearchFocus | None = None,
-                   constraint_question: str | None = None) -> list[dict]:
+                   constraint_question: str | None = None,
+                   excluded_sources: set[str] | None = None,
+                   allowed_sources: set[str] | None = None) -> list[dict]:
         """Find positive subject matches, independently of vector similarity.
 
         Generic price/action words cannot anchor a match. Require at least two
         subject words and a rare anchor, so incidental mentions in a large
         manual do not swamp an exact fact in a small document.
         """
+        # Visibility must precede both rarity statistics and a lossy quota.
+        # Otherwise inaccessible short matches can exhaust the body channel
+        # before the selector gets an opportunity to enforce the same scope.
+        excluded = {source_key(value) for value in (excluded_sources or ())}
+        allowed = ({source_key(value) for value in allowed_sources}
+                   if allowed_sources is not None else None)
+        eligible_positions = {position for position, item in enumerate(self.body_items)
+                              if source_key(item.get('file')) not in excluded
+                              and (allowed is None or source_key(item.get('file')) in allowed)
+                              and item.get('status') != 'deleted'}
         if mode == 'coverage':
             return self._body_seeds_v2(question, limit, search_focus=search_focus,
-                                       constraint_question=constraint_question)
+                                       constraint_question=constraint_question,
+                                       eligible_positions=eligible_positions)
         keys = term_keys(question) - _LOOKUP_WORDS
         if len(keys) < 2:
             return []
-        count = max(1, len(self.body_items))
-        weights = {key: math.log1p(count / (1 + len(self.body_postings.get(key, ())))) for key in keys}
-        positions = set().union(*(self.body_postings.get(key, set()) for key in keys))
+        count = max(1, len(eligible_positions))
+        postings = {key: self.body_postings.get(key, set()) & eligible_positions for key in keys}
+        weights = {key: math.log1p(count / (1 + len(postings[key]))) for key in keys}
+        positions = set().union(*postings.values())
         results = []
         for position in positions:
             item = self.body_items[position]
-            matched = {key for key in keys if position in self.body_postings.get(key, ())}
-            rare_anchor = any(len(self.body_postings[key]) <= max(2, count * 0.1) for key in matched)
+            matched = {key for key in keys if position in postings[key]}
+            rare_anchor = any(len(postings[key]) <= max(2, count * 0.1) for key in matched)
             if len(matched) < 2 or len(matched) / len(keys) < 0.75 or not rare_anchor:
                 continue
             coverage = len(matched) / len(keys)
@@ -947,18 +1146,22 @@ class SectionEvidenceIndex:
         return sorted(results, key=lambda item: (-item['score'], len(item['text']), source_key(item['file'])))[:limit]
 
     def _body_seeds_v2(self, question: str, limit: int, *, search_focus: SearchFocus | None = None,
-                       constraint_question: str | None = None) -> list[dict]:
+                       constraint_question: str | None = None,
+                       eligible_positions: set[int] | None = None) -> list[dict]:
         profiles = _subject_profiles(question, search_focus)
         if not any(profiles) or limit <= 0:
             return []
         authority = constraint_question if constraint_question is not None else question
         requested = _category_ids(_positive_query(authority)[0])
-        count = max(1, len(self.body_items))
+        eligible_positions = (set(range(len(self.body_items))) if eligible_positions is None
+                              else eligible_positions)
+        count = max(1, len(eligible_positions))
         results = {}
         for groups in profiles:
             if not groups:
                 continue
-            postings = [set().union(*(self.body_postings.get(key, ()) for key in group)) for group in groups]
+            postings = [set().union(*(self.body_postings.get(key, ()) for key in group)) & eligible_positions
+                        for group in groups]
             for position in set().union(*postings):
                 item = self.body_items[position]
                 scope = _scope_categories(item)
@@ -1205,8 +1408,9 @@ class SectionEvidenceIndex:
         # matched. Reassemble its own section, not an arbitrary chosen document.
         for rank, item in enumerate(ranked):
             offer(item, 'retrieval-rank', rank=rank)
-        for item in self._body_seeds_v2(question, max(24, top_k * 3), search_focus=search_focus,
-                                       constraint_question=authoritative):
+        for item in self.body_seeds(question, max(24, top_k * 3), mode='coverage',
+                                    search_focus=search_focus, constraint_question=authoritative,
+                                    excluded_sources=excluded, allowed_sources=allowed_sources):
             offer(item, 'body-coverage')
         roots = []
         for section in sections:

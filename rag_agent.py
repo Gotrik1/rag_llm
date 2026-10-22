@@ -74,7 +74,7 @@ VECTOR_TOP_K     = 12      # кандидатов от вектора
 # A semantic/chunking change must never reuse an older docstore or vector
 # collection: the two indexes must describe precisely the same corpus.
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25_v12"))
-CACHE_VERSION    = "v38-body-lexical-2026-10-13"
+CACHE_VERSION    = "v39-source-scope-and-math-2026-10-22"
 QUERY_UNDERSTANDING_VERSION = "v2"
 MAX_OUTPUT_TOKENS = int(os.environ.get("RAG_MAX_OUTPUT_TOKENS", "-1"))
 
@@ -1012,42 +1012,20 @@ def source_reference_tokens(value: str) -> set[str]:
 
 def matching_explicit_sources(question: str, source_aliases: dict[str, str] | None) -> set[str]:
     """Resolve an explicitly named visible document to its indexed source id."""
-    query_tokens = source_reference_tokens(question)
-    query_numbers = {token for token in query_tokens if token.isdigit() and len(token) >= 2}
-    normalized_question = (question or "").casefold().replace("ё", "е")
+    from evidence_selection import matching_catalogue_sources, source_reference_remainder
+
+    matches = matching_catalogue_sources(question, source_aliases)
+    normalized_question = source_reference_remainder(question, source_aliases)
     requested_category = price_category_number(normalized_question)
-    has_method_cue = bool(re.search(r"\bметодик\w*\b", normalized_question))
-    has_source_cue = bool(re.search(
-        r"\b(?:документ\w*|файл\w*|методик\w*|постановлен\w*|пп|регламент\w*|инструкц\w*)\b",
+    # Preserve the existing abbreviated methodology/category reference. A
+    # generic methodology word elsewhere, or inside a complete filename, must
+    # not expand an independently named document's hard scope.
+    has_method_cue = bool(re.search(
+        r"\bметодик\w*\s+(?:расчет\w*\s+)?[1-6]\s*цк(?!\w|\.\w)",
         normalized_question,
     ))
-    matches: set[str] = set()
     for source, alias in (source_aliases or {}).items():
-        alias_tokens = source_reference_tokens(alias)
-        overlap = query_tokens & alias_tokens
-        alpha_overlap = {token for token in overlap if not token.isdigit()}
-        # A bare business number ("1 ЦК") is not a document reference.  Once
-        # the user explicitly says "постановление 442/1179", however, the
-        # number is the most stable identifier and must resolve even when the
-        # grammatical form differs ("постановление"/"постановлений").
-        numeric_anchor = bool(has_source_cue and query_numbers & alias_tokens)
-        # Two generic words from a business phrase (for example, "расчета
-        # стоимости") must not be interpreted as an explicit document name.
-        # Such a false positive turns a soft semantic question into a hard
-        # single-document filter and hides otherwise exact evidence.
-        descriptive_anchor = (
-            has_source_cue
-            and
-            len(alpha_overlap) >= 2
-            and sum(map(len, alpha_overlap)) >= 8
-        )
         normalized_alias = str(alias or "").casefold().replace("ё", "е")
-        # A complete filename is an explicit reference even when its stem is
-        # one common word. Requiring two descriptive tokens loses short files.
-        filename_anchor = bool(
-            Path(normalized_alias).suffix in {".docx", ".pdf", ".md", ".txt", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
-            and re.search(r"(?<!\w)" + re.escape(normalized_alias) + r"(?!\w)", normalized_question)
-        )
         category_range_match = re.search(r"(?<!\d)([1-6])\s*[-–—]\s*([1-6])\s*цк", normalized_alias)
         alias_covers_category = bool(
             requested_category
@@ -1070,7 +1048,7 @@ def matching_explicit_sources(question: str, source_aliases: dict[str, str] | No
             and alias_covers_category
             and re.search(r"\bметодик\w*\b", normalized_alias)
         )
-        if filename_anchor or numeric_anchor or descriptive_anchor or method_category_anchor:
+        if method_category_anchor:
             matches.add(Path(str(source)).name.casefold())
     return matches
 
@@ -2951,19 +2929,92 @@ def sanitize_grounded_answer(answer: str, question: str, allowed_calculations: l
     return answer
 
 
+def _has_symbolic_formula_syntax(calculation: str) -> bool:
+    """Conservative syntax gate, not a claim of relevance or mathematical truth.
+
+    Parse a reduced expression without evaluating source text.  In particular,
+    an operator inside a UI label/breadcrumb is not sufficient math evidence.
+    LaTeX labels/subscripts are opaque atoms for this syntax check only; the
+    original expression is preserved for source binding and display.
+    """
+    import ast
+
+    value = clean_formula_artifacts(calculation).strip("$` \t\r\n")
+    latex_operation = bool(re.search(
+        r"\\(?:frac|dfrac|tfrac|sum|prod|int|sqrt|cdot|times|div)\b", value
+    ))
+    value = re.sub(r"\\(?:left|right)\s*", "", value)
+    value = re.sub(r"\\(?:quad|qquad)\b|\\[,;!]", " ", value)
+    value = re.sub(r"\\(?:cdot|times)\b|×", "*", value)
+    value = re.sub(r"\\div\b|÷", "/", value)
+    value = re.sub(r"\\(?:leq?|geq?|equiv|approx)\b", "=", value)
+    # Collapse innermost braces repeatedly, including text inside subscripts.
+    while re.search(r"\{[^{}]*\}", value):
+        value = re.sub(r"\{[^{}]*\}", "x", value)
+    value = re.sub(r"\\[A-Za-z]+", "m", value).replace("^", "**")
+    # Short symbols may carry opaque indices and numeric coefficients. Do not
+    # reinterpret arbitrary adjacent natural-language words as a product.
+    atom = r"(?:[A-Za-zА-Яа-яЁё]{1,2}(?:_\w+)?|\d+(?:\.\d+)?)"
+    value = re.sub(rf"\b({atom})[ \t]+(?={atom}(?!\w))", r"\1*", value)
+    if not latex_operation and not re.search(r"[=<>≤≥≈≠+*/×÷-]", value):
+        return False
+    parts = re.split(r"(?:<=|>=|==|!=|[=<>≤≥≈≠])", value)
+    allowed = (ast.Expression, ast.Name, ast.Load, ast.Constant, ast.BinOp,
+               ast.UnaryOp, ast.Call, ast.Add, ast.Sub, ast.Mult, ast.Div,
+               ast.Pow, ast.Mod, ast.UAdd, ast.USub)
+    try:
+        for part in parts:
+            tree = ast.parse(part.strip(), mode="eval")
+            for node in ast.walk(tree):
+                if not isinstance(node, allowed):
+                    return False
+                if isinstance(node, ast.Constant) and (isinstance(node.value, bool)
+                        or not isinstance(node.value, (int, float, complex))):
+                    return False
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    return True
+
+
 def ensure_requested_formula_coverage(
     answer: str,
     question: str,
     calculations: list[str],
     context: list[dict],
 ) -> str:
-    """Append one grounded formula when a formula-bearing comparison omitted it."""
+    """Complete a requested symbolic formula after syntax and source checks.
+
+    ``calculations`` also contains textual procedures.  Its presence is not
+    evidence that the user asked for a formula or that its first entry is math.
+    This fallback does not replace the answer's task/evidence verification.
+    """
     normalized = question.casefold().replace("ё", "е")
     ivo_requested = "ив0" in normalized or "иво" in normalized
+    if re.search(
+        r"\bбез\s+(?:математическ\w+\s+)?формул\w*|"
+        r"\bне\s+(?:выводи|приводи|показывай|добавляй|используй)\s+"
+        r"(?:(?:никаких|этих|математическ\w+)\s+)*формул\w*|"
+        r"\bформул\w*\s+не\s+нужн\w*",
+        normalized,
+    ):
+        return answer
+    direct_formula_request = bool(re.search(
+        r"\b(?:дай|привед\w*|покаж\w*|запиш\w*|вывед\w*|укаж\w*)\s+"
+        r"(?:(?:мне|нам|саму|точную|общую|эту|пожалуйста)\s+){0,3}формул|"
+        r"\b(?:какая|какую|каков\w*)\s+формул",
+        normalized,
+    ))
+    procedural_request = bool(re.search(
+        r"\b(?:настр\w*|созда\w*|редактир\w*|измен\w*|откры\w*|заполн\w*|удал\w*)\b",
+        normalized,
+    ))
+    if procedural_request and not direct_formula_request:
+        return answer
     formula_sensitive = (
-        "формул" in normalized
-        or "рассчит" in normalized
-        or "расчет" in normalized
+        is_formula_question(question)
+        or bool(re.search(r"\b(?:рассчит\w*|рассчитыва\w*|вычисл\w*)\b", normalized))
+        or bool(re.search(r"\b(?:порядок|алгоритм|метод|пример)\s+расчета\b", normalized))
+        or bool(re.search(r"\b(?:запиш\w*|привед\w*|покаж\w*)\s+расчет\w*\b", normalized))
         or (ivo_requested and ("отлич" in normalized or "разниц" in normalized))
     )
     if not formula_sensitive or "$$" in answer:
@@ -2990,8 +3041,7 @@ def ensure_requested_formula_coverage(
                 grounded_calculations = [derived]
     if not grounded_calculations:
         return answer
-    calculation = grounded_calculations[0]
-    def confirms_calculation(item: dict) -> bool:
+    def confirms_calculation(calculation: str, item: dict) -> bool:
         text = str(item.get("text", ""))
         if re.sub(r"\s+", "", calculation) in re.sub(r"\s+", "", text):
             return True
@@ -3002,21 +3052,25 @@ def ensure_requested_formula_coverage(
             candidates.append(derived)
         return any(re.sub(r"\s+", "", format_formula_for_katex(candidate)) == formula_key for candidate in candidates)
 
-    source = next(
-        (
-            item for item in context
-            if confirms_calculation(item)
-        ),
-        None,
-    )
-    if source is None:
-        return answer
-    citation = f" [Источник: {human_source_reference(source)}]" if source else ""
-    return (
-        f"{answer.rstrip()}\n\n### Формула из источника\n\n"
-        f"{format_formula_for_katex(calculation, display=True)}\n\n"
-        f"Обозначения и смысл величин приведены в указанном разделе.{citation}"
-    )
+    for calculation in grounded_calculations:
+        # Prose rules remain useful writer evidence, but must not become a
+        # KaTeX block merely because their node was labelled as calculation.
+        if not _has_symbolic_formula_syntax(calculation):
+            continue
+        source = next(
+            (item for item in context
+             if item.get("status") != "deleted" and confirms_calculation(calculation, item)),
+            None,
+        )
+        if source is None:
+            continue
+        citation = f" [Источник: {human_source_reference(source)}]"
+        return (
+            f"{answer.rstrip()}\n\n### Формула из источника\n\n"
+            f"{format_formula_for_katex(calculation, display=True)}\n\n"
+            f"Обозначения и смысл величин приведены в указанном разделе.{citation}"
+        )
+    return answer
 
 
 def ensure_price_composition_source_coverage(answer: str, question: str, context: list[dict]) -> str:
@@ -4595,6 +4649,8 @@ class RAGAgent:
         for seed_question in dict.fromkeys((selection_question, question)):
             for item in section_index.body_seeds(seed_question, limit=max(top_k * 3, 24),
                                                  mode='coverage' if selection_mode=='coverage' else 'legacy',
+                                                 excluded_sources=excluded_sources,
+                                                 allowed_sources=explicit_sources or (set(source_aliases) if source_aliases is not None else None),
                                                  **focus_options):
                 key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
                 merged[key] = item

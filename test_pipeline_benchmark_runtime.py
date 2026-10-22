@@ -101,9 +101,11 @@ def runtime(tmp_path, monkeypatch):
         def __init__(self, llm_model='legacy-model'):
             calls['models'].append(llm_model)
             self.llm_model = llm_model
-        def ask(self, question, retrieval_query=None, source_aliases=None, shared_cache_sources=None, pipeline_mode=None):
+        def ask(self, question, retrieval_query=None, source_aliases=None, shared_cache_sources=None, pipeline_mode=None,
+                system_prompt=None):
             calls['ask'].append({'question':question, 'retrieval_query':retrieval_query, 'aliases':source_aliases,
-                                 'cache_sources':shared_cache_sources, 'pipeline_mode':pipeline_mode})
+                                 'cache_sources':shared_cache_sources, 'pipeline_mode':pipeline_mode,
+                                 'system_prompt':system_prompt})
             def complete(prompt, purpose):
                 calls['complete'].append(purpose)
                 if calls.get('during_complete'):
@@ -196,7 +198,7 @@ def test_model_and_frozen_aliases_avoid_web_provider_and_database_listing(runtim
 
 def test_generation_failure_records_timing_and_type_without_secret_body_or_extra_calls(runtime, capsys):
     runtime.calls['fail'] = 'source-reading'
-    assert runner.main([*runtime.argv,'--capture-generations','--log-stages']) == 0
+    assert runner.main([*runtime.argv,'--capture-generations','--log-stages']) == 1
     serialized = runtime.output.read_text(encoding='utf-8')
     case = json.loads(serialized)['cases'][0]
     assert case['error'] == 'RuntimeError'
@@ -278,3 +280,54 @@ def test_capture_option_rejects_unsupported_mode_before_initialization(runtime):
     with pytest.raises(SystemExit):
         runner.main([*argv,'--capture-generations'])
     assert runtime.calls['models'] == []
+
+
+def test_exact_system_prompt_is_forwarded_and_only_hashes_are_reported(runtime, capsys):
+    prompt = runtime.dataset.parent / 'selected-preset.txt'
+    text = 'PRIVATE_SELECTED_PRESET\r\nСначала главное, затем условия.  '
+    raw = b'\xef\xbb\xbf' + text.encode('utf-8')
+    prompt.write_bytes(raw)
+    assert runner.main([*runtime.argv, '--system-prompt-file', str(prompt),
+                        '--system-prompt-label', 'RAG detailed snapshot']) == 0
+    assert runtime.calls['ask'][0]['system_prompt'] == text
+    report_text = runtime.output.read_text(encoding='utf-8')
+    snapshot = json.loads(report_text)['system_prompt']
+    assert snapshot['file_sha256'] == hashlib.sha256(raw).hexdigest()
+    assert snapshot['effective_text_sha256'] == hashlib.sha256(text.encode('utf-8')).hexdigest()
+    assert snapshot['label'] == 'RAG detailed snapshot'
+    assert 'PRIVATE_SELECTED_PRESET' not in report_text + capsys.readouterr().out
+    assert 'search_focus.py' in json.loads(report_text)['implementation_sha256']
+
+
+@pytest.mark.parametrize('content', [b'', b' \t\r\n', b'\xff\xfe'])
+def test_invalid_prompt_refused_before_any_model_initialization(runtime, content):
+    prompt = runtime.dataset.parent / 'invalid-preset.txt'
+    prompt.write_bytes(content)
+    with pytest.raises(SystemExit):
+        runner.main([*runtime.argv, '--system-prompt-file', str(prompt)])
+    assert runtime.calls['models'] == [] and runtime.calls['ask'] == []
+    assert not runtime.output.exists()
+
+
+def test_prompt_file_is_protected_from_report_overwrite(runtime):
+    prompt = runtime.dataset.parent / 'protected-preset.txt'
+    prompt.write_text('PRIVATE_PRESET', encoding='utf-8')
+    argv = list(runtime.argv)
+    argv[argv.index('--output') + 1] = str(prompt)
+    with pytest.raises(SystemExit):
+        runner.main([*argv, '--system-prompt-file', str(prompt), '--overwrite'])
+    assert prompt.read_text(encoding='utf-8') == 'PRIVATE_PRESET'
+    assert runtime.calls['models'] == []
+
+
+def test_corrective_cannot_silently_run_an_agent_without_pipeline_contract(runtime, monkeypatch):
+    rag = sys.modules['rag_agent']
+    class Incompatible:
+        def __init__(self, **kwargs):
+            pass
+        def ask(self, question):
+            pytest.fail('Legacy inference must not run under a corrective label')
+    monkeypatch.setattr(rag, 'RAGAgent', Incompatible)
+    with pytest.raises(ValueError, match='pipeline_mode'):
+        runner.main(runtime.argv)
+    assert not runtime.output.exists()

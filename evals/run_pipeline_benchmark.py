@@ -184,21 +184,44 @@ def main(argv=None):
     parser.add_argument('--model',help='Construct RAGAgent directly with this model; do not load or change provider settings')
     parser.add_argument('--aliases-file',type=Path,help='Frozen ready-global physical-to-display aliases; bypass database listing')
     parser.add_argument('--snapshot-label',help='Operator label for the frozen alias snapshot')
+    parser.add_argument('--system-prompt-file',type=Path,
+                        help='Exact UTF-8 user preset for both answer arms; report hashes, not prompt text')
+    parser.add_argument('--system-prompt-label',help='Human label only; does not resolve or modify UI presets')
     parser.add_argument('--overwrite',action='store_true',help='Explicitly replace an existing output report; never resumes calls')
     args = parser.parse_args(argv)
     if args.mode=='coverage' and args.answers:
         parser.error('coverage is retrieval-only; use legacy or corrective for answer comparisons')
     if args.capture_generations and args.mode != 'corrective':
         parser.error('capture-generations requires corrective mode')
+    if args.system_prompt_label and not args.system_prompt_file:
+        parser.error('system-prompt-label requires system-prompt-file')
+    if args.system_prompt_file and not (args.answers or args.mode == 'corrective'):
+        parser.error('system-prompt-file requires answer generation')
     protected = {args.dataset.resolve()}
     if args.aliases_file:
         protected.add(args.aliases_file.resolve())
+    if args.system_prompt_file:
+        protected.add(args.system_prompt_file.resolve())
     if args.output.resolve() in protected:
         parser.error('Output must not overwrite a dataset or alias snapshot')
     if args.output.exists() and not args.overwrite:
         parser.error('Output already exists; use a new path or explicit --overwrite')
     if args.limit < 0:
         parser.error('limit must be nonnegative')
+    prompt_text, prompt_snapshot = None, {'kind':'runtime-default-unverified-preset'}
+    if args.system_prompt_file:
+        try:
+            raw_prompt = args.system_prompt_file.read_bytes()
+            prompt_text = raw_prompt.decode('utf-8-sig')
+        except (OSError, UnicodeError):
+            parser.error('Cannot read system-prompt-file as UTF-8')
+        if not prompt_text.strip():
+            parser.error('system-prompt-file must not be empty')
+        prompt_snapshot = {'kind':'explicit-utf8-file',
+                          'label':args.system_prompt_label or args.system_prompt_file.stem,
+                          'file_sha256':hashlib.sha256(raw_prompt).hexdigest(),
+                          'effective_text_sha256':_sha(prompt_text), 'chars':len(prompt_text),
+                          'ui_preset_parity':'requires comparison with deployed preset hash'}
     cases = [json.loads(line) for line in args.dataset.read_text(encoding='utf-8-sig').splitlines() if line.strip()]
     if not cases or any(not isinstance(case, dict) or not isinstance(case.get('id'), str) or not case['id']
         or not isinstance(case.get('question'), str) or not case['question'].strip() for case in cases):
@@ -231,15 +254,23 @@ def main(argv=None):
         aliases = {Path(r['source_path']).name.casefold():r['file_name'] for r in records}
         manifest = [{key:row.get(key) for key in ('id','file_name','sha256','version','uploaded_at')} for row in records]
         snapshot = {'kind':'runtime-ready-global-list', 'database_queried':True}
+    if not aliases:
+        raise ValueError('Benchmark has no ready global sources')
     if args.model:
         from rag_agent import RAGAgent
         agent = RAGAgent(llm_model=args.model)
     else:
         from web_ui import get_agent
         agent = get_agent()
+    supports_pipeline = 'pipeline_mode' in inspect.signature(agent.ask).parameters
+    if args.mode == 'corrective' and not supports_pipeline:
+        raise ValueError('Corrective benchmark requires an explicit pipeline_mode contract')
+    if prompt_text is not None and 'system_prompt' not in inspect.signature(agent.ask).parameters:
+        raise ValueError('Benchmark agent cannot accept an explicit system prompt')
     report = {'mode':args.mode, 'dataset':str(args.dataset), 'answers_enabled':args.answers,
               'scope':'ready-global-only', 'source_count':len(aliases), 'cases':[],
               'source_snapshot':snapshot, 'capture_generations':args.capture_generations,
+              'system_prompt':prompt_snapshot,
               'dataset_case_count':len(dataset_case_ids),'dataset_case_ids':dataset_case_ids,
               'selected_case_ids':[case['id'] for case in cases],
               'started_at':datetime.now(timezone.utc).isoformat(),
@@ -257,7 +288,7 @@ def main(argv=None):
     report['implementation_sha256'] = {name:hashlib.sha256((root/name).read_bytes()).hexdigest()
         for name in ('rag_agent.py','evidence_selection.py','corrective_rag.py','grounding_verifier.py',
                      'conversation_context.py','domain_routing.py','llm_providers.py','evidence_anchors.py',
-                     'source_reader.py','evals/run_pipeline_benchmark.py') if (root/name).is_file()}
+                     'source_reader.py','search_focus.py','user_task.py','evals/run_pipeline_benchmark.py') if (root/name).is_file()}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     report['summary'] = _summary([])
     _write_report(args.output, report, exclusive=not args.overwrite)
@@ -280,11 +311,12 @@ def main(argv=None):
             question = build_retrieval_question(case, args.mode)
             result['retrieval_question'] = question
             if args.answers or args.mode == 'corrective':
-                mode_option = {'pipeline_mode':'on' if args.mode=='corrective' else 'off'} if 'pipeline_mode' in inspect.signature(agent.ask).parameters else {}
+                mode_option = {'pipeline_mode':'on' if args.mode=='corrective' else 'off'} if supports_pipeline else {}
+                prompt_option = {'system_prompt':prompt_text} if prompt_text is not None else {}
                 with _observe_generations(result, log_stages=args.log_stages and args.mode=='corrective',
                                           capture=args.capture_generations, checkpoint=checkpoint):
                     answer, _, _ = agent.ask(case['question'],retrieval_query=question,source_aliases=aliases,
-                                            shared_cache_sources=set(),**mode_option)
+                                            shared_cache_sources=set(),**mode_option,**prompt_option)
                 context = agent.last_retrieved_context() or []
                 result['answer'] = answer
                 result['trace'] = agent.last_retrieval_trace() if hasattr(agent,'last_retrieval_trace') else {}
@@ -306,7 +338,8 @@ def main(argv=None):
                           'source_recall':(result.get('retrieval') or {}).get('source_recall')},ensure_ascii=False),flush=True)
     report['completed_at'] = datetime.now(timezone.utc).isoformat()
     checkpoint()
-    return 0
+    # Captured failures are durable evidence, not a successful batch job.
+    return 1 if report['summary']['errors'] else 0
 
 
 if __name__ == '__main__':

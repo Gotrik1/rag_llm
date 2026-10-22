@@ -133,7 +133,7 @@ def test_same_authoritative_object_reaches_coverage_writer_judge_and_repair(monk
     seen = []
     for module,name in [(corrective_rag,'assess_coverage'),(corrective_rag,'generation_prompt'),
                         (grounding_verifier,'build_grounding_judge_prompt'),
-                        (grounding_verifier,'verify_grounding'),(grounding_verifier,'safe_partial_answer')]:
+                        (grounding_verifier,'verify_grounding'),(grounding_verifier,'task_publication_candidate')]:
         original = getattr(module,name)
         def observed(*args,_fn=original,_name=name,**kwargs):
             seen.append((_name,kwargs['user_task']))
@@ -152,7 +152,7 @@ def test_same_authoritative_object_reaches_coverage_writer_judge_and_repair(monk
     assert all(value is task for _,value in seen)
     assert task == UserTask(raw,resolved)
     assert {'assess_coverage','generation_prompt','build_grounding_judge_prompt','verify_grounding',
-            'safe_partial_answer','repair_prompt'} == {name for name,_ in seen}
+            'task_publication_candidate','repair_prompt'} == {name for name,_ in seen}
     for stage,prompt in model.calls:
         if stage != 'planning':
             assert resolved in prompt.replace('\\n','\n')

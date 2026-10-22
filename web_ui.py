@@ -352,16 +352,39 @@ def enrich_answer_source_citations(answer: str, sources: list[dict]) -> str:
 
     pattern = re.compile(r"\[Источник:\s*([^\];]+?)(?:\s*(?:—|;)\s*(?:раздел:\s*)?([^\]]+?))?\]", re.IGNORECASE)
 
+    def normalized_locator(value: object) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip().strip(". ").casefold()
+
     def replace(match: re.Match[str]) -> str:
         name = user_facing_source_name(match.group(1).strip())
         candidates = by_name.get(name.casefold(), [])
         requested_section = (match.group(2) or "").strip().strip(". ")
-        source = next(
-            (item for item in candidates if requested_section and requested_section.casefold() in str(item.get("section", "")).casefold()),
-            candidates[0] if candidates else None,
-        )
+        requested_locator = normalized_locator(requested_section)
+        canonical = [
+            item for item in candidates
+            if requested_locator and requested_locator == normalized_locator(
+                item.get("locator") or source_locator(item.get("section", ""), item.get("page_number")))
+        ]
+        compatible = [
+            item for item in candidates
+            if requested_locator and requested_locator in normalized_locator(item.get("section", ""))
+        ]
+        matches = canonical or compatible
+        ambiguous_match = len({
+            (normalized_locator(item.get("locator") or source_locator(
+                item.get("section", ""), item.get("page_number"))), str(item.get("url") or "").strip())
+            for item in matches}) > 1
+        if requested_section and (not matches or ambiguous_match):
+            # A known document can still have a locator absent from the source
+            # preview. Preserve it; neither the first excerpt nor nearby math
+            # may silently substitute a different section/document.
+            urls = {str(item.get("url") or "").strip() for item in matches or candidates}
+            url = next(iter(urls)) if len(urls) == 1 and "" not in urls else ""
+            label = f"Источник: {name} — {requested_section}"
+            return f"[{label}]({url})" if url else f"[{label}]"
+        source = next(iter(matches or candidates), None)
         preceding_text = answer[max(0, match.start() - 800):match.start()]
-        if re.search(r"\\frac|\\cdot|\bформул|\bрасч[её]т", preceding_text, re.IGNORECASE):
+        if not canonical and re.search(r"\\frac|\\cdot|\bформул|\bрасч[её]т", preceding_text, re.IGNORECASE):
             formula_source = next(
                 (
                     item for item in candidates
@@ -373,7 +396,7 @@ def enrich_answer_source_citations(answer: str, sources: list[dict]) -> str:
         if source is None:
             locator = source_locator(requested_section)
             return f"[Источник: {name} — {locator}]"
-        label = f"Источник: {source['file']} — {source.get('locator') or source_locator(source.get('section', ''))}"
+        label = f"Источник: {source['file']} — {source.get('locator') or source_locator(source.get('section', ''), source.get('page_number'))}"
         url = str(source.get("url") or "").strip()
         return f"[{label}]({url})" if url else f"[{label}]"
 

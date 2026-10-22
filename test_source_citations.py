@@ -75,6 +75,131 @@ class SourceCitationTests(unittest.TestCase):
         self.assertIn("Источник: manual.pdf — раздел «Unique fact»", enriched)
         self.assertIn("Источник: manual.pdf — раздел «Formula»", enriched)
 
+    def test_exact_canonical_locator_selects_second_section_of_same_document(self):
+        answer = "Доступны три режима. [Источник: manual.pdf — раздел «Режимы»]"
+        sources = [
+            {"file": "manual.pdf", "section": "Определения", "locator": "раздел «Определения»", "url": "/api/documents/doc-1/content"},
+            {"file": "manual.pdf", "section": "Режимы", "locator": "раздел «Режимы»", "url": "/api/documents/doc-1/content"},
+        ]
+
+        enriched = enrich_answer_source_citations(answer, sources)
+
+        self.assertIn("[Источник: manual.pdf — раздел «Режимы»](/api/documents/doc-1/content)", enriched)
+        self.assertNotIn("Определения", enriched)
+
+    def test_formula_heuristic_cannot_override_exact_canonical_locator(self):
+        answer = "Формула: $$I = \\frac{U}{R}$$. [Источник: manual.pdf — раздел «Условия применения»]"
+        sources = [
+            {"file": "manual.pdf", "section": "Formula", "locator": "раздел «Formula»", "url": "/api/documents/doc-1/content"},
+            {"file": "manual.pdf", "section": "Условия применения", "locator": "раздел «Условия применения»", "url": "/api/documents/doc-1/content"},
+        ]
+
+        enriched = enrich_answer_source_citations(answer, sources)
+
+        self.assertIn("Источник: manual.pdf — раздел «Условия применения»", enriched)
+        self.assertNotIn("раздел «Formula»", enriched)
+
+    def test_canonical_locator_matching_normalizes_case_and_whitespace(self):
+        answer = "Факт. [Источник: manual.pdf — РАЗДЕЛ  «Режимы»]"
+        sources = [{
+            "file": "manual.pdf", "section": "Режимы", "locator": "раздел «Режимы»", "url": "/api/documents/doc-1/content",
+        }]
+
+        enriched = enrich_answer_source_citations(answer, sources)
+
+        self.assertIn("[Источник: manual.pdf — раздел «Режимы»](/api/documents/doc-1/content)", enriched)
+
+    def test_unmatched_explicit_locator_is_preserved_with_unique_document_link(self):
+        answer = "Формула находится далее. [Источник: manual.pdf — раздел «Особые случаи»]"
+        sources = [
+            {"file": "manual.pdf", "section": "Определения", "locator": "раздел «Определения»", "url": "/api/documents/doc-1/content"},
+            {"file": "manual.pdf", "section": "Formula", "locator": "раздел «Formula»", "url": "/api/documents/doc-1/content"},
+        ]
+
+        enriched = enrich_answer_source_citations(answer, sources)
+
+        self.assertIn("[Источник: manual.pdf — раздел «Особые случаи»](/api/documents/doc-1/content)", enriched)
+        self.assertNotIn("раздел «Определения»", enriched)
+        self.assertNotIn("раздел «Formula»", enriched)
+
+    def test_unmatched_locator_never_guesses_between_different_document_urls(self):
+        answer = "Факт. [Источник: manual.pdf — раздел «Особые случаи»]"
+        sources = [
+            {"file": "manual.pdf", "section": "Определения", "locator": "раздел «Определения»", "url": "/api/documents/doc-1/content"},
+            {"file": "manual.pdf", "section": "Formula", "locator": "раздел «Formula»", "url": "/api/documents/doc-2/content"},
+        ]
+
+        self.assertEqual(enrich_answer_source_citations(answer, sources), answer)
+
+    def test_duplicate_canonical_locator_never_guesses_document_url(self):
+        answer = "Факт. [Источник: manual.pdf — раздел «Режимы»]"
+        sources = [
+            {"file": "manual.pdf", "section": "Режимы", "locator": "раздел «Режимы»", "url": "/api/documents/doc-1/content"},
+            {"file": "manual.pdf", "section": "Режимы", "locator": "раздел «Режимы»", "url": "/api/documents/doc-2/content"},
+        ]
+
+        self.assertEqual(enrich_answer_source_citations(answer, sources), answer)
+
+    def test_ambiguous_raw_locator_never_guesses_between_document_urls(self):
+        answer = "Факт. [Источник: manual.pdf — Запуск]"
+        for second_url in ("/api/documents/doc-2/content", ""):
+            with self.subTest(second_url=second_url):
+                sources = [
+                    {"file": "manual.pdf", "section": "Запуск основного режима", "locator": "раздел «Запуск основного режима»", "url": "/api/documents/doc-1/content"},
+                    {"file": "manual.pdf", "section": "Запуск резервного режима", "locator": "раздел «Запуск резервного режима»", "url": second_url},
+                ]
+
+                self.assertEqual(enrich_answer_source_citations(answer, sources), answer)
+
+    def test_ambiguous_raw_locator_preserves_partial_section_with_unique_document_link(self):
+        answer = "Факт. [Источник: manual.pdf — Запуск]"
+        sources = [
+            {"file": "manual.pdf", "section": "Запуск основного режима", "locator": "раздел «Запуск основного режима»", "url": "/api/documents/doc-1/content"},
+            {"file": "manual.pdf", "section": "Запуск резервного режима", "locator": "раздел «Запуск резервного режима»", "url": "/api/documents/doc-1/content"},
+        ]
+
+        self.assertEqual(
+            enrich_answer_source_citations(answer, sources),
+            "Факт. [Источник: manual.pdf — Запуск](/api/documents/doc-1/content)",
+        )
+
+    def test_unlinked_same_name_candidate_prevents_unique_document_fallback(self):
+        answer = "Факт. [Источник: manual.pdf — раздел «Особые случаи»]"
+        sources = [
+            {"file": "manual.pdf", "section": "Определения", "locator": "раздел «Определения»", "url": "/api/documents/doc-1/content"},
+            {"file": "manual.pdf", "section": "Formula", "locator": "раздел «Formula»"},
+        ]
+
+        self.assertEqual(enrich_answer_source_citations(answer, sources), answer)
+
+    def test_canonical_locator_uses_available_page_metadata_without_prebuilt_locator(self):
+        answer = "Факт. [Источник: manual.pdf — стр. 17, раздел «Режимы»]"
+        sources = [
+            {"file": "manual.pdf", "section": "Режимы", "page_number": 8, "url": "/api/documents/doc-1/content"},
+            {"file": "manual.pdf", "section": "Режимы", "page_number": 17, "url": "/api/documents/doc-1/content"},
+        ]
+
+        enriched = enrich_answer_source_citations(answer, sources)
+
+        self.assertIn("[Источник: manual.pdf — стр. 17, раздел «Режимы»](/api/documents/doc-1/content)", enriched)
+        self.assertNotIn("стр. 8", enriched)
+
+    def test_page_locator_is_preserved_without_fabricating_preview_page(self):
+        answer = "Факт. [Источник: manual.pdf — стр. 17, раздел «Режимы»]"
+        sources = [{
+            "file": "manual.pdf", "section": "Режимы", "locator": "раздел «Режимы»", "url": "/api/documents/doc-1/content",
+        }]
+
+        enriched = enrich_answer_source_citations(answer, sources)
+
+        self.assertIn("[Источник: manual.pdf — стр. 17, раздел «Режимы»](/api/documents/doc-1/content)", enriched)
+        self.assertNotIn("page_number", sources[0])
+
+    def test_unmatched_locator_without_source_remains_unlinked(self):
+        answer = "Факт. [Источник: manual.pdf — раздел «Режимы»]"
+
+        self.assertEqual(enrich_answer_source_citations(answer, []), answer)
+
     def test_repeated_identical_source_lines_are_collapsed(self):
         answer = (
             "Факт.\n"

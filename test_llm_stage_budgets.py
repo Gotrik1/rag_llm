@@ -1,6 +1,7 @@
 """Request-local budgets apply to internal calls, never shared final outputs."""
 import threading
 import time
+import json
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -33,8 +34,9 @@ def requests(monkeypatch):
         ok = True
 
         def json(self):
-            return {"choices": [{"message": {"content": "synthetic answer"}}],
-                    "result": {"alternatives": [{"message": {"text": "synthetic answer"}}]}}
+            return {"choices": [{"message": {"content": "synthetic answer"}, "finish_reason": "stop"}],
+                    "result": {"alternatives": [{"message": {"text": "synthetic answer"},
+                                                  "status": "ALTERNATIVE_STATUS_FINAL"}]}}
 
     def post(url, **kwargs):
         records.append((url, kwargs))
@@ -141,7 +143,7 @@ def test_gigachat_oauth_and_completion_use_stage_deadline_on_private_clone(monke
         def json(self):
             if self.oauth:
                 return {"access_token": "synthetic-new-token", "expires_at": time.time() + 1800}
-            return {"choices": [{"message": {"content": "synthetic answer"}}]}
+            return {"choices": [{"message": {"content": "synthetic answer"}, "finish_reason": "stop"}]}
 
     def post(url, **kwargs):
         sent.append((url, kwargs))
@@ -189,3 +191,191 @@ def test_stage_metadata_reports_its_own_budget_without_mutating_final_metadata(m
     llm.complete_stage("plan", max_tokens=400, timeout=15)
     assert seen == [400]
     assert llm.metadata.num_output == 2048
+
+
+def completion_body(provider, text, *, finished=True, reason=None):
+    if provider == "yandex":
+        return {"result": {"alternatives": [{"message": {"text": text}, "status": reason or (
+            "ALTERNATIVE_STATUS_FINAL" if finished else "ALTERNATIVE_STATUS_TRUNCATED_FINAL")}]}}
+    return {"choices": [{"message": {"content": text}, "finish_reason": reason or ("stop" if finished else "length")}]}
+
+
+def mocked_response(monkeypatch, body):
+    """Mock HTTP responses, keeping the adapter's response boundary exercised."""
+    sent = []
+    class Response:
+        ok = True
+        def json(self):
+            return body
+    def post(url, **kwargs):
+        sent.append((url, kwargs))
+        return Response()
+    monkeypatch.setattr(llm_providers.requests, "post", post)
+    monkeypatch.setattr(llm_providers, "gigachat_ca_bundle", lambda: True)
+    return sent
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+@pytest.mark.parametrize("finished", [False, True])
+def test_internal_stage_checks_real_response_termination_even_for_parseable_json(provider, finished, monkeypatch):
+    text = json.dumps({"claims": []})
+    sent = mocked_response(monkeypatch, completion_body(provider, text, finished=finished))
+    llm = make_llm(provider)
+    if finished:
+        assert str(llm.complete_stage("judge", max_tokens=4096, timeout=120)) == text
+    else:
+        with pytest.raises(RuntimeError, match="Internal stage response did not finish completely"):
+            llm.complete_stage("judge", max_tokens=4096, timeout=120)
+    assert len(sent) == 1
+    expected_path = "/completion" if provider == "yandex" else "/v1/chat/completions" if provider == "gigachat" else "/chat/completions"
+    assert sent[0][0].endswith(expected_path)
+    assert payload_budget(provider, sent[0][1]["json"]) == 4096
+    assert sent[0][1]["timeout"] == 120
+    assert "require_complete_output" not in sent[0][1]["json"]
+    assert llm.require_complete_output is False
+    assert llm.output_token_limit == -1 and llm.timeout == 900
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+@pytest.mark.parametrize("metadata", ["missing", "unknown", "partial", "null"])
+def test_internal_missing_unknown_and_nonfinal_metadata_fail_closed_without_sensitive_diagnostics(provider, metadata, monkeypatch):
+    secret = "synthetic-test-key RESPONSE_BODY_MUST_NOT_ESCAPE"
+    body = completion_body(provider, secret)
+    alternative = body["result"]["alternatives"][0] if provider == "yandex" else body["choices"][0]
+    key = "status" if provider == "yandex" else "finish_reason"
+    if metadata == "missing":
+        alternative.pop(key)
+    else:
+        alternative[key] = (None if metadata == "null" else "ALTERNATIVE_STATUS_PARTIAL" if
+                            metadata == "partial" and provider == "yandex" else "content_filter" if
+                            metadata == "partial" else "unknown-status-" + secret)
+    sent = mocked_response(monkeypatch, body)
+    with pytest.raises(RuntimeError) as error:
+        make_llm(provider).complete_stage("planning", max_tokens=512, timeout=15)
+    assert str(error.value) == "Internal stage response did not finish completely"
+    assert secret not in str(error.value) and len(sent) == 1
+
+
+@pytest.mark.parametrize("provider,body", [
+    pytest.param("openai", None, id="response-null"),
+    pytest.param("openai", [], id="response-array"),
+    pytest.param("openai", {"choices": None}, id="choices-null"),
+    pytest.param("openai", {"choices": {}}, id="choices-mapping"),
+    pytest.param("openai", {"choices": []}, id="choices-empty"),
+    pytest.param("openai", {"choices": [None]}, id="choice-null"),
+    pytest.param("openai", {"choices": [{"finish_reason": []}]}, id="finish-reason-array"),
+    pytest.param("openai", {"choices": [{"finish_reason": {}}]}, id="finish-reason-mapping"),
+    pytest.param("openai", {"choices": [{"finish_reason": True}]}, id="finish-reason-boolean"),
+    pytest.param("yandex", {"result": None}, id="yandex-result-null"),
+    pytest.param("yandex", {"result": []}, id="yandex-result-array"),
+    pytest.param("yandex", {"result": {"alternatives": None}}, id="alternatives-null"),
+    pytest.param("yandex", {"result": {"alternatives": {}}}, id="alternatives-mapping"),
+    pytest.param("yandex", {"result": {"alternatives": []}}, id="alternatives-empty"),
+    pytest.param("yandex", {"result": {"alternatives": [None]}}, id="alternative-null"),
+    pytest.param("yandex", {"result": {"alternatives": [{"status": []}]}}, id="yandex-status-array"),
+    pytest.param("yandex", {"result": {"alternatives": [{"status": {}}]}}, id="yandex-status-mapping"),
+    pytest.param("yandex", {"result": {"alternatives": [{"status": False}]}}, id="yandex-status-boolean"),
+])
+def test_internal_malformed_response_containers_and_status_types_fail_with_controlled_error(provider, body, monkeypatch):
+    sent = mocked_response(monkeypatch, body)
+    llm = make_llm(provider)
+    with pytest.raises(RuntimeError) as error:
+        llm.complete_stage("structured review", max_tokens=512, timeout=15)
+    assert str(error.value) == "Internal stage response did not finish completely"
+    assert len(sent) == 1
+    assert llm.require_complete_output is False
+    assert llm.output_token_limit == -1 and llm.timeout == 900
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+@pytest.mark.parametrize("final_limit", [-1, 10000])
+def test_stage_rejection_preserves_regular_final_and_stream_behavior_with_optional_operator_cap(provider, final_limit, monkeypatch):
+    text = "Retain final text even when the provider reports truncation."
+    sent = mocked_response(monkeypatch, completion_body(provider, text, finished=False))
+    llm = make_llm(provider, output_token_limit=final_limit)
+    with pytest.raises(RuntimeError):
+        llm.complete_stage("coverage", max_tokens=400, timeout=10)
+    assert str(llm.complete("final")) == text
+    assert list(llm.stream_complete("final stream"))[0].text == text
+    assert [payload_budget(provider, entry[1]["json"]) for entry in sent] == [400,
+        final_limit if final_limit > 0 else None, final_limit if final_limit > 0 else None]
+    assert [entry[1]["timeout"] for entry in sent] == [10, 900, 900]
+    assert llm.require_complete_output is False and llm.output_token_limit == final_limit
+
+
+def test_concurrent_response_integrity_flags_do_not_leak_to_shared_final_adapter(monkeypatch):
+    llm = make_llm()
+    barrier = threading.Barrier(2)
+    sent = []
+    class Response:
+        ok = True
+        def __init__(self, finished):
+            self.finished = finished
+        def json(self):
+            return completion_body("openai", "{}", finished=self.finished)
+    def post(url, **kwargs):
+        budget = kwargs["json"].get("max_tokens")
+        if budget is not None:
+            barrier.wait(timeout=5)
+        sent.append((budget, kwargs["timeout"]))
+        return Response(budget == 768)
+    monkeypatch.setattr(llm_providers.requests, "post", post)
+    def stage(settings):
+        try:
+            return str(llm.complete_stage("review", max_tokens=settings[0], timeout=settings[1]))
+        except RuntimeError:
+            return "rejected"
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert list(executor.map(stage, [(256, 11), (768, 23)])) == ["rejected", "{}"]
+    assert set(sent) == {(256, 11), (768, 23)}
+    assert str(llm.complete("uncapped final")) == "{}"
+    assert sent[-1] == (None, 900)
+    assert llm.require_complete_output is False and llm.output_token_limit == -1
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+@pytest.mark.parametrize("finished", [False, True])
+def test_source_reader_requires_normal_provider_termination_before_assessing_parseable_json(provider, finished, monkeypatch):
+    from source_reader import build_source_reading_prompt, read_sources
+    question = "Как выполняют контроль?"
+    plan = {"requirements": ["Основное правило"], "exclusions": [], "canonical_question": question}
+    evidence = [{"evidence_id": "E1", "file": "Synthetic.md", "text": "Контроль выполняют перед запуском."}]
+    prompt = build_source_reading_prompt(question, plan, evidence)
+    snapshot_id = json.loads(prompt.split("ДАННЫЕ ЧТЕНИЯ:\n", 1)[1])["snapshot_id"]
+    text = json.dumps({"snapshot_id": snapshot_id, "cards": [{"id": "C1", "kind": "rule",
+        "passage_ids": ["E1:P1"], "related_card_ids": [], "requirement_ids": ["R1"]}],
+        "unresolved_requirement_ids": []})
+    sent = mocked_response(monkeypatch, completion_body(provider, text, finished=finished))
+    llm = make_llm(provider)
+    reading = read_sources(question, plan, evidence,
+                           lambda prompt, _: str(llm.complete_stage(prompt, max_tokens=4096, timeout=120)))
+    assert reading.assessed is finished
+    if finished:
+        assert len(reading.cards) == 1
+        assert reading.quoted_passages[0].quote == evidence[0]["text"]
+    else:
+        assert reading.cards == () and reading.quoted_passages == ()
+        assert reading.warnings == ("reader-call-failed",)
+    assert len(sent) == 1 and llm.require_complete_output is False
+
+
+@pytest.mark.parametrize("provider", ["openai", "yandex"])
+def test_internal_invalid_json_uses_controlled_error_without_changing_final_decode_behavior(provider, monkeypatch):
+    secret = "synthetic-test-key RAW_RESPONSE_BODY"
+    class Response:
+        ok = True
+        def json(self):
+            raise ValueError(secret)
+    sent = []
+    def post(*args, **kwargs):
+        sent.append(1)
+        return Response()
+    monkeypatch.setattr(llm_providers.requests, "post", post)
+    llm = make_llm(provider)
+    with pytest.raises(RuntimeError) as error:
+        llm.complete_stage("planning", max_tokens=512, timeout=15)
+    assert str(error.value) == "Internal stage response did not finish completely"
+    assert secret not in str(error.value)
+    with pytest.raises(ValueError):
+        llm.complete("final")
+    assert len(sent) == 2 and llm.require_complete_output is False

@@ -80,6 +80,7 @@ class ProviderLLM(CustomLLM):
     temperature: float = 0.0
     timeout: float = Field(default_factory=lambda: float(os.getenv("LLM_REQUEST_TIMEOUT", "900")))
     output_token_limit: int = Field(default_factory=lambda: MAX_OUTPUT_TOKENS)
+    require_complete_output: bool = Field(default=False, exclude=True, repr=False)
     _giga_token: str = ""
     _giga_token_expires: float = 0.0
 
@@ -99,7 +100,33 @@ class ProviderLLM(CustomLLM):
             except ValueError:
                 detail = response.text
             raise RuntimeError(f"{self.provider}: HTTP {response.status_code}: {detail}")
-        return response.json()
+        try:
+            data = response.json()
+        except ValueError:
+            if self.require_complete_output:
+                raise RuntimeError("Internal stage response did not finish completely") from None
+            raise
+        if self.require_complete_output:
+            self._validate_stage_completion(data)
+        return data
+
+    def _validate_stage_completion(self, data: Any) -> None:
+        """A parseable JSON fragment is usable only after normal termination.
+
+        Gemini uses its OpenAI-compatible route here, not native finishReason.
+        Yandex Foundation Models uses the alternative's native status instead.
+        Unknown/missing metadata cannot certify an internal structured result.
+        """
+        try:
+            if self.provider == "yandex":
+                complete = data["result"]["alternatives"][0]["status"] == "ALTERNATIVE_STATUS_FINAL"
+            else:
+                complete = data["choices"][0]["finish_reason"] == "stop"
+        except (KeyError, TypeError, IndexError):
+            complete = False
+        if not complete:
+            # Never interpolate provider response bodies, text or credentials.
+            raise RuntimeError("Internal stage response did not finish completely")
 
     def _openai_compatible(self, prompt: str) -> str:
         data = self._post(
@@ -186,7 +213,8 @@ class ProviderLLM(CustomLLM):
             raise ValueError("Internal stage max_tokens must be a positive integer")
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Internal stage timeout must be positive and finite")
-        request_llm = self.model_copy(update={"output_token_limit": max_tokens, "timeout": float(timeout)})
+        request_llm = self.model_copy(update={"output_token_limit": max_tokens, "timeout": float(timeout),
+                                              "require_complete_output": True})
         return request_llm.complete(prompt)
 
     @llm_completion_callback()

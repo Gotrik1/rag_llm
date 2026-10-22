@@ -26,6 +26,7 @@ RERANKER_TEXT_LIMIT = max(256, int(os.getenv("RERANKER_TEXT_LIMIT", "6000")))
 EMBED_THREADS = max(1, int(os.getenv("FASTEMBED_THREADS", "4")))
 EMBED_BATCH_SIZE = max(1, int(os.getenv("FASTEMBED_BATCH_SIZE", "8")))
 _embedding_lock = Lock()
+INTERNAL_STAGE_PURPOSES = frozenset({'planning', 'evidence-review', 'source-reading'})
 
 
 def _messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -52,7 +53,7 @@ def _openai_payload(payload: dict[str, Any], stream: bool) -> dict[str, Any]:
     # spend the entire output budget on reasoning and return empty content.
     planner_thinking = (
         os.getenv('RAG_ALLOW_PLANNER_THINKING','false').casefold() in {'true','1','on'}
-        and payload.get('purpose') in {'planning','evidence-review'} and payload.get('think') is True
+        and payload.get('purpose') in INTERNAL_STAGE_PURPOSES and payload.get('think') is True
     )
     if planner_thinking:
         result['chat_template_kwargs'] = {'enable_thinking':True}
@@ -141,7 +142,7 @@ async def generate(payload: dict[str, Any]):
         raise HTTPException(503, str(exc)) from exc
     if stream:
         return StreamingResponse(_stream_ollama(response, "generate"), media_type="application/x-ndjson")
-    content = _content(response,reject_truncated=payload.get('purpose') in {'planning','evidence-review'})
+    content = _content(response,reject_truncated=payload.get('purpose') in INTERNAL_STAGE_PURPOSES)
     await response.extensions["bridge_client"].aclose()
     thinking_enabled = bool(_openai_payload(payload,False).get('chat_template_kwargs',{}).get('enable_thinking'))
     return {"model": LLM_MODEL, "response": content, "done": True,"thinking_enabled":thinking_enabled}
@@ -156,7 +157,7 @@ async def chat(payload: dict[str, Any]):
         raise HTTPException(503, str(exc)) from exc
     if stream:
         return StreamingResponse(_stream_ollama(response, "chat"), media_type="application/x-ndjson")
-    content = _content(response,reject_truncated=payload.get('purpose') in {'planning','evidence-review'})
+    content = _content(response,reject_truncated=payload.get('purpose') in INTERNAL_STAGE_PURPOSES)
     await response.extensions["bridge_client"].aclose()
     return {"model": LLM_MODEL, "message": {"role": "assistant", "content": content}, "done": True}
 

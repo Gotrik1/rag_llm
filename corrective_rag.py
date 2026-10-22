@@ -1,7 +1,7 @@
 """Bounded, evidence-first retrieval orchestration, independent of transport.
 
 Model planning/assessment are decisions to inspect, not proof of correctness.
-Only validated evidence IDs and verbatim source quotes can establish coverage.
+Validated evidence IDs and verbatim quotes establish provenance, not semantic truth.
 """
 from __future__ import annotations
 from dataclasses import asdict, dataclass, field
@@ -223,7 +223,7 @@ missing_inventory_sections и inventory_enumeration_scoped_warnings — огра
 
 
 def generation_prompt(question: str, plan: SearchPlan, evidence: list[dict], coverage: dict, system_prompt: str='',
-                      *, selection_limits: dict | None=None) -> str:
+                      *, selection_limits: dict | None=None, source_reading=None) -> str:
     from grounding_verifier import native_formula_catalogue
     from evidence_anchors import normalize_inventory_selection_limits, normalize_inventory_evidence
     coverage = dict(coverage)
@@ -236,6 +236,18 @@ def generation_prompt(question: str, plan: SearchPlan, evidence: list[dict], cov
                 *selection_limits.get('inventory_enumeration_scoped_warnings', []),
                 *coverage_limits['inventory_enumeration_scoped_warnings']]})
     evidence = normalize_inventory_evidence(evidence)
+    reading = None
+    if source_reading is not None:
+        from source_reader import validated_writer_payload
+        reading = validated_writer_payload(source_reading,question,asdict(plan),evidence,
+                                           selection_limits=selection_limits,max_chars=8192)
+    reading_instruction = ('''\nsource_reading — отдельная предварительная выборка исходных абзацев, а не готовый ответ.
+quoted_passages содержат дословный текст; judgments — только предположения о роли и связях этих абзацев.
+Сверяй их с полными evidence ниже: порядок карточек и наличие ссылки не доказывают истинность толкования.
+Различай утверждение источника и собственный вывод. Не превращай название строки справочника в объяснение отсутствующего алгоритма.
+Если исходное определение противоречит основному уравнению или другому определению той же величины, покажи обе записи и явно обозначь расхождение вместо безусловного выбора одной.
+Не добавляй отсутствующие в источниках расшифровки сокращений и различия похожих названий. Сохраняй явно исключённый пользователем предмет вне ответа, даже когда о нём есть достоверные сведения.
+''' if reading is not None else '')
     return system_prompt+'''\nСледующие правила проверки и формата источников обязательны также при наличии предыдущего шаблона.
 Ответь по-русски на исходный вопрос, используя только доказательства ниже.
 Сначала основное правило, затем условия и исключения. Сохраняй выбранный пользователем предмет и ограничения.
@@ -261,11 +273,12 @@ missing_inventory_sections и inventory_enumeration_scoped_warnings — огра
 Не переписывай весь контекст, не добавляй не запрошенные темы и не повторяй одинаковые сведения.
 Дай прямой ответ на уровне обобщения вопроса, а не на уровне детализации самого длинного источника.
 Сохрани существенные условия и все запрошенные части. Фиксированного ограничения длины ответа нет.
-'''+json.dumps({'question':question,'canonical_question':plan.canonical_question,
+'''+reading_instruction+json.dumps({'question':question,'canonical_question':plan.canonical_question,
                'requirements':plan.requirements,'exclusions':plan.exclusions,
                'coverage':coverage,'evidence':evidence,
                'native_formulae':native_formula_catalogue(evidence),
-               **({'selection_limits':selection_limits} if selection_limits else {})},ensure_ascii=False)+'''
+               **({'selection_limits':selection_limits} if selection_limits else {}),
+               **({'source_reading':reading} if reading is not None else {})},ensure_ascii=False)+'''
 КОНЕЦ ДАННЫХ. Верни сам ответ в читаемом Markdown, без JSON-обёртки и без служебных полей.
 Формат внутреннего плана и проверки не является форматом пользовательского ответа.
 '''
@@ -297,13 +310,15 @@ class CorrectiveResult:
 def run_corrective(question: str, search_question: str, *, retrieve: Callable,
                    complete: Callable[[str,str],str], select: Callable | None=None,
                    system_prompt: str='', max_additional_rounds: int=2,
-                   max_context_chars: int=36000, corpus_hints: list[dict] | None=None) -> CorrectiveResult:
+                   max_context_chars: int=36000, corpus_hints: list[dict] | None=None,
+                   read_before_answer: bool=False, check_answer_scope: bool=False) -> CorrectiveResult:
     from grounding_verifier import verify_grounding, build_grounding_judge_prompt, build_numeric_rules
     from evidence_anchors import (reconcile_evidence_families, inventory_limits_after_filter,
                                  normalize_inventory_selection_limits, normalize_inventory_evidence)
     start = time.perf_counter()
     plan = make_plan(search_question,complete,corpus_hints=corpus_hints)
-    trace = {'version':'corrective-v1','plan':asdict(plan),'rounds':[],'verification':{},'from_cache':False}
+    trace = {'version':'corrective-v1','plan':asdict(plan),'rounds':[],'verification':{},'from_cache':False,
+             'experiments':{'source_reading':bool(read_before_answer),'task_scope_check':bool(check_answer_scope)}}
     # Use the resolved intent for ranking as well as for planning. Feeding the
     # serialized conversation envelope back into lexical subject matching makes
     # host labels and conversational filler compete with the real subject.
@@ -368,8 +383,34 @@ def run_corrective(question: str, search_question: str, *, retrieve: Callable,
                    'Уточните раздел или сузьте вопрос.' if selection_limits.get('inventory_enumeration_incomplete') else
                    'Не удалось найти подтверждённые сведения по этому вопросу в доступных документах.')
         return CorrectiveResult(message,[],trace)
+    reading = None
+    trace['source_reading'] = {'enabled':bool(read_before_answer),'applied':False,'reason':'disabled'}
+    if read_before_answer:
+        from source_reader import read_sources, validated_writer_payload
+        reading_started = time.perf_counter()
+        reading = read_sources(question,asdict(plan),context,complete,selection_limits=selection_limits)
+        accepted = validated_writer_payload(reading,question,asdict(plan),context,
+                                            selection_limits=selection_limits,max_chars=8192)
+        trace['source_reading'] = {'enabled':True,'applied':accepted is not None,
+            'reason':'validated-guidance' if accepted is not None else 'reading-unavailable-or-budget',
+            'elapsed_s':round(time.perf_counter()-reading_started,3),
+            'snapshot_id':reading.snapshot_id,'assessed':reading.assessed,
+            'assessment_kind':'source-selection-not-entailment','coverage_certified':False,
+            'card_count':len(reading.cards),'selected_passage_count':len(reading.quoted_passages),
+            'unselected_passage_count':reading.unselected_passage_count,
+            'unassessed_evidence_count':len(reading.unassessed_evidence_ids),
+            'unresolved_requirement_count':len(reading.unresolved_requirement_ids),
+            'warnings':list(reading.warnings),
+            'guide_chars':len(json.dumps(accepted,ensure_ascii=False)) if accepted is not None else 0}
+        if accepted is None:
+            reading = None
     answer, answer_format_valid = _answer_text(complete(generation_prompt(
-        question,plan,context,coverage,system_prompt,selection_limits=selection_limits),'answer'))
+        question,plan,context,coverage,system_prompt,selection_limits=selection_limits,source_reading=reading),'answer'))
+    # API diagnostics must not repeat a possibly rejected primary answer or the
+    # source reader's full private document text. Detailed outputs belong to
+    # access-controlled offline evaluation artifacts, not the public trace.
+    trace['answer_versions'] = {'primary_sha256':hashlib.sha256(answer.encode()).hexdigest(),
+                                'primary_chars':len(answer)}
     calculation_rules, calculation_diagnostics = build_numeric_rules(search_question,context)
     trace['calculations'] = {'rules':calculation_rules,'diagnostics':calculation_diagnostics}
 
@@ -380,24 +421,31 @@ def run_corrective(question: str, search_question: str, *, retrieve: Callable,
                 reason='Invalid service JSON envelope. Return the answer itself in readable Markdown, not nested fields.',
                 start=0,end=len(value))])
         try:
-            claims = json_object(complete(build_grounding_judge_prompt(value,context,question=question),'evidence-review')).get('claims')
+            claims = json_object(complete(build_grounding_judge_prompt(value,context,question=question,
+                **({'excluded_topics':plan.exclusions,'canonical_question':plan.canonical_question or search_question}
+                   if check_answer_scope else {})),'evidence-review')).get('claims')
         except Exception:
             claims=None
-        return verify_grounding(value,context,question=search_question,claims=claims,calculation_rules=calculation_rules)
+        return verify_grounding(value,context,question=search_question,claims=claims,calculation_rules=calculation_rules,
+                                excluded_topics=plan.exclusions if check_answer_scope else ())
 
     report = verify(answer)
     trace['verification']['initial'] = report.to_dict()
     if report.needs_repair:
         repair = report.repair_prompt()
         answer, answer_format_valid = _answer_text(complete(generation_prompt(
-            question,plan,context,coverage,system_prompt,selection_limits=selection_limits)+'\n'+repair,'answer'))
+            question,plan,context,coverage,system_prompt,selection_limits=selection_limits,source_reading=reading)+'\n'+repair,'answer'))
         report = verify(answer)
         trace['verification']['after_repair'] = report.to_dict()
     if report.needs_repair:
         # Unsupported spans must not be dressed up with valid-looking links.
         from grounding_verifier import safe_partial_answer
+        before_partial = answer
         answer = safe_partial_answer(answer,report)
-        trace['verification']['partial_answer'] = True
+        trace['verification']['partial_answer'] = answer != before_partial
+        if any(check.status == 'mixed_scope' for check in report.checks):
+            trace['verification']['unresolved_task_scope'] = True
     trace['elapsed_s'] = round(time.perf_counter()-start,3)
     trace['coverage_complete'] = bool(coverage['complete'])
+    trace['answer_versions']['final_sha256'] = hashlib.sha256(answer.encode()).hexdigest()
     return CorrectiveResult(answer,context,trace)

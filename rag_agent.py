@@ -3537,12 +3537,19 @@ class RAGAgent:
         request_llm = self.llm
         request_model = str(getattr(request_llm,'model',None) or
                             getattr(request_llm,'model_name',None) or self.llm_model)
+        read_before_answer = os.getenv('RAG_SOURCE_READING','off').casefold() in {'true','1','on'}
+        check_answer_scope = os.getenv('RAG_TASK_SCOPE_CHECK','off').casefold() in {'true','1','on'}
+        planner_thinking = os.getenv('RAG_PLANNER_THINKING','false').casefold() in {'true','1','on'}
+        planner_token_budget = int(os.getenv('RAG_PLANNER_TOKEN_BUDGET','4096'))
+        planner_timeout = float(os.getenv('RAG_PLANNER_TIMEOUT_SECONDS','120'))
+        planner_base_url = str(os.getenv('RAG_PLANNER_BASE_URL') or
+                               getattr(request_llm,'base_url',OLLAMA_BASE_URL)).rstrip('/')
 
         def complete(prompt, purpose):
             started = time.perf_counter()
             event = {"purpose":purpose,"thinking_requested":False,"thinking_used":False}
             try:
-                thinking = purpose != "answer" and os.getenv("RAG_PLANNER_THINKING","false").casefold() in {"true","1","on"}
+                thinking = purpose != "answer" and planner_thinking
                 if purpose!='answer' and isinstance(request_llm,Ollama):
                     import requests
                     event['thinking_requested'] = thinking
@@ -3552,10 +3559,10 @@ class RAGAgent:
                         for think in attempts:
                             try:
                                 response = session.post(
-                                    str(os.getenv('RAG_PLANNER_BASE_URL') or getattr(request_llm,'base_url',OLLAMA_BASE_URL)).rstrip('/')+'/api/generate',
+                                    planner_base_url+'/api/generate',
                                     json={"model":request_model,"prompt":prompt,"stream":False,"think":think,"purpose":purpose,
-                                          "options":{"temperature":0,"seed":42,"num_predict":int(os.getenv('RAG_PLANNER_TOKEN_BUDGET','4096')),
-                                                     "reasoning_effort":"low"}},timeout=float(os.getenv('RAG_PLANNER_TIMEOUT_SECONDS','120')),
+                                          "options":{"temperature":0,"seed":42,"num_predict":planner_token_budget,
+                                                     "reasoning_effort":"low"}},timeout=planner_timeout,
                                 )
                                 response.raise_for_status()
                                 body = response.json()
@@ -3570,8 +3577,8 @@ class RAGAgent:
                                 event['thinking_fallback'] = type(exc).__name__
                 stage_complete = getattr(request_llm,'complete_stage',None)
                 if purpose!='answer' and callable(stage_complete):
-                    return str(stage_complete(prompt,max_tokens=int(os.getenv('RAG_PLANNER_TOKEN_BUDGET','4096')),
-                        timeout=float(os.getenv('RAG_PLANNER_TIMEOUT_SECONDS','120')))).strip()
+                    return str(stage_complete(prompt,max_tokens=planner_token_budget,
+                        timeout=planner_timeout)).strip()
                 return str(request_llm.complete(prompt)).strip()
             finally:
                 event['elapsed_s'] = round(time.perf_counter()-started,3)
@@ -3608,7 +3615,8 @@ class RAGAgent:
             max_additional_rounds=int(os.getenv('RAG_MAX_ADDITIONAL_SEARCH_ROUNDS','2')),
             max_context_chars=min(int(os.getenv('RAG_EVIDENCE_MAX_CHARS','36000')),
                                   max(2000,(int(request_llm.metadata.context_window)-4096)*2)),
-            corpus_hints=corpus_hints)
+            corpus_hints=corpus_hints,
+            read_before_answer=read_before_answer, check_answer_scope=check_answer_scope)
         result.trace.update(mode='corrective',completions=completions,
                             model=request_model,provider=getattr(request_llm,'provider','ollama'),
                             corpus_snapshot=getattr(self,'_docstore_mtime_ns',0))

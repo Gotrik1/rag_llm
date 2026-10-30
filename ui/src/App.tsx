@@ -1,3 +1,4 @@
+/** UI orchestration for persisted chats; server jobs own generation and ingestion. */
 import {
   AssistantRuntimeProvider,
   ComposerPrimitive,
@@ -53,7 +54,8 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { clearCsrfToken, deleteJson, getJson, patchJson, postFormData, postJson, setCsrfToken } from "./api";
-import { contextFromCompletedJob, preserveContextSnapshot } from "./debugSnapshot";
+import { contextFromCompletedJob, isApiContextChunk, preserveContextSnapshot, type ApiContextChunk } from "./debugSnapshot";
+import { withStableThreadListSnapshot } from "./runtimeSnapshot";
 
 type Role = "user" | "assistant";
 type UploadTarget = "global" | "project" | "chat";
@@ -80,17 +82,6 @@ type ApiSource = {
 type ApiFormula = {
   text: string;
   html?: string;
-};
-
-type ApiContextChunk = {
-  file: string;
-  section_path?: string;
-  chunk_type?: string;
-  status?: string;
-  score: number;
-  text: string;
-  html_text?: string;
-  flow_origin?: "python" | "rust";
 };
 
 type AskResponse = {
@@ -295,6 +286,7 @@ function projectFromRecord(record: ProjectRecord): Project {
   };
 }
 
+/** Restore persisted chat identity and its soft retrieval focus; messages load separately. */
 export function chatFromRecord(record: ChatRecord): ChatSummary {
   const metadata = record.metadata ?? {};
   const rawFocus = metadata.retrieval_focus;
@@ -319,13 +311,7 @@ function messageFromRecord(record: MessageRecord): ChatEntry {
   };
 }
 
-function isApiContextChunk(value: unknown): value is ApiContextChunk {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const chunk = value as Record<string, unknown>;
-  return typeof chunk.file === "string" && typeof chunk.text === "string"
-    && typeof chunk.score === "number" && Number.isFinite(chunk.score);
-}
-
+/** Reconstruct answer metadata without re-running retrieval or fabricating an evidence snapshot. */
 export function resultFromMessageRecord(record: MessageRecord): AskResponse | null {
   if (record.role !== "assistant" || record.status === "running") return null;
   const metadata = record.metadata ?? {};
@@ -357,6 +343,7 @@ export function resultFromMessageRecord(record: MessageRecord): AskResponse | nu
   };
 }
 
+/** Bind the panel to the latest persisted answer and the preceding user question in this chat. */
 export function panelStateFromMessageRecords(records: MessageRecord[]): {
   result: AskResponse | null;
   question: string;
@@ -378,10 +365,12 @@ export function panelStateFromMessageRecords(records: MessageRecord[]): {
   return { result: null, question: latestQuestion?.content ?? "" };
 }
 
+/** Persisted running messages trigger recovery rather than a duplicate generation request. */
 export function hasRunningAssistantMessage(records: Array<Pick<MessageRecord, "role" | "status">>): boolean {
   return records.some((record) => record.role === "assistant" && record.status === "running");
 }
 
+/** Legacy synchronous responses omit status; only an explicit running response needs polling. */
 export function generationResponseIsTerminal(status?: AskResponse["status"]): boolean {
   return status !== "running";
 }
@@ -399,6 +388,7 @@ function fileCountLabel(count: number): string {
   return `${count} ${noun}`;
 }
 
+/** Derive upload feedback from current document records so queued banners do not outlive completion. */
 export function uploadFeedback(
   result: UploadResponse | null,
   documents: DocumentRecord[]
@@ -517,6 +507,7 @@ function useMathTypeset(html?: string) {
   return ref;
 }
 
+/** Present the server-authorized inventory in its global, project and chat sections. */
 export function splitDocumentsByScope(documents: DocumentRecord[]): {
   global: DocumentRecord[];
   project: DocumentRecord[];
@@ -529,6 +520,7 @@ export function splitDocumentsByScope(documents: DocumentRecord[]): {
   };
 }
 
+/** Bind an upload to exactly one selected scope; reject missing project/chat identities early. */
 export function uploadScopeFields(
   target: UploadTarget,
   activeProjectId: string,
@@ -543,6 +535,7 @@ export function uploadScopeFields(
   return { chat_id: activeChatId };
 }
 
+/** Session gate owns authentication; authenticated workspace effects mount only after session recovery. */
 export function App() {
   const [session, setSession] = useState<SessionResponse | null>(null);
   const [sessionError, setSessionError] = useState("");
@@ -1241,7 +1234,8 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     [messages, isRunning, onNew]
   );
 
-  const runtime = useExternalStoreRuntime(adapter);
+  const externalRuntime = useExternalStoreRuntime(adapter);
+  const runtime = useMemo(() => withStableThreadListSnapshot(externalRuntime), [externalRuntime]);
 
   const clearThread = useCallback(async () => {
     try {
@@ -1613,7 +1607,7 @@ function NavigationSidebar({
             href={`/api/documents/${document.id}/content`}
             rel="noreferrer"
             target="_blank"
-            title={`${document.file_name}. ${documentUploadedLabel(document.created_at)}. ${documentVersionLabel(document)}${document.metadata?.warnings?.length ? '. Часть изображений распознана с предупреждениями. Проверьте оригинал.' : ''}`}
+            title={documentLinkTitle(document)}
           >
             {/\.(?:png|jpe?g|webp|tiff?|bmp)$/i.test(document.file_name) ? <ImageIcon size={15} /> : <FileText size={15} />}
             <span className="nav-document-copy">
@@ -1622,13 +1616,7 @@ function NavigationSidebar({
                 {documentUploadedLabel(document.created_at)} · {document.chat_id ? "только этот чат" : documentVersionLabel(document)}
               </span>
             </span>
-            <span className={`nav-document-status ${document.status}`}>
-              {document.status === "ready"
-                ? (document.metadata?.warnings?.length ? "Готов ⚠" : "Готов")
-                : document.status === "processing"
-                  ? `${document.processing_state?.progress ?? 0}%`
-                  : document.status}
-            </span>
+            <DocumentProcessingStatus document={document} />
           </a>
           {(document.scope !== "global" || canDeleteGlobalDocuments) ? (
             <button
@@ -1983,6 +1971,28 @@ function SystemPromptSelector({ isRunning }: { isRunning: boolean }) {
   );
 }
 
+/** Reset provider-specific endpoint and credential hints when switching provider families. */
+export function providerConfigForSelection(
+  current: ProviderConfig,
+  provider: ProviderName,
+  defaults: ProvidersResponse["defaults"],
+  models: string[]
+): ProviderConfig {
+  // A custom endpoint belongs to its provider. Keep it on a same-provider
+  // selection, but never carry a hidden cloud URL into Ollama.
+  if (provider === current.provider) return current;
+  const preset = defaults[provider];
+  return {
+    provider,
+    model: provider === "ollama" ? (models[0] ?? preset?.model ?? "") : (preset?.model ?? ""),
+    base_url: preset?.base_url ?? "",
+    folder_id: "",
+    auth_type: "api_key",
+    has_api_key: false,
+    api_key_hint: ""
+  };
+}
+
 function ProviderSettings({
   models,
   onProviderChange
@@ -2012,15 +2022,7 @@ function ProviderSettings({
   useEffect(() => { void load(); }, [load]);
 
   const changeProvider = (provider: ProviderName) => {
-    const preset = defaults[provider];
-    setConfig((current) => ({
-      ...current,
-      provider,
-      model: provider === "ollama" ? (models[0] ?? "") : (preset?.model ?? current.model),
-      base_url: preset?.base_url ?? current.base_url,
-      folder_id: "",
-      auth_type: "api_key"
-    }));
+    setConfig((current) => providerConfigForSelection(current, provider, defaults, models));
     setApiKey("");
     setStatus("");
   };
@@ -2399,15 +2401,13 @@ function ProjectWorkspacePanel({
                 <div className="project-document-list">
                   {projectDocuments.map((document) => (
                     <div className="project-document-row" key={document.id}>
-                      <a href={`/api/documents/${document.id}/content`} rel="noreferrer" target="_blank">
+                      <a href={`/api/documents/${document.id}/content`} rel="noreferrer" target="_blank" title={documentLinkTitle(document)}>
                         {/\.(?:png|jpe?g|webp|tiff?|bmp)$/i.test(document.file_name) ? <ImageIcon size={16} /> : <FileText size={16} />}
                         <span>
                           <strong>{document.file_name}</strong>
                           <small>{documentUploadedLabel(document.created_at)} · {documentVersionLabel(document)}</small>
                         </span>
-                        <em className={`nav-document-status ${document.status}`}>
-                          {document.status === "ready" ? "Готов" : document.status === "processing" ? `${document.processing_state?.progress ?? 0}%` : document.status}
-                        </em>
+                        <DocumentProcessingStatus as="em" document={document} />
                       </a>
                       <button
                         aria-label={`Удалить документ ${document.file_name}`}
@@ -2599,6 +2599,7 @@ function normalizeLegacyLatexLine(line: string): string {
   return `${match[1]}$${formula}$`;
 }
 
+/** Repair supported model math wrappers before Markdown/KaTeX rendering; preserve fenced code. */
 export function normalizeMarkdown(markdown: string): string {
   const normalized = markdown
     .replace(/\\?<(?:\/)?br\s*\/?>|&lt;\/?br\s*\/?&gt;/gi, (tag, offset, source) => {
@@ -3044,6 +3045,7 @@ function uploadedDocumentName(value: string): string {
   return name || "документ";
 }
 
+/** Resolve model source labels only against supplied document links before sanitized rendering. */
 export function normalizeSourceCitations(markdown: string, sources: ApiSource[] = []): string {
   const byName = new Map<string, ApiSource[]>();
   sources.forEach((source) => {
@@ -3173,10 +3175,12 @@ function AttachmentPanel({
   );
 }
 
+/** Prefer a human-readable source locator, then section, then the document-level fallback. */
 export function sourceLocatorLabel(source: Pick<ApiSource, "locator" | "section">): string {
   return source.locator || (source.section ? `Раздел «${source.section}»` : "Документ целиком");
 }
 
+/** Format upload time for display; upload time is not the document's effective revision date. */
 export function documentUploadedLabel(createdAt?: string): string {
   if (!createdAt) return "Время загрузки неизвестно";
   const date = new Date(createdAt);
@@ -3187,12 +3191,14 @@ export function documentUploadedLabel(createdAt?: string): string {
   }).format(date)}`;
 }
 
+/** Keep the active chat visible even when its project's navigation list is collapsed. */
 export function visibleNavigationChats<T>(items: T[], expanded: boolean, limit = 4, activeIndex = -1): T[] {
   if (expanded || items.length <= limit) return items;
   if (activeIndex < limit || activeIndex >= items.length) return items.slice(0, limit);
   return [...items.slice(0, Math.max(limit - 1, 0)), items[activeIndex]];
 }
 
+/** Describe only known uploaded revisions, without claiming that the corpus is legally current. */
 export function documentVersionLabel(
   document: Pick<DocumentRecord, "version_label" | "version_status" | "newer_file_name">
 ): string {
@@ -3201,6 +3207,32 @@ export function documentVersionLabel(
     return `Есть новее: ${document.newer_file_name || "другая загруженная версия"}`;
   }
   return `Версия ${document.version_label} · последняя из загруженных`;
+}
+
+function documentWarningHelp(document: DocumentRecord): string {
+  const warnings = document.metadata?.warnings;
+  return Array.isArray(warnings) && warnings.some((warning) => typeof warning === "string" && warning.trim())
+    ? "Есть предупреждения обработки. Проверьте оригинал."
+    : "";
+}
+
+function documentLinkTitle(document: DocumentRecord): string {
+  const warning = documentWarningHelp(document);
+  return `${document.file_name}. ${documentUploadedLabel(document.created_at)}. ${documentVersionLabel(document)}${warning ? `. ${warning}` : ""}`;
+}
+
+function DocumentProcessingStatus({ document, as: Tag = "span" }: { document: DocumentRecord; as?: "span" | "em" }) {
+  const warning = document.status === "ready" ? documentWarningHelp(document) : "";
+  const label = document.status === "ready"
+    ? "Готов"
+    : document.status === "processing"
+      ? `${document.processing_state?.progress ?? 0}%`
+      : document.status;
+  return (
+    <Tag className={`nav-document-status ${document.status}`} title={warning || undefined}>
+      {label}{warning ? <> <AlertTriangle aria-label="Есть предупреждения обработки" role="img" size={12} /></> : null}
+    </Tag>
+  );
 }
 
 function DebugPanel({
@@ -3247,7 +3279,7 @@ function DebugPanel({
                 {chunk.section_path ? <span>{chunk.section_path}</span> : null}
                 {chunk.chunk_type ? <span>type: {chunk.chunk_type}</span> : null}
                 {chunk.status && chunk.status !== "active" ? <span>status: {chunk.status}</span> : null}
-                <span>score={chunk.score}</span>
+                <span>score={chunk.score ?? "—"}</span>
               </div>
               <HtmlCard
                 className="context-text"

@@ -51,6 +51,7 @@ _OCCURRENCE = re.compile(
 
 @dataclass(frozen=True)
 class ConversationContext:
+    """Immutable resolved user intent and the user-message IDs that explain its conversational origin; not source evidence."""
     original_question: str
     retrieval_question: str
     subject: str

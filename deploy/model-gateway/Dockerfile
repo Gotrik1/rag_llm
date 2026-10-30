@@ -1,0 +1,18 @@
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+COPY deploy/model-gateway/requirements.txt ./requirements.txt
+RUN python -m pip install --requirement requirements.txt
+COPY deploy/model-gateway/app.py ./app.py
+
+RUN useradd --uid 10002 --create-home --shell /usr/sbin/nologin gateway && \
+    chown -R gateway:gateway /app
+USER gateway
+
+EXPOSE 8090
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8090", "--no-access-log"]

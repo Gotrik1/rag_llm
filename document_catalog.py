@@ -209,6 +209,7 @@ def annotate_document_versions(documents: list[dict[str, Any]]) -> list[dict[str
 
 
 def format_uploaded_at(value: Any) -> str:
+    """Format a registry upload time in UTC without treating it as the document's effective or edition date."""
     if isinstance(value, datetime):
         moment = value
     else:
@@ -226,6 +227,7 @@ def format_uploaded_at(value: Any) -> str:
 
 
 def document_version_summary(document: dict[str, Any]) -> str:
+    """Describe only comparable uploaded editions; missing labels cannot establish external currency."""
     label = document.get("version_label")
     status = document.get("version_status")
     if not label:
@@ -253,6 +255,7 @@ def _json_safe(value: Any) -> Any:
 
 
 def build_document_catalog_answer(project_name: str, documents: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build a deterministic registry answer with document links, upload status and same-scope version annotations."""
     annotated = annotate_document_versions(documents)
     scope_name = project_name.strip() or "свободный чат"
     if not annotated:

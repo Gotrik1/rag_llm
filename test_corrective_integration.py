@@ -244,7 +244,14 @@ def test_legacy_default_retains_original_path_and_marks_trace_as_legacy():
     agent.understand_query.assert_called_once_with(QUESTION)
     agent._generate_grounded_answer.assert_called_once()
     agent._ask_corrective.assert_not_called()
-    assert agent.last_retrieval_trace() == {"mode": "legacy"}
+    # The injected retrieval bypasses the real selector. Requested legacy mode
+    # must not be reported as an actually executed selector.
+    assert agent.last_retrieval_trace() == {
+        "mode": "legacy", "selection_mode_requested": "legacy",
+        "selection_mode_source": "default", "selection_mode": "not_applied",
+        "selection_applied": False,
+        "synthetic_question": QUESTION, "visible_candidates": 1,
+    }
 
 
 def test_explicit_legacy_request_overrides_enabled_environment(monkeypatch):
@@ -288,7 +295,12 @@ def test_later_legacy_request_does_not_reuse_previous_corrective_trace():
     agent.understand_query = Mock(return_value=SimpleNamespace(canonical_question=QUESTION, retrieval_queries=(QUESTION,)))
     agent._generate_grounded_answer = Mock(return_value="Прежний ответ")
     agent.ask(QUESTION, pipeline_mode="off")
-    assert agent.last_retrieval_trace() == {"mode": "legacy"}
+    assert agent.last_retrieval_trace() == {
+        "mode": "legacy", "selection_mode_requested": "legacy",
+        "selection_mode_source": "default", "selection_mode": "not_applied",
+        "selection_applied": False,
+        "synthetic_question": QUESTION, "visible_candidates": 1,
+    }
     assert all("evidence_id" not in row for row in agent.last_retrieved_context())
 
 

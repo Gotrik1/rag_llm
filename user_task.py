@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class UserTask:
+    """Exact user question and user-origin resolved context, isolated from planner hypotheses and retrieved facts."""
     question: str
     resolved_user_context: str
 
@@ -19,4 +20,5 @@ class UserTask:
 
     def to_payload(self) -> dict[str, str]:
         # Never truncate, normalize, or substitute a planner's canonical term.
+        """Return both original intent strings unchanged for stage prompts and request diagnostics."""
         return {'question': self.question, 'resolved_user_context': self.resolved_user_context}

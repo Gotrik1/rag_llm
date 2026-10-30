@@ -1,6 +1,13 @@
+//! Lightweight parsers and character-overlap chunks for standalone Rust ingestion.
+//!
+//! This path supports local DOCX/PDF/Markdown/TXT files. DOCX extraction reads
+//! paragraph text, not Python's OMML/table-grid representation; PDF extraction
+//! has no OCR. Do not advertise feature or quality parity with Python ingestion.
+
 use anyhow::{bail, Result};
 use std::path::Path;
 
+/// Text slice tied to its original file, section heading and local chunk ordinal.
 pub struct Chunk {
     pub text: String,
     pub source_file: String,
@@ -11,6 +18,8 @@ pub struct Chunk {
 const CHUNK_SIZE: usize = 1500;
 const CHUNK_OVERLAP: usize = 200;
 
+/// Dispatch by extension and split sections into character-based overlapping text.
+/// Unsupported types and parser/file errors propagate; no indexing occurs here.
 pub fn parse_and_chunk(path: &str) -> Result<Vec<Chunk>> {
     let p = Path::new(path);
     let ext = p.extension()
@@ -31,6 +40,7 @@ pub fn parse_and_chunk(path: &str) -> Result<Vec<Chunk>> {
 // ─────────────────────────────────────────────
 // DOCX: читаем стили параграфов из XML
 // ─────────────────────────────────────────────
+/// Extract DOCX paragraph text and heading styles; embedded math is not parsed.
 fn parse_docx_by_styles(path: &str) -> Result<Vec<(String, String)>> {
     use std::io::Read;
 
@@ -151,6 +161,7 @@ fn extract_para_text(para_xml: &str) -> String {
 // ─────────────────────────────────────────────
 // PDF
 // ─────────────────────────────────────────────
+/// Extract available PDF text; scanned images require a different OCR pipeline.
 fn parse_pdf(path: &str) -> Result<Vec<(String, String)>> {
     use lopdf::Document;
     let doc = Document::load(path)?;
@@ -168,6 +179,7 @@ fn parse_pdf(path: &str) -> Result<Vec<(String, String)>> {
 // ─────────────────────────────────────────────
 // Markdown / TXT
 // ─────────────────────────────────────────────
+/// Read UTF-8 text and use numbered-heading heuristics for section boundaries.
 fn parse_markdown(path: &str) -> Result<Vec<(String, String)>> {
     let text = std::fs::read_to_string(path)?;
     Ok(split_by_text_patterns(&text))
@@ -201,6 +213,7 @@ fn split_by_text_patterns(text: &str) -> Vec<(String, String)> {
     sections
 }
 
+/// Recognize short numbered text heuristically, not a full Markdown/Word outline.
 fn is_numbered_header(line: &str) -> bool {
     if line.is_empty() || line.len() > 80 {
         return false;
@@ -219,6 +232,7 @@ fn is_numbered_header(line: &str) -> bool {
 // ─────────────────────────────────────────────
 // Нарезка секций на чанки
 // ─────────────────────────────────────────────
+/// Slice Unicode characters with overlap while retaining a section label per hit.
 fn sections_to_chunks(sections: Vec<(String, String)>, source: &str) -> Vec<Chunk> {
     let mut chunks = Vec::new();
     let mut chunk_id = 0;

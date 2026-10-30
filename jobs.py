@@ -39,24 +39,29 @@ def _mark_payload_cancelled(job_id: str, payload: dict[str, Any]) -> None:
 
 
 class JobQueue:
+    """Coordinate persistent job records and ARQ delivery; Redis receives job IDs rather than private payloads."""
     def __init__(self, redis_url: str | None = None) -> None:
         self.redis_url = redis_url or os.getenv("RAG_REDIS_URL", "redis://localhost:6379/0")
         self._redis: ArqRedis | None = None
 
     async def connect(self) -> None:
+        """Lazily open this queue facade's Redis connection pool."""
         if self._redis is None:
             self._redis = await create_pool(RedisSettings.from_dsn(self.redis_url))
 
     async def close(self) -> None:
+        """Release the owned Redis pool and permit a later reconnect."""
         if self._redis is not None:
             await self._redis.aclose()
             self._redis = None
 
     async def ping(self) -> bool:
+        """Check Redis delivery availability, establishing the connection when necessary."""
         await self.connect()
         return bool(await self._redis.ping())
 
     async def submit(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist a supported job before enqueueing its ID; mark the record failed if delivery raises."""
         store = get_store()
         if not store.enabled:
             raise RuntimeError("RAG_DATABASE_URL is required for persistent jobs")
@@ -102,15 +107,18 @@ class JobQueue:
             await asyncio.sleep(max(0.05, poll_interval))
 
     async def get(self, job_id: str) -> dict[str, Any] | None:
+        """Fetch the public persisted job status without exposing the worker-only payload."""
         return await asyncio.to_thread(get_store().get_job, job_id)
 
     async def can_access(self, job_id: str, subject: str, privileged: bool = False) -> bool:
+        """Check payload ownership unless the caller has already established privileged access."""
         if privileged:
             return True
         payload = await asyncio.to_thread(get_store().get_job_payload, job_id)
         return isinstance(payload, dict) and payload.get("owner_subject") == subject
 
     async def cancel(self, job_id: str) -> bool:
+        """Request cancellation, abort ARQ delivery and close associated message/document state when accepted."""
         store = get_store()
         payload = await asyncio.to_thread(store.get_job_payload, job_id)
         accepted = await asyncio.to_thread(store.request_cancel, job_id)

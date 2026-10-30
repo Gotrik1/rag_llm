@@ -1,8 +1,10 @@
 import { act, createElement } from "react";
+import { useExternalStoreRuntime, type AssistantRuntime, type ThreadMessage } from "@assistant-ui/react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
+import { withStableThreadListSnapshot } from "./runtimeSnapshot";
 
 // Deliberately use the real @assistant-ui/react runtime and message primitives.
 // Mock only HTTP and browser APIs unavailable in jsdom; never call a model/server.
@@ -14,6 +16,7 @@ describe("persisted answers with the real assistant runtime", () => {
   const answer = "Сохранённый синтетический ответ с исходными фрагментами.";
   const quote = "ТОЧНЫЙ ИСХОДНЫЙ ФРАГМЕНТ\nУсловия сохраняются целиком.";
   const fetchMock = vi.fn();
+  let sourceScore: number | null | undefined;
   let root: Root | undefined;
   let container: HTMLDivElement;
   let originalScrollIntoView: PropertyDescriptor | undefined;
@@ -63,6 +66,7 @@ describe("persisted answers with the real assistant runtime", () => {
   }
 
   beforeEach(() => {
+    sourceScore = 0.875;
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     vi.stubGlobal("ResizeObserver", class {
       observe() {}
@@ -118,7 +122,14 @@ describe("persisted answers with the real assistant runtime", () => {
       if ((options?.method ?? "GET") !== "GET") throw new Error(`Unexpected mutation in read-only fixture: ${path}`);
       const pathname = new URL(path, window.location.origin).pathname;
       if (!(pathname in routes)) throw new Error(`Unexpected fixture request: ${path}`);
-      return jsonResponse(routes[pathname]);
+      const response = jsonResponse(routes[pathname]);
+      if (pathname === `/api/jobs/${jobId}`) {
+        const job = await response.json();
+        if (sourceScore === undefined) delete job.result.context[0].score;
+        else job.result.context[0].score = sourceScore;
+        return jsonResponse(job);
+      }
+      return response;
     });
     vi.stubGlobal("fetch", fetchMock);
   });
@@ -135,6 +146,23 @@ describe("persisted answers with the real assistant runtime", () => {
     vi.unstubAllGlobals();
     window.history.replaceState(null, "", "/");
     window.localStorage.clear();
+  });
+
+  it("confirms the installed bridge allocates equivalent disconnected snapshots and adapts their identity", async () => {
+    let captured: AssistantRuntime | undefined;
+    function RuntimeProbe() {
+      captured = useExternalStoreRuntime<ThreadMessage>({ messages: [], onNew: async () => {} });
+      return null;
+    }
+    root = createRoot(container);
+    await act(async () => root!.render(createElement(RuntimeProbe)));
+    const runtime = captured!;
+    const first = runtime.threads.getState();
+    const second = runtime.threads.getState();
+    expect(second).toEqual(first);
+    expect(second).not.toBe(first);
+    const adapted = withStableThreadListSnapshot(runtime);
+    expect(adapted.threads.getState()).toBe(adapted.threads.getState());
   });
 
   it("renders stored messages and recovers their exact Debug snapshot after a real remount without retrieval", async () => {
@@ -159,6 +187,18 @@ describe("persisted answers with the real assistant runtime", () => {
     await click(container.querySelector(".debug-button"));
     expect(container.querySelector(".context-text")?.textContent).toBe(quote);
     expect(jobRequests()).toHaveLength(2);
+    expect(fetchMock.mock.calls.some(([path]) => path === "/api/debug" || path === "/api/ask")).toBe(false);
+  });
+
+  it.each([undefined, null])("recovers canonical unranked sections and displays a dash (score=%s)", async (score) => {
+    sourceScore = score;
+    await mount();
+    await openDebug();
+    await click(container.querySelector(".debug-button"));
+    expect(container.querySelector(".context-text")?.textContent).toBe(quote);
+    expect(container.querySelector(".source-meta")?.textContent).toContain("score=—");
+    expectVisibleMessages();
+    expect(jobRequests()).toHaveLength(1);
     expect(fetchMock.mock.calls.some(([path]) => path === "/api/debug" || path === "/api/ask")).toBe(false);
   });
 });

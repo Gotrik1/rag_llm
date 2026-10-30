@@ -1,4 +1,9 @@
-"""ASGI entry point for the incremental RAG service migration."""
+"""HTTP adapters for authentication, request scopes, SSE and application use cases.
+
+Generation/document state transitions live in application_services; synchronous
+RAG selection lives in question_service behind the protected compatibility bridge.
+Keep domain rules out of route handlers and bind dependency overrides per request.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -19,6 +24,8 @@ from opentelemetry.trace import format_trace_id, get_current_span
 from pydantic import BaseModel, ConfigDict, Field
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
+from application_services import DocumentService, GenerationService, ServiceError
+from api_openapi import install_openapi
 from audit import record as audit_record
 from db_store import (
     create_document,
@@ -57,18 +64,21 @@ from runtime_paths import UPLOAD_DIR
 
 
 class AskRequest(BaseModel):
+    """Validated question input; ownership is bound by authentication, never by client fields."""
     question: str = Field(min_length=1, max_length=20_000)
     chat_id: str | None = None
     retrieval_focus: str = Field(default="auto", pattern="^(auto|rre|orem|both)$")
 
 
 class LoginRequest(BaseModel):
+    """Credentials accepted by the local login endpoint; extra request fields are rejected."""
     model_config = ConfigDict(extra="forbid")
     email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=1, max_length=128)
 
 
 class RegisterRequest(LoginRequest):
+    """Local registration input extending credentials with the public display name."""
     display_name: str = Field(default="", max_length=80)
 
 
@@ -82,6 +92,7 @@ GLOBAL_DOCUMENT_MANAGEMENT_PERMISSION = "rag.global_documents.manage"
 
 
 def safe_upload_name(filename: str) -> str:
+    """Normalize an untrusted display filename without preserving client directory components."""
     name = Path(filename).name.strip() or "upload.bin"
     name = re.sub(r"[^A-Za-zА-Яа-яЁё0-9._ -]+", "_", name)
     return name[:180] or "upload.bin"
@@ -111,15 +122,18 @@ def run_ask_stream(payload: dict | str, on_delta) -> dict:
 
 
 def qdrant_readiness_error() -> str | None:
+    """Probe vector storage through the compatibility adapter without running a question."""
     from web_ui import Handler
     return Handler.qdrant_error()
 
 
 def legacy_operation(method: str, path: str, body: dict | None = None, *, content_type: str = "", raw_body: bytes = b"") -> tuple[dict, int]:
+    """Call the synchronous compatibility adapter with its existing payload/status contract."""
     return invoke_legacy(method, path, body, content_type=content_type, raw_body=raw_body)
 
 
 def run_ingestion_job(payload: dict) -> dict:
+    """Execute legacy ingestion and surface a failed result to the queue worker."""
     result, status = legacy_operation("POST", "/api/load", payload)
     if status >= 400:
         raise RuntimeError(str(result.get("error", "ingestion failed")))
@@ -127,14 +141,17 @@ def run_ingestion_job(payload: dict) -> dict:
 
 
 def _local_auth_enabled() -> bool:
+    """Select server-side cookie sessions only in the configured local authentication mode."""
     return os.getenv("RAG_AUTH_MODE", "development").strip().lower() == "local"
 
 
 def _all_users_manage_global_documents() -> bool:
+    """Read the explicit testing/deployment override for shared-library management."""
     return os.getenv("RAG_ALL_USERS_MANAGE_GLOBAL_DOCUMENTS", "false").strip().lower() == "true"
 
 
 def can_manage_global_documents(principal: Principal) -> bool:
+    """Evaluate shared-library management separately from ordinary RAG access."""
     return (
         _all_users_manage_global_documents()
         or "superadmin" in principal.roles
@@ -144,12 +161,14 @@ def can_manage_global_documents(principal: Principal) -> bool:
 
 
 def session_user(user: dict) -> dict:
+    """Project public account data plus the effective shared-library UI capability."""
     result = public_user(user)
     result["can_manage_global_documents"] = bool(result.get("is_admin")) or _all_users_manage_global_documents()
     return result
 
 
 async def current_principal(request: Request) -> AsyncIterator[Principal]:
+    """Authenticate, authorize RAG access and bind tenant context for the entire request."""
     try:
         if _local_auth_enabled():
             user = await asyncio.to_thread(authenticate_session, request.cookies.get(SESSION_COOKIE_NAME, ""))
@@ -193,6 +212,7 @@ async def current_principal(request: Request) -> AsyncIterator[Principal]:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    """Initialize telemetry and bootstrap authorization before serving requests; close the queue on exit."""
     configure_logging()
     configure_telemetry()
     bootstrap_subject = os.getenv("BOOTSTRAP_SUPERADMIN_SUBJECT", "").strip() or "rag-superadmin"
@@ -207,47 +227,44 @@ _persistent_ask_tasks: set[asyncio.Task] = set()
 
 
 def _forget_persistent_ask(task: asyncio.Task) -> None:
+    """Release a completed owned task and consume errors after delivery disconnects."""
     _persistent_ask_tasks.discard(task)
     if not task.cancelled():
         task.exception()  # Consume detached failures after a client disconnect.
 
 
-async def _run_and_persist_ask(request_payload: dict, assistant_message: dict) -> dict:
-    message_id = str(assistant_message["id"])
-    try:
-        result = await asyncio.to_thread(run_ask, request_payload)
-    except Exception as exc:
-        await asyncio.to_thread(update_message, message_id, {"content": str(exc), "status": "error"})
-        raise
-    await asyncio.to_thread(
-        update_message,
-        message_id,
-        {
-            "content": str(result.get("answer", "")),
-            "content_html": str(result.get("html_answer", "")),
-            "status": "complete",
-            "metadata": {
-                "flow_mode": result.get("flow_mode"),
-                "from_cache": bool(result.get("from_cache", False)),
-                "elapsed_s": result.get("elapsed_s", 0),
-                "model_label": (result.get("llm") or {}).get("label"),
-                "llm": result.get("llm") or {},
-                "sources": result.get("sources") or [],
-                "formulas": result.get("formulas") or [],
-                "warnings": result.get("warnings") or [],
-                "usage": result.get("usage") or {},
-                "retrieval_trace": result.get("retrieval_trace") or {},
-            },
-        },
+def _generation_service() -> GenerationService:
+    """Bind request-time dependencies so ownership context and overrides stay local."""
+    return GenerationService(
+        get_chat=get_chat, create_message=create_message, update_message=update_message,
+        run_ask=run_ask, queue=jobs, tracked_tasks=_persistent_ask_tasks,
+        forget_task=_forget_persistent_ask,
+        durable=os.getenv("RAG_DURABLE_GENERATION", "false").lower() == "true",
+        wait_seconds=GENERATION_WAIT_SECONDS,
     )
-    result["message_id"] = message_id
-    return result
+
+
+def _document_service() -> DocumentService:
+    """Assemble the document use case without capturing mutable globals at import."""
+    return DocumentService(
+        create_document=create_document, update_document=update_document,
+        get_document=get_document, tombstone_document=tombstone_document,
+        infer_domains=infer_document_domains, safe_name=safe_upload_name,
+        queue=jobs, upload_dir=UPLOAD_DIR, allowed_suffixes=ALLOWED_UPLOAD_SUFFIXES,
+        max_bytes=MAX_UPLOAD_BYTES, max_files=MAX_UPLOAD_FILES,
+    )
+
+
+async def _run_and_persist_ask(request_payload: dict, assistant_message: dict) -> dict:
+    """Compatibility seam for callers that persist a server-owned generation."""
+    return await _generation_service().persist(request_payload, assistant_message)
 cors_origins = [origin.strip() for origin in os.getenv("RAG_CORS_ORIGINS", "http://127.0.0.1:5173").split(",") if origin.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"], allow_headers=["Authorization", "Content-Type", "X-Request-ID", "X-CSRF-Token"], expose_headers=["X-Request-ID", "X-Trace-ID"])
 
 
 @app.middleware("http")
 async def csrf_protection(request: Request, call_next):
+    """Require the session-bound CSRF token on authenticated cookie-based API mutations."""
     if (
         _local_auth_enabled()
         and request.method in {"POST", "PUT", "PATCH", "DELETE"}
@@ -262,6 +279,7 @@ async def csrf_protection(request: Request, call_next):
 
 @app.middleware("http")
 async def request_telemetry(request: Request, call_next):
+    """Record transport metadata and correlation IDs without logging document or answer content."""
     started = time.perf_counter()
     request_id = request.headers.get("X-Request-ID", uuid.uuid4().hex)
     with tracer().start_as_current_span(f"{request.method} {request.url.path}"):
@@ -286,6 +304,7 @@ async def request_telemetry(request: Request, call_next):
 
 @app.get("/healthz", include_in_schema=False)
 async def healthz():
+    """Return process liveness without requiring external dependencies."""
     return {"status": "ok"}
 
 
@@ -293,6 +312,7 @@ async def healthz():
 async def readyz():
     # Dependency readiness remains explicit so deployments do not accidentally
     # advertise readiness before Qdrant is reachable.
+    """Require configured vector, relational and queue dependencies before reporting readiness."""
     problem = await asyncio.to_thread(qdrant_readiness_error)
     if problem:
         raise HTTPException(503, problem)
@@ -310,10 +330,12 @@ async def readyz():
 
 @app.get("/metrics", include_in_schema=False)
 async def metrics():
+    """Expose the Prometheus registry for internal observability."""
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 def _session_response(user: dict, session_token: str, *, status_code: int = 200) -> JSONResponse:
+    """Set the HTTP-only session cookie and return public account/CSRF information."""
     response = JSONResponse(
         jsonable_encoder({"authenticated": True, "user": session_user(user), "csrf_token": csrf_token(session_token)}),
         status_code=status_code,
@@ -332,6 +354,7 @@ def _session_response(user: dict, session_token: str, *, status_code: int = 200)
 
 @app.get("/api/auth/session")
 async def auth_session(request: Request):
+    """Restore a valid local session or expose development bootstrap identity."""
     if not _local_auth_enabled():
         return {
             "authenticated": True,
@@ -357,6 +380,7 @@ async def auth_session(request: Request):
 
 @app.post("/api/auth/register", status_code=201)
 async def auth_register(payload: RegisterRequest, request: Request):
+    """Register an account through local_auth and issue its initial server session."""
     try:
         user = await asyncio.to_thread(register_user, payload.email, payload.display_name, payload.password)
     except RegistrationError as exc:
@@ -373,6 +397,7 @@ async def auth_register(payload: RegisterRequest, request: Request):
 
 @app.post("/api/auth/login")
 async def auth_login(payload: LoginRequest, request: Request):
+    """Verify local credentials and issue a new server session."""
     try:
         user = await asyncio.to_thread(authenticate_credentials, payload.email, payload.password)
     except InvalidCredentials as exc:
@@ -390,6 +415,7 @@ async def auth_login(payload: LoginRequest, request: Request):
 
 @app.post("/api/auth/logout")
 async def auth_logout(request: Request):
+    """Revoke the current server session and expire its browser cookie."""
     session_token = request.cookies.get(SESSION_COOKIE_NAME, "")
     await asyncio.to_thread(revoke_session, session_token)
     response = JSONResponse({"authenticated": False})
@@ -399,6 +425,7 @@ async def auth_logout(request: Request):
 
 @app.get("/api/me")
 async def me(principal: Principal = Depends(current_principal)):
+    """Return the effective authenticated identity and capabilities, never credential material."""
     return {
         "subject": principal.subject,
         "roles": sorted(principal.roles),
@@ -415,11 +442,13 @@ async def me(principal: Principal = Depends(current_principal)):
 
 
 def require_admin(principal: Principal, path: str) -> None:
+    """Authorize an administrative action using the effective principal permissions."""
     authorize(principal, "rag.admin", path)
 
 
 @app.post("/api/admin/policies")
 async def save_policy(payload: dict, principal: Principal = Depends(current_principal)):
+    """Validate the policy envelope before delegating persistence to the authorization store."""
     require_admin(principal, "/api/admin/policies")
     if payload.get("effect") not in {"allow", "deny"} or not payload.get("name") or not payload.get("action"):
         raise HTTPException(400, "name, action and allow/deny effect are required")
@@ -428,6 +457,7 @@ async def save_policy(payload: dict, principal: Principal = Depends(current_prin
 
 @app.post("/api/admin/principals/{subject}/roles")
 async def grant_principal_role(subject: str, payload: dict, principal: Principal = Depends(current_principal)):
+    """Authorize role administration before recording the requested principal grant."""
     require_admin(principal, "/api/admin/principals/*/roles")
     role = str(payload.get("role", "")).strip()
     permissions = [str(item) for item in payload.get("permissions", [])]
@@ -438,176 +468,44 @@ async def grant_principal_role(subject: str, payload: dict, principal: Principal
 
 @app.post("/api/ask")
 async def ask(payload: AskRequest, principal: Principal = Depends(current_principal)):
-    question = payload.question.strip()
-    if not question:
-        raise HTTPException(400, "empty question")
-    # Current RAG/Qdrant/LLM SDKs are synchronous. Isolating them in a worker
-    # thread keeps the event loop responsive without falsely marking blocking IO as async.
+    """Deliver an answer or a pollable job; use cases own publication and retries."""
     with tracer().start_as_current_span("rag.ask") as span:
         span.set_attribute("rag.principal_provider", principal.provider)
         started = time.perf_counter()
-        request_payload = payload.model_dump(exclude_none=True, exclude_defaults=True)
-        request_payload["_owner_subject"] = principal.subject
-        request_payload["_owner_admin"] = "superadmin" in principal.roles
-        assistant_message: dict | None = None
-        if payload.chat_id:
-            if await asyncio.to_thread(get_chat, payload.chat_id) is None:
-                raise HTTPException(404, "chat not found")
-            assistant_message = await asyncio.to_thread(
-                create_message,
-                payload.chat_id,
-                {"role": "assistant", "content": "", "status": "running", "metadata": {"principal": principal.subject}},
+        try:
+            result = await _generation_service().execute(
+                payload.model_dump(exclude_none=True, exclude_defaults=True),
+                principal.subject, "superadmin" in principal.roles,
             )
-        durable_generation = os.getenv("RAG_DURABLE_GENERATION", "false").lower() == "true"
-        if assistant_message and durable_generation:
-            try:
-                job = await jobs.submit(
-                    "generation",
-                    {
-                        "assistant_message_id": str(assistant_message["id"]),
-                        "request": request_payload,
-                        "owner_subject": principal.subject,
-                    },
-                )
-                await asyncio.to_thread(
-                    update_message,
-                    str(assistant_message["id"]),
-                    {
-                        "metadata": {
-                            "principal": principal.subject,
-                            "job_id": str(job["id"]),
-                        }
-                    },
-                )
-            except Exception as exc:
-                await asyncio.to_thread(
-                    update_message,
-                    str(assistant_message["id"]),
-                    {"content": str(exc), "status": "error"},
-                )
-                raise HTTPException(503, "Generation queue is unavailable") from exc
-            terminal = await jobs.wait(str(job["id"]), GENERATION_WAIT_SECONDS)
-            if terminal and terminal["status"] == "completed" and isinstance(terminal.get("result"), dict):
-                result = terminal["result"]
-            elif terminal and terminal["status"] in {"failed", "cancelled"}:
-                raise HTTPException(500, str(terminal.get("error") or "Generation did not complete"))
-            else:
-                result = {
-                    "answer": "",
-                    "message_id": str(assistant_message["id"]),
-                    "job_id": str(job["id"]),
-                    "status": "running",
-                    "flow_mode": "queued",
-                    "from_cache": False,
-                    "elapsed_s": time.perf_counter() - started,
-                }
-        elif assistant_message:
-            task = asyncio.create_task(_run_and_persist_ask(request_payload, assistant_message))
-            _persistent_ask_tasks.add(task)
-            task.add_done_callback(_forget_persistent_ask)
-            # Client cancellation stops delivery only. The server-owned task
-            # persists its terminal state for the next page load.
-            result = await asyncio.shield(task)
-        else:
-            result = await asyncio.to_thread(run_ask, request_payload)
+        except ServiceError as exc:
+            raise HTTPException(exc.status_code, exc.detail) from exc
         PIPELINE_SECONDS.labels("ask", result.get("flow_mode", "unknown")).observe(time.perf_counter() - started)
-        return JSONResponse(
-            jsonable_encoder(result),
-            status_code=202 if result.get("status") == "running" else 200,
-        )
+        return JSONResponse(jsonable_encoder(result), status_code=202 if result.get("status") == "running" else 200)
 
 
 def _sse(event: str, data: dict) -> str:
+    """Encode one SSE event; payload encoding matches ordinary JSON responses."""
     encoded = jsonable_encoder(data)
     return f"event: {event}\ndata: {json.dumps(encoded, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
 
 @app.post("/api/ask/stream")
 async def ask_stream(payload: AskRequest, request: Request, principal: Principal = Depends(current_principal)):
-    """SSE contract with immediate progress, heartbeats and incremental answer chunks."""
-    request_payload = payload.model_dump(exclude_none=True, exclude_defaults=True)
-    request_payload["_owner_subject"] = principal.subject
-    request_payload["_owner_admin"] = "superadmin" in principal.roles
-    if payload.chat_id and await asyncio.to_thread(get_chat, payload.chat_id) is None:
-        raise HTTPException(404, "chat not found")
-    if payload.chat_id and os.getenv("RAG_DURABLE_GENERATION", "false").lower() == "true":
-        async def durable_events():
-            assistant_message = await asyncio.to_thread(
-                create_message,
-                payload.chat_id,
-                {"role": "assistant", "content": "", "status": "running", "metadata": {"principal": principal.subject}},
-            )
-            try:
-                job = await jobs.submit(
-                    "generation",
-                    {
-                        "assistant_message_id": str(assistant_message["id"]),
-                        "request": request_payload,
-                        "owner_subject": principal.subject,
-                    },
-                )
-                await asyncio.to_thread(
-                    update_message,
-                    str(assistant_message["id"]),
-                    {"metadata": {"principal": principal.subject, "job_id": str(job["id"])}},
-                )
-            except Exception as exc:
-                await asyncio.to_thread(
-                    update_message,
-                    str(assistant_message["id"]),
-                    {"content": str(exc), "status": "error"},
-                )
-                yield _sse("error", {"message": "Generation queue is unavailable"})
-                return
-            yield _sse(
-                "started",
-                {"flow": "queued", "job_id": str(job["id"]), "message_id": str(assistant_message["id"])},
-            )
-            while True:
-                if await request.is_disconnected():
-                    return
-                state = await jobs.get(str(job["id"]))
-                if state is None:
-                    yield _sse("error", {"message": "Generation job disappeared"})
-                    return
-                if state["status"] == "completed":
-                    result = dict(state.get("result") or {})
-                    result.pop("html_answer", None)
-                    yield _sse("completed", result)
-                    return
-                if state["status"] in {"failed", "cancelled"}:
-                    yield _sse("error", {"message": str(state.get("error") or "Generation did not complete")})
-                    return
-                yield _sse("heartbeat", {"status": state["status"], "progress": state.get("progress", 0)})
-                await asyncio.sleep(1)
-
-        return StreamingResponse(
-            durable_events(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    """Encode generation progress as SSE without duplicating lifecycle rules."""
+    service = _generation_service()
+    try:
+        prepared = await service.prepare(
+            payload.model_dump(exclude_none=True, exclude_defaults=True),
+            principal.subject, "superadmin" in principal.roles,
         )
+    except ServiceError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
 
     async def events():
-        yield _sse("started", {"flow": "pending"})
-        deltas: asyncio.Queue[str] = asyncio.Queue()
-        loop = asyncio.get_running_loop()
-        callback = lambda text: loop.call_soon_threadsafe(deltas.put_nowait, text)
-        task = asyncio.create_task(asyncio.to_thread(run_ask_stream, request_payload, callback))
-        while not task.done() or not deltas.empty():
-            if await request.is_disconnected():
-                task.cancel()
-                return
-            try:
-                delta = await asyncio.wait_for(deltas.get(), timeout=10)
-                yield _sse("delta", {"text": delta})
-            except TimeoutError:
-                yield _sse("heartbeat", {"status": "running"})
-        try:
-            result = task.result()
-            result.pop("html_answer", None)
-            yield _sse("completed", result)
-        except Exception:
-            yield _sse("error", {"message": "RAG generation failed"})
+        """Encode transport-neutral generation events as SSE frames."""
+        async for event, data in service.stream_events(prepared, principal.subject, request.is_disconnected, run_ask_stream):
+            yield _sse(event, data)
+
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
@@ -629,134 +527,51 @@ async def upload_documents(
     chat_id: str = Form(""),
     principal: Principal = Depends(current_principal),
 ):
-    """Persist uploads and enqueue ingestion without holding the request open."""
-    if not files or len(files) > MAX_UPLOAD_FILES:
-        raise HTTPException(400, f"upload between 1 and {MAX_UPLOAD_FILES} files")
-    normalized_project = project_id.strip() or None
-    normalized_chat = chat_id.strip() or None
-    if not normalized_project and not normalized_chat and not can_manage_global_documents(principal):
-        raise HTTPException(403, "global document upload is not permitted for this account")
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    queued: list[dict] = []
-    for upload in files:
-        display_name = safe_upload_name(upload.filename or "upload.bin")
-        if Path(display_name).suffix.lower() not in ALLOWED_UPLOAD_SUFFIXES:
-            raise HTTPException(415, f"unsupported document type: {display_name}")
-        target = UPLOAD_DIR / f"{uuid.uuid4().hex}_{display_name}"
-        size = 0
-        try:
-            with target.open("xb") as output:
-                while chunk := await upload.read(1024 * 1024):
-                    size += len(chunk)
-                    if size > MAX_UPLOAD_BYTES:
-                        raise HTTPException(413, f"file is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB: {display_name}")
-                    output.write(chunk)
-        except Exception:
-            target.unlink(missing_ok=True)
-            raise
-        document = await asyncio.to_thread(
-            create_document,
-            normalized_project,
-            normalized_chat,
-            {
-                "file_name": display_name,
-                "source_path": str(target),
-                "mime_type": upload.content_type or "application/octet-stream",
-                "status": "queued",
-                "metadata": {
-                    "size_bytes": size,
-                    "knowledge_domains": list(infer_document_domains(display_name)),
-                },
-            },
+    """Adapt multipart uploads to the document registration/ingestion use case."""
+    try:
+        result = await _document_service().upload(
+            files, project_id, chat_id, principal.subject, can_manage_global_documents(principal),
         )
-        try:
-            job = await jobs.submit(
-                "ingestion",
-                {
-                    "path": str(target),
-                    "document_id": str(document["id"]),
-                    "owner_subject": principal.subject,
-                },
-            )
-        except Exception as exc:
-            await asyncio.to_thread(
-                update_document,
-                str(document["id"]),
-                {"status": "failed", "processing_state": {"error": str(exc)[:1000]}},
-            )
-            raise HTTPException(503, f"ingestion queue unavailable for {display_name}") from exc
-        await asyncio.to_thread(
-            update_document,
-            str(document["id"]),
-            {"processing_state": {"job_id": job["id"], "progress": 0}},
-        )
-        queued.append({
-            "id": str(document["id"]),
-            "file": display_name,
-            "size_bytes": size,
-            "status": "queued",
-            "job_id": job["id"],
-            "url": f"/api/documents/{document['id']}/content",
-        })
-    return JSONResponse({"files": queued, "chunks": 0, "queued": True}, status_code=202)
+    except ServiceError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+    return JSONResponse(result, status_code=202)
 
 
 @app.get("/api/projects/{project_id}/documents")
 async def project_documents(project_id: str, _: Principal = Depends(current_principal)):
+    """List authorized project documents and annotate their known version relationships."""
     items = await asyncio.to_thread(list_documents, project_id, None)
     return {"items": annotate_document_versions(items)}
 
 
 @app.get("/api/documents")
 async def documents(project_id: str = "", chat_id: str = "", _: Principal = Depends(current_principal)):
+    """List the requested visible document scope with version annotations."""
     items = await asyncio.to_thread(list_documents, project_id.strip() or None, chat_id.strip() or None)
     return {"items": annotate_document_versions(items)}
 
 
 @app.get("/api/documents/{document_id}/content")
 async def document_content(document_id: str, _: Principal = Depends(current_principal)):
-    document = await asyncio.to_thread(get_document, document_id)
-    if document is None:
-        raise HTTPException(404, "document not found")
-    path = Path(str(document.get("source_path", ""))).resolve()
-    upload_root = UPLOAD_DIR.resolve()
-    if upload_root not in path.parents or not path.is_file():
-        raise HTTPException(404, "document content is unavailable")
-    return FileResponse(path, media_type=str(document.get("mime_type") or "application/octet-stream"), filename=str(document["file_name"]))
+    """Send the authorized original after service-side path containment checks."""
+    try:
+        path, media_type, filename = await _document_service().content(document_id)
+    except ServiceError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+    return FileResponse(path, media_type=media_type, filename=filename)
 
 
 @app.delete("/api/documents/{document_id}")
 async def delete_document(document_id: str, principal: Principal = Depends(current_principal)):
-    """Hide a document immediately and queue serialized index/file cleanup."""
-    document = await asyncio.to_thread(get_document, document_id)
-    if document is None:
-        raise HTTPException(404, "document not found")
-    if not document.get("owner_subject") and not can_manage_global_documents(principal):
-        raise HTTPException(403, "shared document deletion is not permitted for this account")
+    """Accept deletion after the service hides the source and queues cleanup."""
     try:
-        tombstone = await asyncio.to_thread(tombstone_document, document_id)
-    except PermissionError as exc:
-        raise HTTPException(403, str(exc)) from exc
-    if tombstone is None:
-        raise HTTPException(409, "document is already being deleted")
-    try:
-        job = await jobs.submit(
-            "deletion",
-            {
-                "path": str(document.get("source_path") or ""),
-                "document_id": document_id,
-                "owner_subject": principal.subject,
-            },
+        result = await _document_service().delete(
+            document_id, principal.subject, can_manage_global_documents(principal),
         )
-    except Exception as exc:
-        # The tombstone deliberately remains: stale chunks must never become
-        # searchable again merely because the cleanup queue is unavailable.
-        raise HTTPException(503, "document is hidden, but cleanup queue is unavailable") from exc
+    except ServiceError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
     JOBS.labels("deletion", "queued").inc()
-    return JSONResponse(
-        {"id": document_id, "status": "deleting", "job_id": str(job["id"])},
-        status_code=202,
-    )
+    return JSONResponse(result, status_code=202)
 
 
 @app.get("/api/openapi.json", include_in_schema=False)
@@ -767,6 +582,7 @@ async def api_openapi(_: Principal = Depends(current_principal)):
 
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str, principal: Principal = Depends(current_principal)):
+    """Return a job only when its owner or an administrator may access it."""
     if not await jobs.can_access(job_id, principal.subject, "superadmin" in principal.roles):
         raise HTTPException(404, "job not found")
     job = await jobs.get(job_id)
@@ -779,6 +595,7 @@ async def get_job(job_id: str, principal: Principal = Depends(current_principal)
 
 @app.delete("/api/jobs/{job_id}")
 async def cancel_job(job_id: str, principal: Principal = Depends(current_principal)):
+    """Request cancellation only for an accessible, cancellable background job."""
     if not await jobs.can_access(job_id, principal.subject, "superadmin" in principal.roles):
         raise HTTPException(404, "job not found")
     if not await jobs.cancel(job_id):
@@ -803,6 +620,7 @@ async def legacy_api(operation: str, request: Request, principal: Principal = De
         except ValueError as exc:
             raise HTTPException(400, "invalid JSON") from exc
     def invoke_scoped_legacy_operation() -> tuple[dict, int]:
+        """Restore trusted ownership when the compatibility call enters a worker thread."""
         with request_scope(principal.subject, is_admin="superadmin" in principal.roles):
             return legacy_operation(
                 request.method,
@@ -814,3 +632,7 @@ async def legacy_api(operation: str, request: Request, principal: Principal = De
 
     payload, status = await asyncio.to_thread(invoke_scoped_legacy_operation)
     return JSONResponse(jsonable_encoder(payload), status_code=status)
+
+
+# Register the documentation only after all native and compatibility routes exist.
+install_openapi(app, legacy_spec_path=Path(__file__).with_name("openapi.json"), session_cookie_name=SESSION_COOKIE_NAME)

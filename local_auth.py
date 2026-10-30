@@ -26,14 +26,17 @@ _DUMMY_HASH = _PASSWORD_HASHER.hash("not-a-real-password-for-timing-equality")
 
 
 class RegistrationError(ValueError):
+    """A rejected account field or duplicate registration; suitable for the registration error response."""
     pass
 
 
 class InvalidCredentials(ValueError):
+    """Authentication failed without disclosing whether the account, password or session was invalid."""
     pass
 
 
 def normalize_email(value: str) -> str:
+    """Normalize Unicode and case for account lookup, rejecting invalid syntax with RegistrationError."""
     email = unicodedata.normalize("NFKC", value).strip().casefold()
     if len(email) > 254 or not _EMAIL_RE.fullmatch(email):
         raise RegistrationError("Укажите корректный адрес электронной почты.")
@@ -41,6 +44,7 @@ def normalize_email(value: str) -> str:
 
 
 def validate_password(password: str, email: str = "") -> None:
+    """Enforce length and email-based password restrictions without storing or returning the password."""
     if len(password) < 12:
         raise RegistrationError("Пароль должен содержать не менее 12 символов.")
     if len(password) > 128:
@@ -76,6 +80,7 @@ def _session_lifetime() -> timedelta:
 
 
 def public_user(row: dict[str, Any]) -> dict[str, Any]:
+    """Project a user row onto public profile fields; never include password hashes or session material."""
     return {
         "id": str(row["id"]),
         "email": str(row["email"]),
@@ -86,6 +91,7 @@ def public_user(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def register_user(email: str, display_name: str, password: str) -> dict[str, Any]:
+    """Validate and insert an Argon2-backed local account; return the internal row for session creation."""
     normalized = normalize_email(email)
     validate_password(password, normalized)
     name = _display_name(display_name, normalized)
@@ -115,6 +121,7 @@ def register_user(email: str, display_name: str, password: str) -> dict[str, Any
 
 
 def authenticate_credentials(email: str, password: str) -> dict[str, Any]:
+    """Verify an active account, apply lockout/rehash updates and return its internal row on success."""
     try:
         normalized = normalize_email(email)
     except RegistrationError:
@@ -176,6 +183,7 @@ def authenticate_credentials(email: str, password: str) -> dict[str, Any]:
 
 
 def create_session(user_id: str, user_agent: str = "", ip_address: str | None = None) -> str:
+    """Persist only a token hash and expiry, returning the new opaque token once for the cookie."""
     token = secrets.token_urlsafe(48)
     expires_at = datetime.now(timezone.utc) + _session_lifetime()
     agent_hash = hashlib.sha256(user_agent.encode("utf-8", errors="ignore")).hexdigest() if user_agent else ""
@@ -199,6 +207,7 @@ def create_session(user_id: str, user_agent: str = "", ip_address: str | None = 
 
 
 def authenticate_session(token: str) -> dict[str, Any]:
+    """Resolve an unrevoked, unexpired session for an active user and throttle last-seen updates."""
     if not token or len(token) > 256:
         raise InvalidCredentials("Требуется вход в систему.")
     with psycopg.connect(database_url(), row_factory=dict_row) as conn:
@@ -230,6 +239,7 @@ def authenticate_session(token: str) -> dict[str, Any]:
 
 
 def revoke_session(token: str) -> None:
+    """Mark the supplied session token revoked; an empty token is a no-op."""
     if not token:
         return
     with psycopg.connect(database_url()) as conn:
@@ -241,16 +251,20 @@ def revoke_session(token: str) -> None:
 
 
 def csrf_token(session_token: str) -> str:
+    """Derive the session-bound CSRF HMAC using the configured application secret."""
     return hmac.new(_auth_secret(), f"csrf:{session_token}".encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def verify_csrf(session_token: str, candidate: str) -> bool:
+    """Reject missing tokens and compare the expected session-bound CSRF token in constant time."""
     return bool(session_token and candidate) and hmac.compare_digest(csrf_token(session_token), candidate)
 
 
 def cookie_max_age() -> int:
+    """Return the configured bounded session lifetime in seconds for the browser cookie."""
     return int(_session_lifetime().total_seconds())
 
 
 def cookie_secure() -> bool:
+    """Read whether the session cookie must be sent only over HTTPS."""
     return os.getenv("RAG_SESSION_COOKIE_SECURE", "false").strip().lower() == "true"

@@ -1,3 +1,11 @@
+//! Standalone Rust CLI and line-oriented compatibility commands for Python.
+//!
+//! `:retrieve-json` reads the canonical Python docstore without initializing
+//! vector/embedding services; `:generate-json` performs a fresh generation call.
+//! Interactive `:load` / `:ask-json` instead use the separate Rust stores/cache.
+//! This process is not an authenticated HTTP service or a replacement for Python
+//! document scope, persistent jobs, answer verification or publication policy.
+
 mod ingest;
 mod embed;
 mod store;
@@ -12,6 +20,7 @@ use std::io::{self, BufRead, Write};
 use tracing::info;
 
 #[derive(Deserialize)]
+/// Context supplied by the caller; this command does not retrieve or authorize it.
 struct GenerateRequest {
     question: String,
     context: String,
@@ -19,6 +28,7 @@ struct GenerateRequest {
 }
 
 #[tokio::main]
+/// Dispatch stdin commands; machine JSON responses coexist with CLI banners.
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
@@ -97,8 +107,8 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        // Машинный контракт полного Rust flow.  JSON печатается одной строкой,
-        // поэтому его безопасно вызывает Python backend.
+        // Standalone JSON answer command: this uses the local question-only
+        // SQLite cache and is not the scoped Python HTTP orchestration path.
         if let Some(query) = input.strip_prefix(":ask-json ") {
             let agent = initialized_agent(&mut agent).await?;
             match agent.ask(query).await {
@@ -162,6 +172,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Initialize the optional CLI stores only for commands that actually need them.
 async fn initialized_agent(slot: &mut Option<agent::Agent>) -> Result<&agent::Agent> {
     if slot.is_none() {
         *slot = Some(agent::Agent::new().await?);

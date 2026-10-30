@@ -1,3 +1,9 @@
+//! Ollama-compatible generation client for the optional Rust commands.
+//!
+//! The caller supplies authorized context. This module formats a prompt but
+//! does not perform source selection, grounding checks or durable publication.
+//! Endpoint, default model and budgets come from the Rust process environment.
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -29,22 +35,27 @@ struct OllamaResponse {
     response: String,
 }
 
+/// Reuse an HTTP client across non-streaming `/api/generate` requests.
 pub struct OllamaClient {
     client: reqwest::Client,
 }
 
 impl OllamaClient {
+    /// Construct the client without performing a model or network health check.
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
         }
     }
 
+    /// Use `LLM_MODEL`, falling back to the standalone CLI model name.
     pub async fn generate(&self, context: &str, question: &str) -> Result<String> {
         let model = env::var("LLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
         self.generate_with_model(context, question, &model).await
     }
 
+    /// Generate a fresh answer from supplied evidence without an answer cache.
+    /// HTTP/model errors propagate; a successful response is not a grounding proof.
     pub async fn generate_with_model(&self, context: &str, question: &str, model: &str) -> Result<String> {
         let prompt = format!(
             "<|im_start|>system\n\
@@ -104,6 +115,7 @@ impl OllamaClient {
     }
 }
 
+/// Accept either an Ollama base URL or its complete `/api/generate` endpoint.
 fn ollama_generate_url() -> String {
     let base_url = env::var("OLLAMA_BASE_URL")
         .unwrap_or_else(|_| DEFAULT_OLLAMA_BASE_URL.to_string());

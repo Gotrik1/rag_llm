@@ -36,22 +36,35 @@ def test_coverage_example_uses_existing_passage_not_an_assumed_first_id():
     assert set(re.findall(r'\bE\d+(?::P\d+)?\b',seen[0])) == {'E37','E37:P1'}
 
 
-def test_judge_syntax_example_uses_a_claims_actual_cited_source():
+def test_judge_schema_has_no_verdict_and_payload_preserves_actual_citation():
     other = {'evidence_id':'E16','file':'Other.md','text':'The attic closes at ten.'}
     prompt = build_grounding_judge_prompt(FACT+' [E37]',[other,*EVIDENCE],question=QUESTION,
                                           user_task=UserTask(QUESTION,QUESTION))
-    example = json.JSONDecoder().raw_decode(prompt.split('Только JSON: ',1)[1])[0]
-    row = example['claims'][0]
+    schema = json.JSONDecoder().raw_decode(prompt.split('JSON Schema: ',1)[1])[0]
+    row_schema = schema['properties']['claims']['items']
+    assert set(row_schema['required']) == {'claim_id','context_ids','support','passage_ids','task_relevance'}
+    assert row_schema['properties']['support']['enum'] == ['supported','unsupported','contradicted','uncertain']
+    assert 'claims' not in schema
+    assert all('"'+key+'":' not in json.dumps(schema) for key in ('default','example','examples','const'))
+    assert 'E37:P1' not in json.dumps(schema)
+    data = decode(prompt,'{"question":')
+    row = data['answer_claims'][0]
     assert row['claim_id'] == 'C1'
-    assert row['passage_ids'] == ['E37:P1']
+    assert row['context_ids'] == [] and row['cited_evidence_ids'] == ['E37']
+    assert 'support' not in row and 'passage_ids' not in row
+    assert any(item['evidence_id'] == 'E37' and item['passages'][0]['passage_id'] == 'E37:P1'
+               for item in data['evidence'])
     assert 'E1:P1' not in prompt
 
 
-def test_judge_without_a_cited_source_does_not_invent_support_in_its_example():
+def test_judge_without_a_cited_source_has_no_prefilled_decision():
     prompt = build_grounding_judge_prompt(FACT,EVIDENCE,question=QUESTION,
                                           user_task=UserTask(QUESTION,QUESTION))
-    row = json.JSONDecoder().raw_decode(prompt.split('Только JSON: ',1)[1])[0]['claims'][0]
-    assert row['support'] == 'uncertain' and row['passage_ids'] == []
+    schema = json.JSONDecoder().raw_decode(prompt.split('JSON Schema: ',1)[1])[0]
+    assert schema['properties']['claims']['items']['properties']['support']['type'] == 'string'
+    row = decode(prompt,'{"question":')['answer_claims'][0]
+    assert row['cited_evidence_ids'] == []
+    assert 'support' not in row and 'passage_ids' not in row
     assert 'E1:P1' not in prompt
 
 

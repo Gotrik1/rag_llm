@@ -23,14 +23,14 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install Python dependencies
-        run: pip install -r requirements.docker.txt
+      - name: Install Python and test dependencies
+        run: pip install -r requirements.test.txt
 
       - name: Check Python syntax
         run: python -m compileall -q asgi_app.py web_ui.py db_store.py rag_agent.py response_cache.py document_ingestion.py docx_parser.py ingestion_worker.py generation_worker.py ingestion_task.py quality_eval.py
 
       - name: Run Python tests
-        run: python -m unittest discover -v
+        run: python -m pytest -q
 
       - name: Validate Compose configuration
         run: docker compose config -q
@@ -101,7 +101,7 @@ jobs:
           cache: pip
 
       - name: Install backend dependencies
-        run: pip install -r requirements.docker.txt "coverage>=7.6,<8"
+        run: pip install -r requirements.test.txt
 
       - name: Apply migrations and create default workspace
         run: |
@@ -125,7 +125,7 @@ jobs:
 
       - name: Run backend tests with PostgreSQL and Redis
         run: |
-          coverage run -m unittest discover -v
+          coverage run -m pytest -q
           coverage report --fail-under=50
           coverage xml -o coverage.xml
 

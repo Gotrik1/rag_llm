@@ -96,10 +96,12 @@ def ensure_claude_cleaned_prompt() -> tuple[str, str]:
 
 
 def with_markdown_output_rules(prompt: str) -> str:
+    """Append the shared Markdown and formula output contract to a prompt after trimming trailing whitespace."""
     return f"{prompt.rstrip()}{MARKDOWN_OUTPUT_RULES}"
 
 
 def profiles(default_prompt: str) -> list[dict[str, str]]:
+    """Build selectable prompt profiles; preparing the reconstructed Claude profile may update its local stored file."""
     _, claude_description = ensure_claude_cleaned_prompt()
     grounded_rag_prompt = with_markdown_output_rules(default_prompt)
     expanded_rag_prompt = f"""{grounded_rag_prompt}
@@ -135,4 +137,5 @@ def profiles(default_prompt: str) -> list[dict[str, str]]:
 
 
 def get_profile(profile_id: str, default_prompt: str) -> dict[str, str]:
+    """Resolve a selected profile by ID, falling back to the grounded RAG profile for unknown IDs."""
     return next((profile for profile in profiles(default_prompt) if profile["id"] == profile_id), profiles(default_prompt)[0])

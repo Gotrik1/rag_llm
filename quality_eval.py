@@ -30,6 +30,10 @@ REFUSAL_MARKERS = (
 
 @dataclass(frozen=True)
 class QualityCase:
+    """Immutable regression expectations for one question: literal term/source/locator matches, refusal markers and a latency threshold.
+
+    Expected strings are supplied by the dataset author; they do not constitute
+    a semantic gold answer or establish the corpus's complete relevant sources."""
     id: str
     question: str
     expected_terms: tuple[str, ...] = ()
@@ -45,6 +49,7 @@ class QualityCase:
 
 @dataclass(frozen=True)
 class QualityResult:
+    """Weighted lexical/link/latency checks on a nominal 0-10 scale, with diagnostic failures; not a factual correctness grade."""
     id: str
     score: float
     latency_s: float
@@ -54,6 +59,10 @@ class QualityResult:
 
 @dataclass(frozen=True)
 class RetrievalResult:
+    """Candidate-level expected-source/locator coverage and mean reciprocal expected-source positions, plus transport diagnostics.
+
+    These metrics describe the returned context list, not whether the final answer
+    uses the sources correctly, prioritizes the main rule or avoids hallucination."""
     source_recall: float
     locator_recall: float
     mean_reciprocal_rank: float
@@ -66,6 +75,10 @@ class RetrievalResult:
 
 @dataclass(frozen=True)
 class CaseResult:
+    """Raw answer, source records, heuristic checks and a separately measured retrieval result for human review.
+
+    Failure labels may flag incomplete generation independently of the numeric
+    score; consumers must not treat that score alone as semantic acceptance."""
     id: str
     score: float
     latency_s: float
@@ -78,6 +91,10 @@ class CaseResult:
 
 
 def load_cases(path: Path) -> list[QualityCase]:
+    """Read UTF-8 JSONL expectations, ignoring blank/comment lines and rejecting empty or unscorable datasets.
+
+    A case requires a question and an expected term/source/locator or refusal;
+    formula/forbidden terms alone do not satisfy that validation requirement."""
     cases: list[QualityCase] = []
     for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw_line.strip()
@@ -129,6 +146,11 @@ def _coverage(expected: tuple[str, ...], values: list[str]) -> float:
 
 
 def score_response(case: QualityCase, response: dict[str, Any], latency_s: float) -> QualityResult:
+    """Score case-insensitive substring coverage, source links, formula strings, refusal markers and elapsed time.
+
+    Weights are 4/2/1/1/1/1; any forbidden substring subtracts two points once.
+    An unspecified expectation receives full coverage credit. A truthy URL is not
+    fetched or validated, and matching formula/answer text is not a proof of facts."""
     answer = str(response.get("answer", ""))
     sources = [item for item in response.get("sources", []) if isinstance(item, dict)]
     formulas = [item for item in response.get("formulas", []) if isinstance(item, dict)]
@@ -170,6 +192,13 @@ def _context_locator(item: dict[str, Any]) -> str:
 
 
 def score_retrieval(case: QualityCase, response: dict[str, Any], latency_s: float) -> RetrievalResult:
+    """Measure expected name/locator substring coverage in returned context records.
+
+    Ranks are one-based context-row positions, including repeated document rows.
+    The rank metric averages the first reciprocal position of each expected
+    source, rather than standard single-first-relevant MRR across queries. Missing
+    expectations score 1.0 by convention; this is not answer correctness or a
+    measurement of all relevant documents outside the supplied expectations."""
     context = [item for item in response.get("context", []) if isinstance(item, dict)]
     source_names = [str(item.get("file", "")) for item in context]
     locators = [_context_locator(item) for item in context]
@@ -235,6 +264,11 @@ class ApiClient:
         *,
         transport_retries: int = 0,
     ) -> dict:
+        """Send one JSON API operation with optional bearer/session CSRF and a 180-second attempt timeout.
+
+        Only selected transport failures receive explicitly requested exponential
+        retries; HTTP errors fail immediately. Callers decide whether replaying an
+        operation is appropriate. Returned JSON is decoded without schema validation."""
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
         headers = {"Accept": "application/json"}
         if body is not None:
@@ -258,6 +292,7 @@ class ApiClient:
         raise RuntimeError(f"{method} {path} transport retry loop exhausted")
 
     def login(self, email: str, password: str) -> None:
+        """Establish a local cookie session and retain its CSRF token, rejecting incomplete authentication responses."""
         response = self.request(
             "/api/auth/login",
             "POST",
@@ -269,6 +304,12 @@ class ApiClient:
 
 
 def run_case(client: ApiClient, chat_id: str, case: QualityCase) -> CaseResult:
+    """Probe retrieval separately, persist the user turn, request an answer and poll its message until completion or deadline.
+
+    This mutates the supplied chat. The debug candidate list is a separate probe,
+    not an attested snapshot of the answer's actual evidence. Generation latency
+    starts after user-message persistence; incomplete/error/empty answers add a
+    failure label without replacing the independently computed heuristic score."""
     retrieval = run_retrieval_case(client, chat_id, case)
     client.request(
         f"/api/chats/{chat_id}/messages",
@@ -320,6 +361,11 @@ def run_case(client: ApiClient, chat_id: str, case: QualityCase) -> CaseResult:
 
 
 def run_retrieval_case(client: ApiClient, chat_id: str, case: QualityCase) -> RetrievalResult:
+    """Run the debug retrieval probe with up to two transport retries and score the returned candidates.
+
+    Runtime transport/API failures become explicit errors and zero expected-item
+    coverage; metrics without corresponding expectations retain their 1.0 default.
+    This probe does not generate or semantically assess an answer."""
     retrieval_started = time.perf_counter()
     try:
         retrieval_response = client.request(
@@ -352,6 +398,10 @@ def run_retrieval_case(client: ApiClient, chat_id: str, case: QualityCase) -> Re
 
 
 def retrieval_summary(results: list[RetrievalResult]) -> dict[str, float]:
+    """Macro-average per-case candidate coverage and rank metrics, rounded to four decimals.
+
+    Cases with no relevant expectations still contribute their default 1.0. An
+    empty input also returns 1.0 by convention and must not be read as tested success."""
     if not results:
         return {"source_recall": 1.0, "locator_recall": 1.0, "mean_reciprocal_rank": 1.0}
     return {
@@ -364,6 +414,12 @@ def retrieval_summary(results: list[RetrievalResult]) -> dict[str, float]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run selected JSONL cases against an existing chat and emit a heuristic regression report with process exit status.
+
+    Full runs mutate the chat; retrieval-only runs skip answer generation. Passing
+    uses numeric score/recall thresholds and retrieval error state, not every
+    failure label or semantic review. The report explicitly requires human
+    semantic assessment; its score is not an objective answer-quality grade."""
     parser = argparse.ArgumentParser(description="Run the deployed RAG quality gate")
     parser.add_argument("dataset", type=Path)
     parser.add_argument("--base-url", default=os.getenv("RAG_EVAL_BASE_URL", "http://127.0.0.1:8080"))

@@ -16,3 +16,19 @@ those changes without explicit approval.
 
 Codex-managed worktrees are temporary task checkouts; their changes are not
 canonical until intentionally ported and reviewed here.
+
+## MCP knowledge graph
+
+The latest verified server MCP project is `rag-assistant-canonical-20261029-handoff-v17`
+(verified on 2026-10-29 against `build_answer_sources` and
+`QuestionService.answer`). The older MCP record `rag-assistant` is stale; the
+server denied its deletion, so it remains available but must not be treated as
+the current source graph.
+
+For later sessions, read `.codebase-memory/artifact.json` when present and
+verify its project before using it: the local artifact last retained an older
+`C-Users-gotri-Documents-LLM` graph without the new service helpers. Prefer the
+verified server project above when the artifact fails that check. After
+indexing, verify a current function signature or newly
+added helper against the working tree. A matching Git HEAD or an `indexed`
+status alone does not prove that uncommitted changes were indexed.

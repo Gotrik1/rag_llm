@@ -2,6 +2,9 @@
 .github
 .venv
 .venv312/
+.test-venv/
+.tmp/
+**/.pytest_cache/
 # Local QA data and generated deliverables are never application image input.
 output/
 tmp/
@@ -18,4 +21,10 @@ ui/node_modules
 ui/dist
 cache.db
 *.pyc
-.env
+# Runtime configuration and credentials are mounted, never baked into images.
+.env*
+**/.env*
+!.env.example
+!**/.env.example
+deploy/secrets/*
+!deploy/secrets/*.example

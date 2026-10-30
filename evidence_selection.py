@@ -6,18 +6,23 @@ Source visibility is enforced before heading lookup or relationship expansion.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
 import unicodedata
 from bisect import bisect_left
 from collections import OrderedDict
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
 from nltk.stem.snowball import RussianStemmer
 
 from search_focus import SearchFocus, SearchOperation
+from evidence_diversity import priority_multiplier
+from query_rank import QueryRankContext, NativePackWitness, _NativeWitnessBuilder, native_identity
+from table_context import TableContextError, map_table_prose, parse_table_unit
 
 _STEMMER = RussianStemmer()
 _STOP = {
@@ -48,6 +53,7 @@ _CATEGORY_WORDS = {'1': 'первой', '2': 'второй', '3': 'третье�
                    '4': 'четвертой', '5': 'пятой', '6': 'шестой'}
 _CATEGORY_IDS = {_STEMMER.stem(word): number for number, word in _CATEGORY_WORDS.items()}
 _VERSION_FIELDS = ('document_id', 'source_id', 'revision_id', 'version_id', 'document_version', 'content_hash', 'sha256')
+_EXCERPT_MARKER = '\n\n[ПРОПУСК АБЗАЦЕВ]\n\n'
 _ORDINAL_ABBREVIATION = re.compile(r'((?:[а-яё]+\s*(?:,|и)\s*)*[а-яё]+)\s+цк\b', re.I)
 _NUMERIC_ORDINAL_CATEGORY = re.compile(
     r'(?<![\w.])([1-6])(?:[ \t\u00a0\u202f]*[-\u2010\u2011][ \t\u00a0\u202f]*|[ \t\u00a0\u202f]+)'
@@ -55,6 +61,146 @@ _NUMERIC_ORDINAL_CATEGORY = re.compile(
     r'(?:цк\b|ценов(?:ая|ой|ую|ою|ые|ых|ым|ыми)[ \t\u00a0\u202f]+'
     r'категори(?:я|и|ю|ей|ею|й|ям|ями|ях)\b)', re.I,
 )
+
+
+@dataclass(frozen=True)
+class _PreferredProjection:
+    """Private, index-attested view; raw quotes/records are never rewritten."""
+    quote: str
+    context: str
+
+
+def _preferred_projection_map(item):
+    """Only fully witnessed current origins may bridge native assembly."""
+    result = {}
+    for key, contexts in item.get('_reader_contexts', {}).items():
+        projections = item.get('_reader_projections', {}).get(key, {})
+        if contexts and contexts <= projections.keys():
+            values = tuple(projections[context] for context in contexts)
+            if all(isinstance(value, _PreferredProjection) for value in values):
+                result[key] = values
+    return result
+
+
+def _projected_preferred_quote(preference, projections):
+    values = (projections or {}).get(_preferred_passage_key(preference), ())
+    quotes = {value.quote for value in values if isinstance(value, _PreferredProjection)}
+    return next(iter(quotes)) if values and len(quotes) == 1 else None
+
+
+def _trusted_preferred_equations(origin, assembled, preference, witness):
+    """Native roundtrip-safe equations selected in this exact source quote."""
+    if (not isinstance(witness, NativePackWitness)
+            or witness.signature(native_identity(origin)) is None
+            or not _matching_preferred_passages(origin, (preference,))):
+        return frozenset()
+    if any((key in origin, type(origin.get(key)), origin.get(key)) !=
+           (key in assembled, type(assembled.get(key)), assembled.get(key))
+           for key in ('file', 'file_path', 'section_path', 'status', *_VERSION_FIELDS)):
+        return frozenset()
+    from grounding_verifier import native_formula_catalogue
+    quoted = set(_math_expressions(preference['quote']))
+    try:
+        native = native_formula_catalogue([origin])
+    except (ValueError, TypeError, RecursionError):
+        return frozenset()
+    return frozenset(row['source_formula'] for row in native
+        if row['source_formula'] in quoted and '=' in row['source_formula']
+        and len(_math_symbols(row['source_formula'].split('=', 1)[0])) == 1
+        and _math_symbols(row['source_formula'].split('=', 1)[1]))
+
+
+def _reader_native_equations(item, preferences):
+    result = {}
+    for preference in preferences:
+        key = _preferred_passage_key(preference)
+        contexts = item['_reader_contexts'][key]
+        proofs = item['_reader_equations'].get(key, {})
+        shared = set.intersection(*(set(proofs.get(context, ())) for context in contexts)) if contexts else set()
+        if shared:
+            result.setdefault(preference['quote'], set()).update(shared)
+    return result
+
+
+def _trusted_preference_projection(origin, assembled, preference, witness):
+    """Remove one exact server section prefix only after raw/index proof.
+
+    The complete remaining origin must already exist in the same physical
+    native section. Nested/code markers and conditions are never projected.
+    """
+    if (not isinstance(witness, NativePackWitness)
+            or witness.signature(native_identity(origin)) is None
+            or not _matching_preferred_passages(origin, (preference,))):
+        return None
+    for key in ('file', 'file_path', 'section_path', 'status', *_VERSION_FIELDS):
+        if ((key in origin, type(origin.get(key)), origin.get(key))
+                != (key in assembled, type(assembled.get(key)), assembled.get(key))):
+            return None
+    path, text = origin.get('section_path'), origin.get('text')
+    if not isinstance(path, str) or not path or '\n' in path or '\r' in path:
+        return None
+    prefix = '[SECTION: ' + path + ']'
+    if not isinstance(text, str) or not text.startswith(prefix):
+        return None
+    tail = text[len(prefix):]
+    separator = next((value for value in ('\r\n', '\n', ' ') if tail.startswith(value)), None)
+    if separator is None:
+        return None
+    body = tail[len(separator):].strip()
+    if not body or body not in str(assembled.get('text', '')):
+        return None
+    raw_quote = preference['quote']
+    if raw_quote.startswith(prefix):
+        if not text.startswith(raw_quote) or not raw_quote.startswith(prefix + separator):
+            return None
+        quote = raw_quote[len(prefix + separator):]
+    else:
+        quote = raw_quote
+    title = path.rsplit('>', 1)[-1].strip()
+    labels = {path, title, *(('#' * number + ' ' + title) for number in range(1, 7))}
+    if not quote.strip() or quote.strip() in labels or quote not in body:
+        return None
+    return _PreferredProjection(quote, body)
+
+
+def _matching_preferred_passages(item: dict, preferences: tuple[dict, ...], *,
+                                 origin_ids=None, projections=None) -> tuple[dict, ...]:
+    """A model hint can prefer only the same native, verbatim source passage.
+
+    The caller must validate the entire reading snapshot first. Re-check the
+    native binding after section reassembly as well: an E-ID alone can be
+    recycled in another request or survive replacement of an incoming row.
+    """
+    identifiers = {item.get('evidence_id')} if origin_ids is None else origin_ids
+    matches = []
+    for preference in preferences:
+        if not isinstance(preference, dict) or set(preference) != {'evidence_id', 'quote', 'source'}:
+            continue
+        source = preference['source']
+        quote = preference['quote']
+        if (not isinstance(source, dict) or not isinstance(quote, str) or not quote
+                or not isinstance(preference['evidence_id'], str)
+                or preference['evidence_id'] not in identifiers):
+            continue
+        if any(type(item.get(key)) is not type(source.get(key)) or item.get(key) != source.get(key)
+               for key in ('file', 'section_path', *_VERSION_FIELDS)):
+            continue
+        projected = _projected_preferred_quote(preference, projections)
+        if quote in str(item.get('text', '')) or projected and projected in str(item.get('text', '')):
+            matches.append(preference)
+    return tuple(matches)
+
+
+def _preferred_passage_match(item: dict, preferences: tuple[dict, ...], *, origin_ids=None,
+                            projections=None) -> bool:
+    return bool(_matching_preferred_passages(item, preferences, origin_ids=origin_ids,
+                                            projections=projections))
+
+
+def _preferred_passage_key(preference: dict) -> tuple:
+    source = preference['source']
+    return (preference['evidence_id'], preference['quote'],
+            *(repr(source.get(key)) for key in ('file', 'section_path', *_VERSION_FIELDS)))
 
 
 def _normalize_numeric_ordinal_categories(text: str) -> str:
@@ -74,6 +220,7 @@ def _expand_ordinal_categories(text: str) -> str:
     text = _normalize_numeric_ordinal_categories(text)
 
     def expand(match):
+        """Раскрыть только распознанные порядковые номера категорий, сохранив неизвестную запись."""
         words = re.findall(r'[а-яё]+', match[1].casefold().replace('ё', 'е'))
         ordinals = [_CATEGORY_IDS.get(_stem_word(word)) for word in words if word != 'и']
         if not ordinals or any(number is None for number in ordinals):
@@ -113,6 +260,7 @@ def _positive_query(question: str) -> tuple[str, list[str]]:
     excluded = []
 
     def remove(match):
+        """Отделить исключенную тему от положительного поискового запроса."""
         excluded.append(match.group(1).strip())
         return ' '
 
@@ -136,6 +284,7 @@ def _query_groups(question: str, *, subject_phrase: bool = False) -> tuple[froze
     acronym = r'(?:[A-ZА-ЯЁ][A-ZА-ЯЁ0-9]{1,11}|[а-яёa-z]{2,5})'
 
     def aliases(match):
+        """Объединить перечисленные сокращения в одну группу альтернативных поисковых ключей."""
         words = re.findall(acronym, match.group(0))
         groups.append(frozenset().union(*(term_keys(word) for word in words)))
         return ' '
@@ -179,12 +328,40 @@ def _subject_profiles(question: str, focus: SearchFocus | None = None):
     return (_query_groups(_positive_query(question)[0]),)
 
 
+def _native_section_text(text: str) -> str:
+    """The existing native section assembly projection, not fact normalization."""
+    try:
+        return map_table_prose(text, lambda prose: re.sub(r'\[SECTION:[^\]]*\]\s*', '', prose)).strip()
+    except TableContextError as exc:
+        raise ValueError('invalid-table-unit') from exc
+
+
+def new_query_rank_context(question: str) -> QueryRankContext:
+    """Создать независимый учет рангов для исходного вопроса с неизменяемой проекцией текста."""
+    return QueryRankContext(question,
+        lambda value: frozenset().union(*_query_groups(_positive_query(value)[0])),
+        # Exact native section assembly projection; no words/conditions/numbers
+        # are removed. Identity still hashes the complete original text.
+        native_text=_native_section_text)
+
+
 def _profile_coverage(profiles, keys, requested=frozenset(), scope=frozenset()):
     return max((_group_coverage(_applicable_groups(groups, requested, scope), keys)
                 for groups in profiles), default=0.0)
 
 
 def _category_ids(text: str) -> frozenset[str]:
+    # Cache pure parsing of bounded immutable strings, never request ACLs,
+    # mutable evidence records or complete long source passages.
+    return _cached_category_ids(text) if len(text) <= 1024 else _parse_category_ids(text)
+
+
+@lru_cache(maxsize=16384)
+def _cached_category_ids(text: str) -> frozenset[str]:
+    return _parse_category_ids(text)
+
+
+def _parse_category_ids(text: str) -> frozenset[str]:
     # Category ordinals are scoped by ЦК / ценовая категория, so an unrelated
     # phrase such as "первый платеж" does not become a tariff-category filter.
     text = _expand_ordinal_categories(text)
@@ -218,6 +395,29 @@ def _scope_categories(item: dict) -> frozenset[str]:
     return _category_ids(opening[:700])
 
 
+def filter_query_applicability(items: list[dict], constraint_question: str) -> list[dict]:
+    """Apply existing native kind/category rules to a pre-packing pool.
+
+    Only the USER-origin question is authority here. An incidental category
+    mentioned later in a paragraph does not redefine its applicability; an
+    unknown applicability stays unknown rather than being invented.
+    """
+    requested = _category_ids(_positive_query(constraint_question)[0])
+    kind = requested_source_kind(constraint_question)
+    result = []
+    for item in items:
+        file = str(item.get('file', '')).casefold()
+        if (kind and kind not in file and not (
+            kind == 'постановлен' and re.search(r'(?:^|[\W_])пп[\W_]*\d', file)
+        )):
+            continue
+        scope = _scope_categories(item)
+        if requested and scope and not requested & scope:
+            continue
+        result.append(item)
+    return result
+
+
 def _version_compatible(first: dict, second: dict) -> bool:
     return all(not first.get(key) or not second.get(key) or first[key] == second[key]
                for key in _VERSION_FIELDS)
@@ -230,8 +430,40 @@ def _applicable_groups(groups, requested, scope):
     return tuple(group for group in groups if not group <= other)
 
 
+def _table_content_runs(text: str):
+    """Separate validated standalone table units before any prose/math splitting.
+
+    A marker inside a cell's JSON string is ordinary source text, not another
+    unit. An invalid standalone own-format record is corruption, not permission
+    to fall back to splitting its values away from their column context.
+    """
+    if '[TABLE_ROW_V1]' not in text:
+        return None
+    runs, pending, found = [], [], False
+    # JSON permits literal U+0085/U+2028/U+2029 inside strings. splitlines()
+    # treats those as boundaries, unlike the physical LF record delimiter.
+    for line in re.findall(r'[^\n]*\n|[^\n]+$', text):
+        if line.strip().startswith('[TABLE_ROW_V1]'):
+            if parse_table_unit(line.strip()) is None:
+                raise ValueError('invalid-table-unit')
+            if pending:
+                runs.append((False, ''.join(pending)))
+                pending = []
+            runs.append((True, line.rstrip('\r\n')))
+            found = True
+        else:
+            pending.append(line)
+    if pending:
+        runs.append((False, ''.join(pending)))
+    return runs if found else None
+
+
 def _content_blocks(text: str) -> list[str]:
     """Paragraph units without splitting display equations at blank lines."""
+    runs = _table_content_runs(str(text))
+    if runs is not None:
+        return [block for table, run in runs
+                for block in ([run] if table else _content_blocks(run))]
     blocks, pending, in_display, in_native = [], [], False, False
     for paragraph in str(text).split('\n\n'):
         pending.append(paragraph)
@@ -257,6 +489,10 @@ def _legend_rows(block: str) -> list[str]:
     both a notation cell and multiple structural rows avoids treating narrative
     line breaks or a vertical bar inside an equation as table boundaries.
     """
+    runs = _table_content_runs(block)
+    if runs is not None:
+        return [row for table, run in runs
+                for row in ([run] if table else _legend_rows(run)) if row.strip()]
     spans = list(re.finditer(r'\[MATH:\s*[^\]]+\]|\$\$.*?\$\$|\\\[.*?\\\]', block, re.S))
     starts, notation, offset = [], False, 0
     for line in block.splitlines(keepends=True):
@@ -287,6 +523,12 @@ def _legend_rows(block: str) -> list[str]:
 
 def _notation_cell(text: str) -> tuple[str, str | None]:
     """A table/prose definition delimiter is outside mathematical markup."""
+    if text.strip().startswith('[TABLE_ROW_V1]'):
+        unit = parse_table_unit(text.strip())
+        if unit is not None:
+            cells = unit['cells']
+            return ((cells[0]['text'], ' '.join(cell['text'] for cell in cells[1:]))
+                    if len(cells) > 1 else (text, None))
     start = 0
     for match in re.finditer(r'\[MATH:\s*[^\]]+\]|\$\$.*?\$\$|\\\[.*?\\\]|\||—|\s[–-]\s', text, re.S):
         if match[0] == '|':
@@ -327,6 +569,172 @@ def _substantive_text(text: str, title: str = '') -> str:
     return value
 
 
+def _original_subject_scopes(question: str) -> list[dict]:
+    """Literal subjects belong to their original clause, never a generated facet.
+
+    A name with several adjacent words is one conjunctive target. Separate
+    requested identifiers are independent targets; matching a shared word in
+    another name cannot satisfy that target. Latin/opaque labels in a Cyrillic
+    question keep their identity when the user changes their letter case.
+    """
+    parts = re.split(r'[?!;\n]+|\s*,?\s+а\s+(?:также|ещ[её])\s+|'
+                     r'\s+и\s+(?=(?:сколько|како[йв]|как\b|что\b|где\b|кто\b))', question, flags=re.I)
+    scopes = []
+    for part in parts:
+        if re.match(r'\s*(?:ответь(?:те)?|отвечай(?:те)?|оформи(?:те)?|сформатируй(?:те)?)\b', part, re.I):
+            continue  # A requested response format is not an evidence subject.
+        targets, guards = set(), set()
+
+        def add(value, *, guard):
+            """Зарегистрировать предметную группу и при необходимости обязательный уточняющий признак."""
+            keys = term_keys(value) - _V2_FILLER - _LOOKUP_WORDS
+            if keys:
+                targets.add(keys)
+                if guard:
+                    guards.add(keys)
+
+        for match in re.finditer(r'\b[А-ЯЁA-Z][а-яёa-z]{2,}(?:[ \t]+[А-ЯЁA-Z][а-яёa-z]{2,})*\b', part):
+            # Sentence-initial capitalization is not evidence of an identity.
+            if part[:match.start()].strip():
+                add(match[0], guard=True)
+        if re.search(r'[а-яё]', question, re.I):
+            for match in re.finditer(r'\b[A-Za-z][A-Za-z0-9_-]*(?:[ \t]+[A-Za-z][A-Za-z0-9_-]*)*\b', part):
+                if len(match[0]) >= 2:
+                    add(match[0], guard=len(match[0].split()) > 1)
+        for match in re.finditer(r'\b\w+(?:-\w+)+\b', part):
+            if re.search(r'\d', match[0]) and re.search(r'[^\W\d_]', match[0]):
+                add(match[0], guard=True)
+        for match in re.finditer(r'[«“"]([^»”"\n]{2,100})[»”"]', part):
+            add(match[1], guard=True)
+        # A short prefix of a full native target does not become an alternative
+        # identity (for example one word of a two-word name or an opaque ID).
+        targets = {keys for keys in targets if not any(keys < other for other in targets)}
+        guards = {keys for keys in targets if any(old <= keys for old in guards)}
+        groups = _query_groups(part)
+        if groups:
+            scopes.append({'targets': targets, 'guards': guards, 'groups': groups, 'text': part,
+                           'question_clause': bool(re.match(r'\s*(?:как\w*|сколько|что|где|кто|когда|зачем|почему|'
+                                                           r'how|what|which|where|who|when|why)\b', part, re.I))})
+    return scopes
+
+
+def _inherited_original_subject(item: dict, scope: dict, candidates: list[dict]) -> bool:
+    """A native governing title supplies identity, never the leaf's predicate.
+
+    Only already visible candidates can attest an ancestor/root. Exact physical
+    and revision bindings are required; a filename, another branch's heading or
+    an incidental body mention cannot supply an entity to an anonymous fact.
+    """
+    targets = scope['targets']
+    path = str(item.get('section_path', '')).strip()
+    if not targets or not path:
+        return False
+    context_words = term_keys('проект программа объект организация процесс модуль узел площадка подразделение')
+    identity_keys = frozenset().union(*targets)
+    request_words = term_keys('каков какова каковы сколько укажи сообщи нужен нужна нужно') | _V2_FILLER
+    predicates = term_keys(scope['text']) - identity_keys - context_words - request_words
+    body = term_keys(_substantive_text(str(item.get('text', '')), str(item.get('section_title', ''))))
+    if not predicates or len(predicates & body) / len(predicates) < .65:
+        return False  # A source must state the requested property itself.
+
+    def heading(value):
+        """Нормализовать оформление заголовка для сравнения предмета, не меняя исходную запись."""
+        return re.sub(r'^\s*[#*]*\s*\d+(?:\.\d+)*[.)]?\s*', '', value).strip(' #*')
+
+    entity_cue = r'(?:проект\w*|программ\w*|объект\w*|организаци\w*|процесс\w*|модул\w*|узел|узла|площадк\w*|подразделени\w*)'
+
+    def foreign_entity(value):
+        # Native headings and explicit prose labels use the same full-value
+        # comparator. Their structural boundary establishes a name slot; case
+        # does not. No free lower-case body words become global entity anchors.
+        """Обнаружить явное название другого объекта, исключающее наследование предмета."""
+        slot = re.search(r'(?i:\b(' + entity_cue + r'))\s+([^\n:;—]{1,100})$', value)
+        if slot and term_keys(slot[1]) & context_words & term_keys(scope['text']):
+            declared = term_keys(slot[2].strip(' «»"'))
+            if declared:
+                return not any(declared == target for target in targets)
+        return any(not any(named <= target for target in targets)
+                   for local in _original_subject_scopes(value) for named in local['guards'])
+
+    # Leading section numbers are syntax, not evidence that the first capitalized
+    # word is a name. A native named descendant overrides a document-wide title.
+    if any(foreign_entity(heading(part)) for part in [*path.split(' > '), str(item.get('section_title', ''))]):
+        return False
+    own_text = str(item.get('text', ''))
+    # An explicit "entity: ..." slot has a lexical value even when its name
+    # is lower-case. Compare that bounded label with the original full name;
+    # do not mine arbitrary lower-case words as document-wide entity mentions.
+    for match in re.finditer(r'(?i:\b(' + entity_cue + r'))\s+([^\n:;—]{1,100})\s*[:;—]', own_text):
+        if foreign_entity(match[0].rstrip(':;— ').strip()):
+            return False
+
+    def same_source(parent):
+        """Разрешить наследование только внутри одного физического документа и совместимой редакции."""
+        fields = ('file_path', 'source_id', 'document_id')
+        shared = any(item.get(key) and item.get(key) == parent.get(key) for key in fields)
+        return bool(shared and source_key(item.get('file')) == source_key(parent.get('file'))
+                    and all(not (item.get(key) and parent.get(key)) or item[key] == parent[key] for key in fields)
+                    and all(item.get(key) == parent.get(key) for key in _VERSION_FIELDS))
+
+    for parent in candidates:
+        if parent is item or not same_source(parent):
+            continue
+        parent_path = str(parent.get('section_path', '')).strip()
+        if parent_path:
+            if not path.startswith(parent_path + ' > '):
+                continue
+            title = heading(str(parent.get('section_title') or parent_path.rsplit(' > ', 1)[-1]))
+        else:
+            # Root content stores a native document title as its opening line.
+            # Bound the title, and do not promote a sentence/reference in its body.
+            title = str(parent.get('text', '')).strip().split('\n', 1)[0].strip(' #*')
+            if (not title or len(title) > 240 or re.search(r'[.!?;]\s|\b(?:см\.?|упомина\w*|сравнен\w*)\b', title, re.I)):
+                continue
+        if not foreign_entity(title) and any(target <= term_keys(title) for target in targets):
+            return True
+    return False
+
+
+def _filter_original_subjects(candidates: list[dict], question: str, literal_anchors) -> list[dict]:
+    scopes = _original_subject_scopes(question)
+    keys_by_item = {id(item): term_keys(str(item.get('text', ''))) |
+                    term_keys(str(item.get('section_title', ''))) for item in candidates}
+    guards = [target for scope in scopes for target in scope['guards']]
+    if not any(target <= keys for target in guards for keys in keys_by_item.values()):
+        # Retain the former fallback when no bounded original identity can be
+        # established. This is not an entity recognizer or semantic resolver.
+        if literal_anchors and any(literal_anchors <= item['_anchors'] for item in candidates):
+            return [item for item in candidates if literal_anchors <= item['_anchors']
+                    or item['selection_reason'] == 'subject-child' or item.get('reference_from')]
+        return candidates
+
+    def supported(item):
+        """Проверить прямое или подтвержденное унаследованное соответствие исходному вопросу."""
+        if item['selection_reason'] == 'subject-child' or item.get('reference_from'):
+            return True
+        keys = keys_by_item[id(item)]
+        for number, scope in enumerate(scopes):
+            if scope['targets']:
+                if any(target <= keys for target in scope['targets']):
+                    return True
+                if _inherited_original_subject(item, scope, candidates):
+                    return True
+                continue
+            if not scope['question_clause']:
+                continue  # Formatting/citation instructions are not independent evidence subjects.
+            other_keys = frozenset().union(*(group for n, other in enumerate(scopes) if n != number
+                                             for group in other['groups']))
+            distinct = [group for group in scope['groups'] if not group & other_keys]
+            # An independent anonymous clause needs its own body evidence;
+            # shared action/quantity nouns alone cannot bypass a named subject.
+            if len(distinct) >= 2 and all(group & keys for group in distinct) and \
+                    _group_coverage(scope['groups'], keys) >= .8:
+                return True
+        return False
+
+    return [item for item in candidates if supported(item)]
+
+
 def _section_role(item: dict) -> str:
     """Heading-level provenance hint, not a legal validity determination."""
     path = str(item.get('section_path') or item.get('section_title') or '').casefold()
@@ -358,10 +766,12 @@ def _math_symbols(expression: str) -> frozenset[str]:
     symbols = re.findall(r'\\?[A-Za-zА-Яа-яЁё]+(?:(?:_sub|_sup)\([^)]*\)|_\{[^}]*\}|_\w+)*', value)
     ignored = {'sub', 'sup', 'frac', 'sum', 'sqrt', 'left', 'right', 'times', 'cdot'}
     def identity(symbol):
+        """Построить ключ математического символа, сохранив различающие индексы и признаки."""
         def qualifier(match):
             # Tables commonly omit trailing period/entity indices. Keep the
             # descriptive first qualifier (cold != hot), never strip numbered
             # variants such as X_1 / X_2. No domain symbol names are assumed.
+            """Убрать только хвостовые индексы объекта, сохранив описательный квалификатор величины."""
             descriptor = match[1].split(',', 1)[0].strip()
             descriptor = re.sub(r'(?<=\S)\s+[A-Za-zА-Яа-яЁё]$', '', descriptor)
             return '_sub(' + descriptor + ')'
@@ -389,7 +799,7 @@ def _equation_guards(blocks, number):
     return positions
 
 
-def _formula_dependencies(blocks, question, groups):
+def _formula_dependencies(blocks, question, groups, *, root_blocks=None):
     """Prioritize locally defined quantities and one-hop native equations.
 
     Lookup words (e.g. price versus amount, concentration versus mass) matter
@@ -398,6 +808,7 @@ def _formula_dependencies(blocks, question, groups):
     equation merely using it. Never generate or transform a source equation.
     """
     requested = term_keys(_positive_query(question)[0]) - _V2_FILLER - _CATEGORY_STEMS
+    requested -= term_keys('он она оно они его ее их')
     requested -= term_keys('ценовой категории') if _category_ids(question) else frozenset()
     requested = frozenset(key for key in requested if not key.isdigit())
     if not requested:
@@ -446,17 +857,20 @@ def _formula_dependencies(blocks, question, groups):
                               'expression': re.sub(r'\s+', '', expression)})
     if not equations:
         return [], definitions
-    best = max(equation['score'] for equation in equations)
-    if best <= 0:
-        return [], definitions
     roots, seen = [], set()
-    for equation in sorted(equations, key=lambda item: (-item['score'], item['block'])):
-        if equation['score'] < max(0.65, best - 0.25) or equation['expression'] in seen:
-            continue
-        roots.append(equation)
-        seen.add(equation['expression'])
-        if len(roots) == 3:
-            break
+    if root_blocks is not None:
+        roots = [equation for equation in equations if equation['block'] in root_blocks][:3]
+    else:
+        best = max(equation['score'] for equation in equations)
+        if best <= 0:
+            return [], definitions
+        for equation in sorted(equations, key=lambda item: (-item['score'], item['block'])):
+            if equation['score'] < max(0.65, best - 0.25) or equation['expression'] in seen:
+                continue
+            roots.append(equation)
+            seen.add(equation['expression'])
+            if len(roots) == 3:
+                break
     # One edge only: no recursive symbolic traversal, and no cross-section,
     # version, source or ACL widening. Keep root equations ahead of supports.
     dependencies, seen_blocks = [], {item['block'] for item in roots}
@@ -472,28 +886,74 @@ def _formula_dependencies(blocks, question, groups):
     return roots + dependencies, definitions
 
 
-def _scoped_cohorts(blocks, question, groups):
+def _scope_only_calculation(question):
+    """Recognize a calculation of a named category, without choosing a quantity.
+
+    An explicit price, amount or capacity remains its own subject. Query groups
+    intentionally omit some lookup words, so use the original positive words
+    here rather than guessing that every category query asks for all formulae.
+    """
+    if not _category_ids(question) or not re.search(r'расч[её]т|рассчит|рассчитыв|формул', question, re.I):
+        return False
+    scope_keys = _CATEGORY_STEMS | term_keys('ценовая категория он она оно они его ее их формула расчет')
+    return not (term_keys(question) - scope_keys - _V2_FILLER)
+
+
+def _scoped_cohorts(blocks, question, groups, *, allow_scope_calculation=True):
     """Keep a compact applicability clause and its native enumeration atomic."""
     requested = _category_ids(question)
     overview = bool(re.search(r'какие|перечисл|обзор|виды|состав|структур|этапы|что\s+входит', question, re.I))
     category_keys = _CATEGORY_STEMS | term_keys('ценовая категория')
-    if not overview and any(not group <= category_keys for group in groups):
+    scope_calculation = allow_scope_calculation and _scope_only_calculation(question)
+    if not overview and not scope_calculation and any(not group <= category_keys for group in groups):
         return []
 
     def mode_ids(value):
         # Explicit local identifiers, not a maintained list of mode names.
+        """Выделить явно записанные идентификаторы режимов, не угадывая их по словарю предметной области."""
         return {match[1].casefold() for match in re.finditer(
             r'\b(?i:режим\w*|вариант\w*|mode|variant)\s+([A-ZА-ЯЁ][A-Za-zА-Яа-яЁё0-9_-]{0,20}|\d+)\b', value,
         )}
 
     requested_modes = mode_ids(question)
     cohorts = []
+    protected, offsets, flat = [], [], '\n\n'.join(blocks)
+    if scope_calculation:
+        # Reuse the publication parser's balanced fence/inline/quote walker.
+        # A literal example cannot introduce a governing source heading.
+        from answer_citations import _protected_spans
+        protected = _protected_spans(flat)
+    offset = 0
+    for block in blocks:
+        offsets.append(offset)
+        offset += len(block) + 2
+
+    def protected_at(position, *, literal=False):
+        """Проверить, попадает ли позиция в защищенный литерал или другой непрозрачный участок."""
+        return any(start <= position < end and (not literal or
+                   flat[start:end].lstrip(' \t')[:1] in {'`', '~', '"', "'", '«', '“', '‘'})
+                   for start, end in protected)
+
+    in_legend, heading_scope = False, frozenset()
     for number, block in enumerate(blocks):
+        headings = [match[1] for match in re.finditer(r'(?m)^ {0,3}#{1,6}[ \t]+([^\n]+)', block)
+                    if not protected_at(offsets[number] + match.start())]
+        if headings:
+            in_legend = False
+            # Scope comes from the nearest actual source heading, never from a
+            # filename, a distant sibling or an incidental table-cell mention.
+            heading_scope = _category_ids(headings[-1])
+        if re.match(r'\s*(?:Где\b|Здесь\b|Обозначения\b|Таблица\s+параметров\b)', block, re.I):
+            in_legend = True
         if len(block) > 700 or _math_expressions(block) or '[TABLE]' in block:
             continue
         if not re.match(r'\s*(?:Применени[ея]\b|Для\b|Режим\b|При\b)', block, re.I):
             continue
+        if scope_calculation and protected_at(offsets[number] + len(block)-len(block.lstrip()), literal=True):
+            continue
         scope = _category_ids(block)
+        if not scope and scope_calculation and not in_legend:
+            scope = heading_scope
         if requested and (not scope or not requested & scope):
             continue
         modes = mode_ids(block)
@@ -504,9 +964,12 @@ def _scoped_cohorts(blocks, question, groups):
         core, count = [number], 0
         for following in range(number + 1, len(blocks)):
             value = blocks[following]
+            if scope_calculation and protected_at(offsets[following] + len(value)-len(value.lstrip()), literal=True):
+                break
             if re.match(r'\s*(?:Где\b|Здесь\b|Обозначения\b|#{1,6}\s|\[TABLE\]|Применени[ея]\b|Режим\b|Для\b|При\b)', value, re.I):
                 break
-            if len(value) < 100 and re.fullmatch(r'\s*(?:Формул[аы]|Расчет|Состав)\s*:\s*', value, re.I):
+            if len(value) < 100 and re.fullmatch(
+                    r'\s*(?:Формул[аы](?:\s+расч[её]та(?:\s+[^:\n]+)?)?|Расч[её]т(?:\s+[^:\n]+)?|Состав)\s*:\s*', value, re.I):
                 core.append(following)
                 continue
             expressions = _math_expressions(value)
@@ -518,18 +981,324 @@ def _scoped_cohorts(blocks, question, groups):
             count += max(equations, list_items)
             if count > 8 or sum(len(blocks[position]) for position in core) > 2000:
                 break
-        if count < 2:
+        # A single native operation can be the complete introduced relation.
+        # A legend's definition or a literal constant is not promoted by this
+        # broad-question rule; no preferred letter or filename is involved.
+        single_operation = (scope_calculation and not in_legend and count == 1 and any(
+            '=' in expression and _math_symbols(expression.split('=', 1)[1])
+            for position in core[1:] for expression in _math_expressions(blocks[position])))
+        if count < 2 and not single_operation:
             continue
         size = sum(len(blocks[position]) for position in core)
         cohorts.append({'anchor': number, 'core': core, 'scope_categories': sorted(scope),
-                        'bounded': count <= 8 and size <= 2000})
+                        'bounded': count <= 8 and size <= 2000,
+                        **({'calculation_root': True} if scope_calculation and not in_legend else {})})
         if len(cohorts) == 3:
             break
     return cohorts
 
 
+def _preferred_native_packets(text, quotes, *, question, groups, origin_contexts=None,
+                              native_equations=None, formula_diagnostics=None):
+    """Map a trusted quote to whole native blocks and existing scope guards.
+
+    A reader PID may be a safe sub-unit of a very large paragraph. It does not
+    authorize carving that substring out of its native applicability. When a
+    current ranked origin is available, its whole native record is mandatory:
+    applicability need not start with a recognized conditional word. If a
+    spelling occurs more than once, keep all possible local contexts rather
+    than silently choosing one occurrence with different neighboring guards.
+    """
+    blocks = _content_blocks(text)
+    spans, start = [], 0
+    for block in blocks:
+        position = text.find(block, start)
+        if position < 0:
+            return blocks, {}
+        spans.append((position, position + len(block)))
+        start = position + len(block)
+    cohorts = _scoped_cohorts(blocks, question, groups)
+    atomic = {position: cohort['core'] for cohort in cohorts if cohort['bounded'] for position in cohort['core']}
+    # The transitive closure of _equation_guards is the same neighboring graph
+    # below. Keep it linear for a long run of conditional paragraphs rather
+    # than repeatedly copying every following guard for every new position.
+    previous_guard, following_guard = [], []
+    for block in blocks:
+        previous = bool(re.match(r'\s*(?:При\b|Если\b|Только\b|За исключением\b)', block, re.I))
+        following = bool(re.match(
+            r'\s*(?:Где\b|Здесь\b|Обозначения\b|При\b|Если\b|Только\b|За исключением\b)', block, re.I))
+        native_math = bool(_math_expressions(block)) if previous or following else False
+        previous_guard.append(previous and not native_math)
+        following_guard.append(following and not native_math)
+    packets = {}
+    for quote in dict.fromkeys(quotes):
+        if not isinstance(quote, str) or not quote:
+            continue
+        contexts = (origin_contexts or {}).get(quote) or (quote,)
+        positions, unresolved = set(), False
+        for context in contexts:
+            # Native section assembly trims outer whitespace, but never alters
+            # a condition/word inside the originating source record. The hint's
+            # quote itself still has to match verbatim at both trust boundaries.
+            context = context.strip()
+            found, offset = False, 0
+            while context and (position := text.find(context, offset)) >= 0:
+                found = True
+                end = position + len(context)
+                positions.update(number for number, (left, right) in enumerate(spans)
+                                 if left < end and position < right)
+                offset = end
+            unresolved |= not found
+        if unresolved or not positions:
+            continue
+        eligible = (native_equations or {}).get(quote, ())
+        seed_blocks = {number for number, block in enumerate(blocks)
+                       if set(_math_expressions(block)) & set(eligible)} if eligible else set()
+        packages, definitions = (_formula_dependencies(blocks, question, groups, root_blocks=seed_blocks)
+                                  if seed_blocks else ([], {}))
+        missing = set()
+        if packages:
+            defined = {package['symbol'] for package in packages}
+            for package in packages:
+                positions.update(package['core'])
+                for symbol in {package['symbol'], *package['rhs']}:
+                    if symbol in definitions:
+                        positions.add(definitions[symbol][1])
+                missing.update(package['rhs'] - defined - definitions.keys())
+        pending = list(positions)
+        while pending:
+            number = pending.pop()
+            neighbors = list(atomic.get(number, ()))
+            if number and previous_guard[number - 1]:
+                neighbors.append(number - 1)
+            if number + 1 < len(blocks) and following_guard[number + 1]:
+                neighbors.append(number + 1)
+            for neighbor in neighbors:
+                if neighbor not in positions:
+                    positions.add(neighbor)
+                    pending.append(neighbor)
+        packets[quote] = frozenset(positions)
+        if packages and formula_diagnostics is not None:
+            formula_diagnostics[quote] = {'blocks': frozenset(positions), 'missing_symbols': frozenset(missing)}
+    return blocks, packets
+
+
+def _negative_block_scope(blocks, groups, profiles, excluded_topics, *, question=''):
+    """A conservative lexical mask, not a certificate of semantic exclusion.
+
+    Only an independent assertive prose block can be removed. Mixed subjects,
+    qualifications and opaque native units stay literal and explicitly unknown.
+    The returned coordinates always refer to the original native block list.
+    """
+    negatives = tuple(_query_groups(value, subject_phrase=True) for value in excluded_topics
+                      if isinstance(value, str) and value.strip())
+    negatives = tuple(value for value in negatives if value)
+    all_negative = frozenset().union(*(group for profile in negatives for group in profile))
+    ignored = _CATEGORY_STEMS | term_keys('ценовая категория') | _V2_FILLER | _LOOKUP_WORDS
+    # Model-proposed subjects can rank candidates, not redefine the positive
+    # USER subject used to enforce an explicit original exclusion.
+    positive_profiles = (_query_groups(question),) if question.strip() else (profiles or (groups,))
+    discriminators = tuple(tuple(frozenset(key for key in group - all_negative - ignored
+                                         if not key.isdigit()) for group in profile
+                                if any(not key.isdigit() for key in group - all_negative - ignored))
+                           for profile in positive_profiles)
+    discriminators = tuple(profile for profile in discriminators if profile)
+    blocked, unresolved = set(), set()
+    for number, block in enumerate(blocks):
+        keys = term_keys(re.sub(r'\[SECTION:[^\]]*\]', '', block))
+        if not any(_group_coverage(profile, keys) == 1 for profile in negatives):
+            continue
+        opaque = ('[TABLE_ROW_V1]' in block or '[TABLE]' in block or '[IMAGE_' in block
+                  or bool(_math_expressions(block)))
+        qualified = bool(_EXCEPTION.search(block) or re.search(
+            r'\b(?:не|без|если|при|только|кроме|нельзя|запрещен\w*|услов\w*)\b', block, re.I))
+        positive = any(_group_coverage(profile, keys) == 1 for profile in discriminators)
+        if opaque or qualified or positive or not discriminators:
+            unresolved.add(number)
+        else:
+            blocked.add(number)
+    return blocked, unresolved
+
+
+def _table_header_question(question):
+    return bool(re.search(r'(?:назван|наименован|заголов)\w*\s+(?:\w+\s+){0,2}(?:столб|колон)|'
+                          r'(?:column|header)\s+(?:name|label)', question, re.I))
+
+
+def _original_table_subjects(question):
+    """Task verbs alone cannot grant a table a native subject reservation."""
+    scopes = _original_subject_scopes(question)
+    asked = [scope for scope in scopes if scope['question_clause']]
+    framing = _V2_FILLER | term_keys('формула формулы расчет рассчитывается рассчитываются рассчитать '
+        'рассчитай вычислить вычисляется вычисли приведи привести укажи сообщи каков какова каковы '
+        'сколько нужен нужна нужно отличается отличие сравни сопоставь он она оно они его ее их '
+        'how what which calculate calculation formula give explain compare')
+    return [(scope, tuple(group - framing for group in _query_groups(scope['text'], subject_phrase=True)
+                          if group - framing)) for scope in (asked or scopes)]
+
+
+def _table_body_subject_supported(item, subjects, candidates):
+    # This permits a reservation, not admission or a semantic-completeness
+    # claim. Weak/unknown lexical support keeps ordinary rank and source text.
+    text = str(item.get('text', ''))
+    native_values = []
+    for table, run in (_table_content_runs(text) or [(False, text)]):
+        if table:
+            unit = parse_table_unit(run.strip())
+            native_values.extend(cell['text'] for key in ('headers', 'context', 'cells') for cell in unit[key])
+        else:
+            native_values.append(run)
+    native = ' '.join([*native_values, str(item.get('section_title', '')), str(item.get('section_path', ''))])
+    # Retain an exact native spelling alongside its stem: a lossy stemmer can
+    # shorten a nominative label more than its inflected query spelling.
+    keys = term_keys(native) | frozenset(re.findall(r'[^\W_]+', native.casefold()))
+    for scope, groups in subjects:
+        if not groups:
+            continue
+        if all(group & keys for group in groups) and all(target <= keys for target in scope['guards']):
+            return True
+        if scope['targets'] and _inherited_original_subject(item, scope, candidates):
+            return True
+    return False
+
+
+def _typed_table_body_plan(blocks, question, groups):
+    """Bounded native row support, never a semantic header promotion.
+
+    The caller has already admitted one physical/revision section. A standalone
+    row is metadata only when another row carries its exact full header witness
+    and its cells contain no detectable factual value. All payloads stay native.
+    """
+    tables = {}
+    for number, block in enumerate(blocks):
+        if block.strip().startswith('[TABLE_ROW_V1]'):
+            unit = parse_table_unit(block.strip())
+            if unit is not None:
+                tables.setdefault(unit['table_id'], []).append((number, unit))
+    metadata_headers, cohorts = set(), []
+    metadata_by_table = {}
+    if not tables:
+        return metadata_headers, cohorts
+    active = bool(re.search(r'расч[её]т|рассчит|рассчитыв|формул|единиц|услов|что\s+такое|calculat|formula', question, re.I))
+    requested = _category_ids(question)
+    targets = [target for scope in _original_subject_scopes(question) for target in scope['guards']]
+    formula_packets, _ = _formula_dependencies(blocks, question, groups) if active else ([], {})
+    calculation_roots = {position for cohort in _scoped_cohorts(blocks, question, groups)
+                         if cohort.get('calculation_root') for position in cohort['core']} if not _positive_query(question)[1] else set()
+    if active and calculation_roots:
+        formula_packets, _ = _formula_dependencies(blocks, question, groups, root_blocks=calculation_roots)
+        formula_packets = [packet for packet in formula_packets if packet['block'] in calculation_roots]
+    formula_core = {number for packet in formula_packets
+                    if not requested or not (scope := _category_ids(packet['expression'])) or requested & scope
+                    for number in packet['core']}
+    expression_symbols = frozenset().union(*(_math_symbols(expression) for block in blocks
+        if not block.strip().startswith('[TABLE_ROW_V1]') for expression in _math_expressions(block)
+        if '=' in expression and (not requested or not (scope := _category_ids(expression)) or requested & scope)))
+
+    def signature(cells):
+        """Сравнить ячейки по координатам, объединениям и точному исходному тексту."""
+        return tuple((cell['row'], cell['column'], cell['span'], cell['text']) for cell in cells)
+
+    def factual(cells):
+        # Absence of a few familiar verbs cannot prove that arbitrary native
+        # prose is a label. Unknown words keep their original data-row status.
+        """Считать неизвестное содержимое данными, пока не доказано, что перед нами только заголовки."""
+        label_keys = term_keys('показатель признак параметр наименование название имя описание обозначение '
+                               'значение единица измерение ед изм источник данные периодичность номер тип вид группа '
+                               'категория режим резервный основной обычный специальный формула условие стоимость цена '
+                               'field name label parameter value description type category mode source unit number')
+        identity_keys = frozenset().union(*targets) if targets else frozenset()
+        for cell in cells:
+            value = cell['text']
+            labels = re.sub(r'(?<!\d)[1-6]\s*цк\b', '', value, flags=re.I)
+            if ('[MATH:' in value or '[MATHML_REF:' in value or _math_expressions(value)
+                    or re.search(r'\d|[=<>≤≥%]|\b(?:да|нет|не|без|если|при|только|равен\w*|равна|составля\w*|'
+                                 r'действу\w*|применя\w*|использу\w*|определя\w*|бер[её]т\w*|долж\w*)\b', labels, re.I)
+                    or len(value) > 90 or len(value.split()) > 8):
+                return True
+            words = term_keys(labels)
+            if words and (words - label_keys - identity_keys or not words & label_keys):
+                return True
+        return False
+
+    for table_id, rows in tables.items():
+        witnesses = {signature(unit['headers']) for _, unit in rows if unit['headers']}
+        witnessed_headers = {number for number, unit in rows if signature(unit['cells']) in witnesses}
+        headers = {number for number, unit in rows
+                   if signature(unit['cells']) in witnesses and not factual(unit['cells'])
+                   and all(cell['start'] == 0 and cell['end'] == cell['total_chars'] for cell in unit['cells'])}
+        metadata_by_table[table_id] = headers
+        if not active:
+            continue
+        header_keys = term_keys(' '.join(cell['text'] for _, unit in rows for cell in unit['headers']))
+        named_header = any(target <= header_keys for target in targets)
+        category_header = bool(requested and any(requested & _category_ids(cell['text'])
+                               for _, unit in rows for cell in unit['headers']))
+        explicit_fields = bool(re.search(r'формул|единиц|услов|formula|units|conditions', question, re.I))
+        native_equation = any('=' in expression for number, unit in rows if number not in headers
+                              for cell in unit['cells'] for expression in _math_expressions(cell['text']))
+        core, uses_formula, direct_rows = [], False, 0
+        requested_fields = term_keys(question) - _V2_FILLER - _LOOKUP_WORDS - _CATEGORY_STEMS - term_keys('он она оно они ценовая категория')
+        matched_fields = set()
+        for number, unit in rows:
+            # An uncertain/factual first row remains selectable native data,
+            # but its structural header witness alone cannot earn a body slot.
+            if number in witnessed_headers or not any(cell['text'].strip() for cell in unit['cells']):
+                continue
+            cells = unit['cells']
+            label = cells[0]['text'] if cells else ''
+            row_scope = _category_ids(' '.join(cell['text'] for cell in cells))
+            if requested and row_scope and not requested & row_scope:
+                continue
+            symbols = frozenset().union(*(_math_symbols(expression) for expression in _notation_expressions(label)))
+            own_math = bool(symbols and (symbols & expression_symbols or requested & row_scope))
+            # Headers establish only a source column topic; the copied row
+            # supplies its formula/value/condition. Other tables need their own
+            # applicable native quantity/definition support, not JSON keys.
+            named_property = named_header and (bool(term_keys(label) & requested_fields)
+                                               or (native_equation and not explicit_fields))
+            if named_property or category_header or own_math:
+                core.append(number)
+                uses_formula |= own_math
+                direct_rows += bool(symbols & expression_symbols)
+                matched_fields.update(term_keys(label) & requested_fields)
+        if not core:
+            continue
+        bounded = len(core) <= 12
+        core = core[:12]
+        first = min(number for number, _ in rows)
+        guards = _equation_guards(blocks, first)
+        core = sorted(set(core) | set(guards) | (formula_core if uses_formula else set()))
+        root_end = max(calculation_roots, default=-1)
+        is_primary = bool(calculation_roots and first > root_end and first-root_end <= 4
+                          and not any(_math_expressions(blocks[n]) for n in range(root_end+1,first)))
+        cohorts.append({'table_id':table_id, 'core':core, 'bounded':bounded,
+                        'calculation_root_table':is_primary,
+                        'role':'matrix' if named_header or category_header else 'notation',
+                        'direct_density':direct_rows / max(1, len(core)), 'requested_fields':sorted(matched_fields),
+                        'required_chars':sum(len(blocks[n]) + len(_EXCERPT_MARKER) for n in core)})
+    # A chapter may repeat the same quantities in a compact legend and a much
+    # larger system-configuration table. Neither makes every table mandatory.
+    # Explicitly requested field rows remain independent; otherwise retain the
+    # strongest bounded native support packet per structural role.
+    retained = [cohort for cohort in cohorts if cohort['requested_fields']]
+    for role in {cohort['role'] for cohort in cohorts}:
+        choices = [cohort for cohort in cohorts if cohort['role'] == role and not cohort['requested_fields']]
+        if choices:
+            retained.append(max(choices, key=lambda cohort:(cohort['bounded'],cohort.get('calculation_root_table',False),cohort['direct_density'],-cohort['required_chars'])))
+    # Header cells are themselves the requested data for a structural query.
+    # Otherwise omit a proven label-only duplicate only alongside an admitted
+    # body cohort from that exact table, never for a header-only source.
+    if not _table_header_question(question):
+        metadata_headers.update(number for cohort in retained
+                                for number in metadata_by_table[cohort['table_id']])
+    return metadata_headers, retained
+
+
 def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnostics=None,
-                     subject_profiles=None, formula_subjects=None):
+                     subject_profiles=None, formula_subjects=None, preferred_quotes=(),
+                     preferred_origin_contexts=None, preferred_native_equations=None,
+                     excluded_topics=(), reserve_table_body=True):
     """Pack relevant whole paragraphs with neighbors, in source order.
 
     A 50k collapsed Markdown section must not contribute its unrelated preface
@@ -537,11 +1306,39 @@ def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnos
     blocks atomic and explicitly mark omissions; this is an excerpt, not the
     complete logical section.
     """
-    if len(text) <= budget:
+    # Validate even when the full section fits and no splitting is necessary.
+    # The long-section branch below sees each complete unit as one block; a
+    # header/cell packet that exceeds its budget is omitted whole, never cut.
+    _table_content_runs(text)
+    if len(text) <= budget and not excluded_topics:
         return text, []
     blocks = _content_blocks(text)
-    keys = [term_keys(re.sub(r'\[SECTION:[^\]]*\]', '', block)) for block in blocks]
+    metadata_headers, table_cohorts = (_typed_table_body_plan(blocks, question, groups)
+                                     if reserve_table_body else (set(), []))
+    keys = [term_keys(' '.join(cell['text'] for cell in unit['cells']))
+            if block.strip().startswith('[TABLE_ROW_V1]') and (unit := parse_table_unit(block.strip())) is not None
+            else term_keys(re.sub(r'\[SECTION:[^\]]*\]', '', block)) for block in blocks]
     profiles = subject_profiles or (groups,)
+    blocked, uncertain = (_negative_block_scope(blocks, groups, profiles, excluded_topics, question=question)
+                          if excluded_topics else (set(), set()))
+    promoted, unfit_atomic = set(), set()
+    preferred_conflicts = 0
+
+    def negative_diagnostics(selected):
+        """Сохранить неразрешенные исключения и конфликты целостности в диагностике отбора."""
+        if diagnostics is not None and excluded_topics:
+            diagnostics.update({
+                'negative_scope_checked': True,
+                'negative_scope_excluded_block_indices': sorted(blocked),
+                'negative_scope_unresolved': bool((uncertain | promoted) & selected or unfit_atomic),
+                'negative_scope_unresolved_block_indices': sorted((uncertain | promoted) & selected),
+                'negative_scope_atomic_conflict_incomplete': bool(unfit_atomic),
+                'negative_scope_declined_reader_packets': preferred_conflicts,
+            })
+
+    if len(text) <= budget and not blocked:
+        negative_diagnostics(set(range(len(blocks))))
+        return text, []
     scores = [2 * _profile_coverage(profiles, value) + max(
         (_group_coverage(facet, value) for facet in facet_groups.values() if facet), default=0,
     ) for value in keys]
@@ -549,38 +1346,15 @@ def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnos
     selected, size = set(), 0
     # Leave room for omission markers, which are metadata-like labels, not
     # invented source content. A prefix-only excerpt needs no extra markers.
-    marker = '\n\n[ПРОПУСК АБЗАЦЕВ]\n\n'
+    marker = _EXCERPT_MARKER
     guarded = {number: _equation_guards(blocks, number) for number, block in enumerate(blocks)
                if any('=' in expression for expression in _math_expressions(block))}
-    cohorts = _scoped_cohorts(blocks, question, groups)
+    cohorts = _scoped_cohorts(blocks, question, groups, allow_scope_calculation=not excluded_topics)
     atomic = {position: cohort['core'] for cohort in cohorts if cohort['bounded'] for position in cohort['core']}
-
-    def reserve(positions):
-        nonlocal size
-        positions = set(positions)
-        positions.update(member for position in list(positions) for member in atomic.get(position, ()))
-        positions.update(guard for position in list(positions) for guard in guarded.get(position, ()))
-        positions -= selected
-        cost = sum(len(blocks[position]) + len(marker) for position in positions)
-        if size + cost > budget:
-            return False
-        selected.update(positions)
-        size += cost
-        return True
-
-    cohort_blocks, incomplete_cohorts = [], []
-    for cohort in cohorts:
-        if cohort['bounded'] and reserve(cohort['core']):
-            cohort_blocks.append(cohort['core'])
-        else:
-            incomplete_cohorts.append({'anchor': cohort['anchor'], 'scope_categories': cohort['scope_categories'],
-                                       'reason': 'payload-budget' if cohort['bounded'] else 'cohort-limit'})
-    # Formatting instructions must not dilute the requested mathematical
-    # subject. Keep the user question separately for category/condition cohorts.
+    # Discover the same native formula packets before reservations. A negative
+    # query cannot tear their source lead-in away to make a cleaner-looking
+    # equation. No non-negative selection/budget behavior is changed.
     if formula_subjects:
-        # Clean phrases retain price/quantity and other semantic nouns. Probe
-        # each independently, interleaving their packages under the same six-
-        # package bound instead of making one comparison side own the budget.
         probes, definitions = [], {}
         for phrase in formula_subjects:
             found, defined = _formula_dependencies(blocks, phrase, _query_groups(phrase, subject_phrase=True))
@@ -599,13 +1373,171 @@ def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnos
         packages = packages[:6]
     else:
         packages, definitions = _formula_dependencies(blocks, question, groups)
-    for _, number in definitions.values():
-        guarded[number] = sorted({*guarded.get(number, ()), *_equation_guards(blocks, number)})
+    calculation_roots = {position for cohort in cohorts if cohort.get('calculation_root')
+                         for position in cohort['core']} if not formula_subjects and not preferred_quotes and not excluded_topics else set()
+    primary_legend = {position for cohort in table_cohorts if cohort.get('calculation_root_table')
+                      for position in cohort['core']} if calculation_roots else set()
+    def package_definitions(package):
+        """Связать расчет с его собственным набором определений, если исходная легенда установлена."""
+        if primary_legend and package['block'] in calculation_roots:
+            return {symbol:value for symbol,value in definitions.items() if value[1] in primary_legend}
+        return definitions
+    if calculation_roots and not formula_subjects and not preferred_quotes:
+        roots, _ = _formula_dependencies(blocks, question, groups, root_blocks=calculation_roots)
+        root_ids = {package['block'] for package in roots}
+        packages = roots + [package for package in packages if package['block'] not in root_ids]
+    # Dependencies expand only from the defining equation, not backwards from
+    # a shared notation row into every other equation that uses that row.
+    for package in packages if calculation_roots else ():
+        closure = set(package['core'])
+        if package['block'] in calculation_roots:
+            closure.update(primary_legend)
+        local_definitions = package_definitions(package)
+        for symbol in {package['symbol'], *package['rhs']}:
+            if symbol in local_definitions:
+                closure.add(local_definitions[symbol][1])
+        atomic[package['block']] = set(atomic.get(package['block'], ())) | closure
+    if excluded_topics:
+        for _, number in definitions.values():
+            guarded[number] = sorted({*guarded.get(number, ()), *_equation_guards(blocks, number)})
+
+    def native_closure(positions):
+        """Достроить атомарные зависимости выбранных исходных блоков без перестановки их содержания."""
+        positions, pending = set(positions), list(positions)
+        while pending:
+            position = pending.pop()
+            for member in (*atomic.get(position, ()), *guarded.get(position, ())):
+                if member not in positions:
+                    positions.add(member)
+                    pending.append(member)
+        return positions
+
+    if blocked:
+        for package in packages:
+            packet = set(package['core'])
+            for symbol in {package['symbol'], *package['rhs']}:
+                if symbol in definitions:
+                    packet.add(definitions[symbol][1])
+            packet = native_closure(packet)
+            if packet & blocked:
+                # Merge overlapping mandatory packets before any preference
+                # can select a partial lead-in from a conflicting component.
+                for position in packet:
+                    atomic[position] = packet
+    preferred_packets = (_preferred_native_packets(text, preferred_quotes, question=question, groups=groups,
+                                                 origin_contexts=preferred_origin_contexts,
+                                                 native_equations=preferred_native_equations)[1]
+                         if preferred_quotes else {})
+    if blocked:
+        permitted = {quote: packet for quote, packet in preferred_packets.items()
+                     if not native_closure(packet) & blocked}
+        preferred_conflicts = len(preferred_packets) - len(permitted)
+        preferred_packets = permitted
+    preferred_components = []
+    for packet in preferred_packets.values():
+        merged = set(packet)
+        overlaps = [component for component in preferred_components if component & merged]
+        for component in overlaps:
+            merged.update(component)
+            preferred_components.remove(component)
+        preferred_components.append(merged)
+    preferred_atomic = {position: number for number, component in enumerate(preferred_components)
+                        for position in component}
+    unfit_components = set()
+
+    def reserve(positions, *, mandatory=False):
+        """Зарезервировать целый связанный пакет в бюджете; не публиковать обрезанную обязательную часть."""
+        nonlocal size
+        positions = set(positions)
+        if preferred_atomic:
+            pending, expanded = list(positions), set()
+            while pending:
+                position = pending.pop()
+                members = [*atomic.get(position, ()), *guarded.get(position, ())]
+                component = preferred_atomic.get(position)
+                if component is not None and component not in expanded:
+                    if component in unfit_components:
+                        return False
+                    expanded.add(component)
+                    members.extend(preferred_components[component])
+                for member in members:
+                    if member not in positions:
+                        positions.add(member)
+                        pending.append(member)
+        else:
+            positions.update(member for position in list(positions) for member in atomic.get(position, ()))
+            positions.update(guard for position in list(positions) for guard in guarded.get(position, ()))
+        if excluded_topics:
+            positions = native_closure(positions)
+            if positions & unfit_atomic:
+                return False
+        conflicts = positions & blocked
+        if conflicts and not mandatory:
+            return False
+        positions -= selected
+        cost = sum(len(blocks[position]) + len(marker) for position in positions)
+        if size + cost > budget:
+            if conflicts and mandatory:
+                unfit_atomic.update(positions)
+            if preferred_atomic:
+                unfit_components.update(number for number in expanded if size + sum(
+                    len(blocks[position]) + len(marker) for position in preferred_components[number] - selected) > budget)
+            return False
+        if conflicts:
+            promoted.update(conflicts)
+            blocked.difference_update(conflicts)
+        selected.update(positions)
+        size += cost
+        return True
+
+    # Reader-selected native packets get their existing fair allowance before
+    # generic overlap consumes it. An unfit packet is omitted atomically, not
+    # reduced to a naked number/formula; the selector reports its lost hint.
+    for packet in preferred_packets.values():
+        reserve(packet)
+    if _table_header_question(question):
+        witnesses = {tuple((cell['row'], cell['column'], cell['span'], cell['text']) for cell in unit['headers'])
+                     for block in blocks if block.strip().startswith('[TABLE_ROW_V1]')
+                     and (unit := parse_table_unit(block.strip())) is not None and unit['headers']}
+        for number, block in enumerate(blocks):
+            if (block.strip().startswith('[TABLE_ROW_V1]')
+                    and (unit := parse_table_unit(block.strip())) is not None
+                    and tuple((cell['row'], cell['column'], cell['span'], cell['text'])
+                              for cell in unit['cells']) in witnesses):
+                reserve([number])
+    cohort_blocks, incomplete_cohorts = [], []
+    table_incomplete = False
+    # Native applicability + its operations precede a supporting legend. The
+    # original question has no narrower quantity; existing exclusions retain
+    # their previous path. This does not assert semantic completeness.
+    for cohort in cohorts:
+        if not cohort.get('calculation_root'):
+            continue
+        if cohort['bounded'] and reserve(cohort['core'], mandatory=True):
+            cohort_blocks.append(cohort['core'])
+        else:
+            incomplete_cohorts.append({'anchor': cohort['anchor'], 'scope_categories': cohort['scope_categories'],
+                                      'reason': 'payload-budget' if cohort['bounded'] else 'cohort-limit'})
+    for cohort in table_cohorts:
+        if not cohort['bounded'] or not reserve(cohort['core'], mandatory=True):
+            table_incomplete = True
+    for cohort in cohorts:
+        if cohort.get('calculation_root'):
+            continue
+        if cohort['bounded'] and reserve(cohort['core'], mandatory=True):
+            cohort_blocks.append(cohort['core'])
+        else:
+            incomplete_cohorts.append({'anchor': cohort['anchor'], 'scope_categories': cohort['scope_categories'],
+                                       'reason': 'payload-budget' if cohort['bounded'] else 'cohort-limit'})
+    if not excluded_topics:
+        # Preserve the pre-existing non-negative reservation order exactly.
+        for _, number in definitions.values():
+            guarded[number] = sorted({*guarded.get(number, ()), *_equation_guards(blocks, number)})
     formula_blocks = []
     # The mandatory equation + its short applicability lead-in is reserved
     # before generic lexical matches / huge notation tables consume the cap.
     for package in packages:
-        if reserve(package['core']):
+        if reserve(package['core'], mandatory=True):
             formula_blocks.append(package['block'])
     # Definitions are supporting context, not a substitute for an equation.
     # They receive budget only after the defining equation packets are safe.
@@ -613,10 +1545,13 @@ def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnos
         if package['block'] not in formula_blocks:
             continue
         for symbol in sorted({package['symbol'], *package['rhs']}):
-            if symbol in definitions:
-                number = definitions[symbol][1]
-                reserve([number, *_equation_guards(blocks, number)])
+            if symbol in package_definitions(package):
+                number = package_definitions(package)[symbol][1]
+                reserve([number, *_equation_guards(blocks, number)], mandatory=True)
     if diagnostics is not None:
+        diagnostics['table_body_coverage_incomplete'] = table_incomplete
+        diagnostics['table_body_reserved_blocks'] = [cohort['core'] for cohort in table_cohorts
+                                                     if set(cohort['core']) <= selected]
         diagnostics['scoped_cohort_blocks'] = cohort_blocks
         diagnostics['scoped_cohort_incomplete'] = incomplete_cohorts
         diagnostics['formula_dependency_blocks'] = formula_blocks
@@ -625,7 +1560,7 @@ def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnos
         # Adjacent notation/conditions are more valuable than an unrelated
         # introduction. The anchor paragraph gets budget before its neighbors.
         for position in (number, number - 1, number + 1, number + 2):
-            if position < 0 or position >= len(blocks) or position in selected:
+            if position < 0 or position >= len(blocks) or position in selected or position in metadata_headers:
                 continue
             reserve([position])
     if diagnostics is not None:
@@ -633,10 +1568,11 @@ def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnos
         # certification that every source symbol has a definition or meaning.
         missing = {symbol for package in packages if package['block'] in selected
                    for symbol in {package['symbol'], *package['rhs']}
-                   if symbol in definitions and
-                   not {definitions[symbol][1], *guarded.get(definitions[symbol][1], ())} <= selected}
+                   if symbol in package_definitions(package) and
+                   not {package_definitions(package)[symbol][1], *guarded.get(package_definitions(package)[symbol][1], ())} <= selected}
         diagnostics['definition_closure_incomplete'] = bool(missing)
         diagnostics['missing_definition_symbols'] = sorted(missing)
+    negative_diagnostics(selected)
     if not selected:
         return '', []
     ordered = sorted(selected)
@@ -644,6 +1580,43 @@ def _focused_excerpt(text, budget, groups, facet_groups, *, question='', diagnos
     for previous, number in zip(ordered, ordered[1:]):
         result += ('\n\n' if number == previous + 1 else marker) + blocks[number]
     return result, ordered
+
+
+_SECTION_LOCATOR_NUMBER = r'\d+(?:\.\d+)*(?:\(\d+\))?(?![\w(/]|\.[\w(]|\.\.|[-–—]\d)'
+_REFERENCE_DOCUMENT = (r'(?:документ\w*|правил\w*|регламент\w*|инструкци\w*|методик\w*|'
+                       r'положени\w*|закон\w*|кодекс\w*|постановлени\w*|приказ\w*)')
+
+
+def _local_section_authority(block: str, match) -> bool:
+    """Reject qualified foreign/container references, not their whole paragraph."""
+    boundary = r';|[.!?](?=\s+[А-ЯЁA-Z])'
+    before = re.split(boundary, block[:match.start()])[-1]
+    after = re.split(boundary, block[match.end():], maxsplit=1)[0]
+    # Nested containers are not this flat namespace, including their later
+    # parent matches. Separate comma-coordinated flat references remain local.
+    container = r'(?:стать\w*|част\w*|раздел\w*|подпункт\w*|пункт\w*|приложени\w*|п\.|подп\.|разд\.)'
+    self_authority = r'(?:настоящ\w*|данн\w*|этих|этого|этой)'
+    if re.match(r'\s+' + container + r'\s+\d', after, re.I):
+        return False
+    if re.match(r'\s+' + self_authority + r'\s+' + container + r'(?=\s|[.,;:]|$)', after, re.I):
+        return False
+    if re.search(r'\b' + container + r'\s+' + _SECTION_LOCATOR_NUMBER + r'\s*$', before, re.I):
+        return False
+    if re.search(r'\b(?:стать\w*|част\w*|приложени\w*)\s+' + _SECTION_LOCATOR_NUMBER
+                 + r'\s*[,:-]\s*$', before, re.I):
+        return False
+    if re.match(r'\s+' + self_authority + r'\s+' + _REFERENCE_DOCUMENT + r'\b', after, re.I):
+        return True  # A later amendment note does not replace explicit self-authority.
+    if re.match(r'\s+(?:(?:друг\w*|иного|иной|отдельн\w*|федеральн\w*)\s+)?'
+                + _REFERENCE_DOCUMENT + r'\b', after, re.I):
+        return False
+    # A named/numbered document governing this clause is not the current file
+    # merely because that file also happens to contain the requested point.
+    for authority in re.finditer(r'\b' + _REFERENCE_DOCUMENT
+                                 + r'\s+(?:от\s+[^,;]+?\s+)?(?:[«"]|(?:№|N)\s*\d)', before, re.I):
+        if not re.search(r'\b' + self_authority + r'\s*$', before[:authority.start()], re.I):
+            return False
+    return True
 
 
 def _reference_clauses(text: str) -> list[dict]:
@@ -655,7 +1628,10 @@ def _reference_clauses(text: str) -> list[dict]:
         if len(block) > 2400:
             continue
         for match in re.finditer(r'\b(?:см\.?\s*|в\s+|по\s+|согласно\s+)?'
-                                 r'(?:раздел\w*|подпункт\w*|пункт\w*|п\.)\s+(\d+(?:\.\d+)*)', block, re.I):
+                                 r'(?:раздел\w*|подпункт\w*|пункт\w*|п\.)\s+('
+                                 + _SECTION_LOCATOR_NUMBER + ')', block, re.I):
+            if not _local_section_authority(block, match):
+                continue
             prefix = block[:match.start()]
             if match.start() == 0 and not re.search(r'см\.?|согласно|\bв\s|\bпо\s', match[0], re.I):
                 continue  # A section heading is not a link to itself.
@@ -674,11 +1650,11 @@ def _reference_clauses(text: str) -> list[dict]:
 
 def _section_locator(item: dict) -> str:
     leaf = str(item.get('section_title') or item.get('section_path', '').rsplit('>', 1)[-1]).strip(' #*')
-    match = re.match(r'(?:пункт\s+|подпункт\s+|раздел\s+)?(\d+(?:\.\d+)*)(?!\d)', leaf, re.I)
+    match = re.match(r'(?:пункт\s+|подпункт\s+|раздел\s+)?(' + _SECTION_LOCATOR_NUMBER + ')', leaf, re.I)
     return match[1] if match else ''
 
 
-def _sibling_family(sections, candidates, groups, visible, requested):
+def _sibling_family(sections, candidates, groups, visible, requested, *, diagnostics=None):
     """Find one compact, topic-governed family, not arbitrary neighboring hits.
 
     Two independently relevant children or an exact governing topic parent
@@ -689,28 +1665,53 @@ def _sibling_family(sections, candidates, groups, visible, requested):
     subject = tuple(group for group in groups if not group <= structural)
     if not subject:
         return None
+
+    def source_binding(item):
+        """Получить физическую привязку фрагмента, не подменяя ее отображаемым названием."""
+        for field in ('file_path', 'source_id', 'document_id'):
+            if item.get(field):
+                return field, str(item[field])
+        return None
+
+    def governs(item, path):
+        """Подтвердить, что родительский путь действительно задает предмет дочерней группы."""
+        leaf = term_keys(path.rsplit(' > ', 1)[-1])
+        if _group_coverage(subject, leaf) == 1:
+            return True
+        # A native child inherits its own ancestor qualifiers. A display
+        # filename or a generic word cannot import another hierarchy's topic.
+        return bool(source_binding(item) and any(group & leaf for group in subject)
+                    and _group_coverage(subject, term_keys(path)) == 1)
+
     seeds, governing = {}, set()
     for item in candidates:
         path = str(item.get('section_path', ''))
         if item.get('reference_from') or item['evidence_role'] == 'exception':
             continue
         revision = tuple(str(item.get(field) or '') for field in _VERSION_FIELDS)
-        if _group_coverage(subject, term_keys(path.rsplit(' > ', 1)[-1])) == 1:
-            key = source_key(item['file']), path, revision
+        binding = source_binding(item)
+        if governs(item, path):
+            key = source_key(item['file']), path, revision, binding
             governing.add(key)
             seeds.setdefault(key, []).append(item)
+        native_support = term_keys(path.rsplit(' > ', 1)[-1]) | term_keys(str(item.get('text', '')))
+        inherited_support = bool(binding and any(group & native_support for group in subject)
+                                 and _group_coverage(subject, term_keys(path) | native_support) == 1)
         if ' > ' in path and (item['selection_reason'] == 'subject-child'
-                               or max(item['_heading_coverage'], item['_local_coverage']) >= 0.65):
+                               or max(item['_heading_coverage'], item['_local_coverage']) >= 0.65
+                               or inherited_support):
             parent = path.rsplit(' > ', 1)[0]
-            if _group_coverage(subject, term_keys(parent.rsplit(' > ', 1)[-1])) == 1:
-                seeds.setdefault((source_key(item['file']), parent, revision), []).append(item)
+            if governs(item, parent):
+                seeds.setdefault((source_key(item['file']), parent, revision, binding), []).append(item)
     choices = []
-    for (file, parent, revision), members in seeds.items():
-        if (file, parent, revision) not in governing and len({item['section_path'] for item in members}) < 2:
+    for (file, parent, revision, binding), members in seeds.items():
+        if (file, parent, revision, binding) not in governing and len({item['section_path'] for item in members}) < 2:
             continue
         children = {}
         for child in sections:
             if source_key(child['file']) != file or not visible(child) or not _version_compatible(members[0], child):
+                continue
+            if binding is not None and source_binding(child) != binding:
                 continue
             path = str(child.get('section_path', ''))
             if not path.startswith(parent + ' > ') or ' > ' in path[len(parent) + 3:]:
@@ -722,12 +1723,16 @@ def _sibling_family(sections, candidates, groups, visible, requested):
                 continue
             if any(not _version_compatible(child, previous) for previous in children.values()):
                 children = {}  # An unknown-version seed cannot join conflicting revisions.
+                if diagnostics is not None:
+                    diagnostics.update(family_coverage_incomplete=True,
+                                       family_coverage_incomplete_reason='ambiguous-version')
                 break
             children.setdefault(child['section_path'], child)
         if len(children) < 2:
             continue
         ordered = sorted(children.values(), key=lambda child: child.get('position', 100000))
-        identity = hashlib.sha256((file + '\n' + parent + '\n' + repr(revision)).encode()).hexdigest()[:16]
+        identity = hashlib.sha256((file + '\n' + parent + '\n' + repr(revision)
+                                   + ('\n' + repr(binding) if binding is not None else '')).encode()).hexdigest()[:16]
         choices.append({
             'id': identity, 'file': members[0]['file'], 'parent_section_path': parent, 'children': ordered,
             'total_chars': sum(len(child['text']) for child in ordered),
@@ -745,6 +1750,7 @@ def _stem_word(word: str) -> str:
 
 @lru_cache(maxsize=8192)
 def term_keys(text: str) -> frozenset[str]:
+    """Получить нормализованные тематические ключи, сохранив номер ценовой категории."""
     text = _normalize_numeric_ordinal_categories(text)
     # Leading section numbers are not topics, but "2 ЦК" is a topic with an
     # essential category number. Never normalize it to the ambiguous "ЦК".
@@ -757,6 +1763,7 @@ def term_keys(text: str) -> frozenset[str]:
 
 
 def source_key(value: object) -> str:
+    """Нормализовать физическое имя файла; UUID-префиксы редакций здесь не отбрасываются."""
     return Path(str(value or "")).name.casefold()
 
 
@@ -879,6 +1886,7 @@ def matching_catalogue_sources(question: str, source_aliases: dict[str, str] | N
     occupied: list[tuple[int, int]] = []
 
     def overlaps(start, end):
+        """Проверить пересечение найденного диапазона с уже занятым упоминанием."""
         return any(start < right and end > left for left, right in occupied)
 
     # Prefer a complete long filename over another catalogue name occurring as
@@ -944,6 +1952,7 @@ def matching_catalogue_sources(question: str, source_aliases: dict[str, str] | N
 
 
 def requested_source_kind(question: str) -> str | None:
+    """Определить явно запрошенный тип документа; без явного ограничения вернуть None."""
     value = question.casefold()
     if re.search(r"(?:по|согласно|из|смотреть|только)\s+(?:норм\w*\s+)?постановлен\w*", value):
         return "постановлен"
@@ -953,6 +1962,7 @@ def requested_source_kind(question: str) -> str | None:
 
 
 def evidence_role(item: dict) -> str:
+    """Отличить определение и исключение по исходному заголовку и началу текста."""
     leaf = str(item.get("section_title") or item.get("section_path", "").rsplit(">", 1)[-1])
     if _EXCEPTION.search(leaf):
         return "exception"
@@ -965,6 +1975,7 @@ def evidence_role(item: dict) -> str:
 
 
 def evidence_id(item: dict) -> str:
+    """Хешировать физическое имя и полный текст фрагмента; это не проверка прав доступа."""
     return hashlib.sha256((source_key(item.get("file")) + "\n" + str(item.get("text", ""))).encode()).hexdigest()
 
 
@@ -1054,6 +2065,7 @@ class SectionEvidenceIndex:
         # Russian stemming avoids losing a fact when ящик becomes ящика.
         self.body_items = []
         self.body_postings: dict[str, set[int]] = {}
+        witness_builder = _NativeWitnessBuilder()
         for node in nodes:
             metadata = node.metadata or {}
             text = node.text or ''
@@ -1061,26 +2073,37 @@ class SectionEvidenceIndex:
             if not file or not text.strip() or metadata.get('status') == 'deleted':
                 continue
             position = len(self.body_items)
-            self.body_items.append({**metadata, 'file': file, 'text': text})
+            native_item = {**metadata, 'file': file, 'text': text}
+            self.body_items.append(native_item)
+            witness_builder.add(native_item)
             for key in term_keys(re.sub(r'\[SECTION:[^\]]*\]', '', text)):
                 self.body_postings.setdefault(key, set()).add(position)
-        groups: OrderedDict[tuple[str, str], dict] = OrderedDict()
+        self._native_pack_witness = witness_builder.freeze()
+        groups: OrderedDict[tuple[object, ...], dict] = OrderedDict()
         for position, node in enumerate(nodes):
             metadata = node.metadata or {}
             path = str(metadata.get("section_path", "")).strip()
-            marker = re.search(r"\[SECTION:\s*([^\]]+)\]", node.text or "")
+            source_text = node.text or ""
+            runs = _table_content_runs(source_text)
+            outer_text = ''.join(run for table, run in runs if not table) if runs is not None else source_text
+            marker = re.search(r"\[SECTION:\s*([^\]]+)\]", outer_text)
             if marker and path.endswith("..."):
                 path = marker.group(1).strip()
             file = str(metadata.get("file_name", metadata.get("file_path", "")))
             if not path or not file or metadata.get("status") == "deleted":
                 continue
-            key = (source_key(file), path)
+            # A display basename and locator are not a physical/revision
+            # identity. Reuse the exact typed native identity with text left
+            # empty, so different chunks of one proven source still assemble
+            # but another file path/revision cannot inherit first metadata.
+            physical = native_identity({**metadata, 'file': file, 'section_path': path, 'text': ''})
+            key = (source_key(file), path, physical if physical is not None else object())
             group = groups.setdefault(key, {
                 **metadata, "file": file, "section_path": path,
                 "section_title": metadata.get("section_title") or path.rsplit(">", 1)[-1].strip(),
                 "position": position, "parts": [], "seen": set(),
             })
-            body = re.sub(r"\[SECTION:[^\]]*\]\s*", "", node.text or "").strip()
+            body = _native_section_text(node.text or "")
             if body and body not in group["seen"]:
                 group["parts"].append(body)
                 group["seen"].add(body)
@@ -1120,6 +2143,15 @@ class SectionEvidenceIndex:
                               if source_key(item.get('file')) not in excluded
                               and (allowed is None or source_key(item.get('file')) in allowed)
                               and item.get('status') != 'deleted'}
+        # A soft probe cannot replace the USER's explicit category. Reuse the
+        # coverage selector's applicability semantics before rarity and quota,
+        # including in legacy mode; an unknown source scope is not a conflict.
+        if constraint_question is not None:
+            requested = _category_ids(_positive_query(constraint_question)[0])
+            if requested:
+                eligible_positions = {position for position in eligible_positions
+                                      if not (scope := _scope_categories(self.body_items[position]))
+                                      or requested & scope}
         if mode == 'coverage':
             return self._body_seeds_v2(question, limit, search_focus=search_focus,
                                        constraint_question=constraint_question,
@@ -1205,7 +2237,7 @@ class SectionEvidenceIndex:
         for values in collisions.values():
             for items in values.values():
                 first = items[0]
-                parts = list(dict.fromkeys(re.sub(r'\[SECTION:[^\]]*\]\s*', '', str(item['text'])).strip()
+                parts = list(dict.fromkeys(_native_section_text(str(item['text']))
                                            for item in items))
                 section = {**first, 'text': '\n\n'.join(part for part in parts if part),
                            'section_title': first.get('section_title') or first['section_path'].rsplit('>', 1)[-1].strip(),
@@ -1225,8 +2257,10 @@ class SectionEvidenceIndex:
         selection_meta: dict | None = None,
         search_focus: SearchFocus | None = None,
         constraint_question: str | None = None,
+        preferred_passages: tuple[dict, ...] = (),
+        query_rank_context: QueryRankContext | None = None,
     ) -> list[dict]:
-        """Coverage-aware evidence packing; legacy ``select`` remains unchanged.
+        """Coverage-aware evidence packing with optional request-local rank support.
 
         Rankings are evidence, not a hard gate. Heading hits, positive body
         matches and already ranked semantic hits compete in the same pool.
@@ -1235,17 +2269,40 @@ class SectionEvidenceIndex:
         cannot displace a primary rule unless the question asks for them.
         """
         if selection_meta is not None:
+            selection_meta.pop('family_coverage_incomplete', None)
+            selection_meta.pop('family_coverage_incomplete_reason', None)
             selection_meta.pop('inventory_enumeration_incomplete', None)
             selection_meta.pop('inventory_enumeration_scoped_warnings', None)
+            selection_meta.pop('preferred_passage_retention_incomplete', None)
+            selection_meta.pop('preferred_passage_retention', None)
+            selection_meta.pop('table_body_coverage_incomplete', None)
+            selection_meta.pop('table_body_declined_alternatives', None)
+            selection_meta.pop('scoped_cohort_incomplete', None)
+            for key in ('negative_scope_unresolved', 'negative_scope_unresolved_items',
+                        'negative_scope_atomic_conflict_incomplete'):
+                selection_meta.pop(key, None)
         if top_k <= 0 or max_chars <= 0:
             return []
+
+        def remember_negative_scope(signals):
+            """Не потерять признаки неразрешенного исключения при последующих шагах упаковки."""
+            if selection_meta is not None and signals.get('negative_scope_unresolved'):
+                selection_meta['negative_scope_unresolved'] = True
+                selection_meta['negative_scope_unresolved_items'] = (
+                    selection_meta.get('negative_scope_unresolved_items', 0) + 1)
+                if signals.get('negative_scope_atomic_conflict_incomplete'):
+                    selection_meta['negative_scope_atomic_conflict_incomplete'] = True
         reference_enabled = (os.getenv('RAG_REFERENCE_EXPANSION', 'off').casefold() in {'on', 'true', '1'}
                              if resolve_references is None else resolve_references)
         excluded = {source_key(value) for value in (excluded_sources or ())}
         allowed = {source_key(value) for value in (allowed_sources or ())}
         authoritative = constraint_question if constraint_question is not None else question
+        rank_context = (query_rank_context if isinstance(query_rank_context, QueryRankContext)
+                        and query_rank_context.question == authoritative else None)
+        marginal = rank_context.allocator() if rank_context is not None else None
         kind = requested_source_kind(authoritative)
         positive, forbidden = _positive_query(authoritative)
+        scope_calculation = not forbidden and _scope_only_calculation(positive)
         profiles = _subject_profiles(question, search_focus)
         groups = profiles[0]
         requested = _category_ids(positive)
@@ -1263,8 +2320,9 @@ class SectionEvidenceIndex:
             r'\b[а-яё]+(?:ую|ая|ое|ые|ый|ий|ыми|ими)\b', positive, re.I,
         ))) - _CATEGORY_STEMS - _V2_FILLER
         enumerate_intent = search_focus is not None and search_focus.operation == SearchOperation.ENUMERATE
+        overview_query = positive.casefold().replace('ё', 'е')
         overview = (enumerate_intent or bool(re.search(
-            r'какие|обзор|перечисл|из\s+чего|состав|структур|что\s+ведется', positive, re.I)))
+            r'какие|обзор|перечисл|из\s+чего|состав|структур|что\s+ведется', overview_query, re.I)))
         wants_exception = bool(_EXCEPTION.search(positive))
         historical_intent = bool(re.search(r'истори|раньше|ранее|изменил|изменен|предыдущ|стар\w*\s+редакц|по\s+состоянию', positive, re.I))
         # Full requirements stay with coverage/writer. Only typed subjects may
@@ -1281,15 +2339,20 @@ class SectionEvidenceIndex:
             facet_groups.update({f'{number} ЦК': _query_groups(f'{number} ЦК') for number in sorted(requested)})
 
         def facet_coverage(label, keys):
+            """Оценить покрытие одного аспекта вопроса заданным набором тематических ключей."""
             return _profile_coverage(focus_facets.get(label, (facet_groups[label],)), keys)
 
         def visible(item):
+            """Отсечь запрещенный источник, удаленную запись и явно не подходящий тип документа."""
             key = source_key(item.get('file'))
             return bool(key) and key not in excluded and (allowed_sources is None or key in allowed) and (
                 not kind or kind in str(item.get('file', '')).casefold()
                 or (kind == 'постановлен' and bool(re.search(r'(?:^|[\W_])пп[\W_]*\d', key)))
             ) and item.get('status') != 'deleted'
 
+        eligible_inputs = filter_query_applicability([item for item in ranked if visible(item)], authoritative)
+        offered_origins = (set().union(*(rank_context.origins(item) for item in eligible_inputs))
+                           if rank_context is not None else set())
         sections = self._coverage_sections()
         section_lookup = {}
         for item in sections:
@@ -1301,8 +2364,14 @@ class SectionEvidenceIndex:
                 if not section_lookup.get(key) or any(_version_compatible(item, known) for known in section_lookup[key]):
                     version_preferences.setdefault(key, []).append(item)
         pool, analyses = {}, {}
+        bound_preferences, retained_preference_keys = {}, set()
+        incomplete_preferred_formula = False
+        preference_positions, bound_preference_positions = {}, {}
+        for number, preference in enumerate(preferred_passages):
+            preference_positions.setdefault(id(preference), number)
 
         def offer(candidate, reason, rank=None, structural_facet=None, reference=None):
+            """Предложить кандидата только после проверки видимости и совместимости редакции."""
             if not visible(candidate) or not str(candidate.get('text', '')).strip():
                 return
             location = source_key(candidate['file']), str(candidate.get('section_path', ''))
@@ -1356,6 +2425,8 @@ class SectionEvidenceIndex:
             if reason not in {'subject-child', 'inventory-enumeration'} and rank is None and reference is None and max(body_coverage, heading_coverage) < 0.65:
                 return
             support = pool.get(identity)
+            query_origins = (rank_context.origins(candidate) & offered_origins
+                             if rank_context is not None else frozenset())
             covered = {label for label, keys in facet_groups.items()
                        if keys and any(facet_coverage(label, value | heading) >= 0.7 for value in block_keys)}
             if structural_facet:
@@ -1383,7 +2454,27 @@ class SectionEvidenceIndex:
             role = evidence_role(item)
             if role == 'exception' and not wants_exception:
                 score -= 2.0
+            # Only actual current ranked rows can establish origin identities.
+            # Never trust a caller-supplied internal origin/preference field,
+            # or let a quote from another paragraph borrow this row's E-ID.
+            origin = candidate.get('evidence_id') if rank is not None else None
+            origin = origin if isinstance(origin, str) and re.fullmatch(r'E[1-9]\d*', origin) else None
+            native_preferences = (_matching_preferred_passages(candidate, preferred_passages)
+                                  if origin is not None else ())
+            projections, reader_equations = {}, {}
+            for preference in native_preferences:
+                projection = _trusted_preference_projection(
+                    candidate, item, preference, self._native_pack_witness)
+                if projection is not None:
+                    projections[_preferred_passage_key(preference)] = {str(candidate['text']): projection}
+                reader_equations[_preferred_passage_key(preference)] = {str(candidate['text']):
+                    _trusted_preferred_equations(candidate, item, preference, self._native_pack_witness)}
+            for preference in native_preferences:
+                key = _preferred_passage_key(preference)
+                bound_preferences[key] = preference
+                bound_preference_positions.setdefault(key, preference_positions[id(preference)])
             if support:
+                support['_query_origins'].update(query_origins)
                 support['_facets'].update(covered)
                 support['_score'] = max(support['_score'], score)
                 support['_rank'] = min(support['_rank'], rank if rank is not None else 100000)
@@ -1392,6 +2483,17 @@ class SectionEvidenceIndex:
                 if reference is not None:
                     support.setdefault('reference_from', []).append(reference['from'])
                     support['reference_target'] = reference['target']
+                if origin is not None:
+                    support['_reader_origin_ids'].add(origin)
+                support['_reader_preferences'].update(
+                    {_preferred_passage_key(preference): preference for preference in native_preferences})
+                for preference in native_preferences:
+                    support['_reader_contexts'].setdefault(_preferred_passage_key(preference), set()).add(
+                        str(candidate['text']))
+                for key, values in projections.items():
+                    support['_reader_projections'].setdefault(key, {}).update(values)
+                for key, values in reader_equations.items():
+                    support['_reader_equations'].setdefault(key, {}).update(values)
                 return
             pool[identity] = {**item, 'selection_reason': reason, 'evidence_role': role,
                               'section_role': _section_role(item), 'section_role_basis': 'heading-pattern-only',
@@ -1399,7 +2501,14 @@ class SectionEvidenceIndex:
                               '_body_coverage': body_coverage, '_heading_coverage': heading_coverage,
                               '_local_coverage': local_coverage, '_heading_specificity': specificity,
                               '_anchors': literal_anchors & (body | heading),
-                              '_score': score, '_rank': rank if rank is not None else 100000}
+                              '_score': score, '_rank': rank if rank is not None else 100000,
+                              '_query_origins': set(query_origins),
+                              '_reader_origin_ids': {origin} if origin is not None else set(),
+                              '_reader_preferences': {_preferred_passage_key(preference): preference
+                                                      for preference in native_preferences},
+                              '_reader_contexts': {_preferred_passage_key(preference): {str(candidate['text'])}
+                                                   for preference in native_preferences},
+                              '_reader_projections': projections, '_reader_equations': reader_equations}
             if reference is not None:
                 pool[identity]['reference_from'] = [reference['from']]
                 pool[identity]['reference_target'] = reference['target']
@@ -1478,9 +2587,28 @@ class SectionEvidenceIndex:
             r'как\s+(?:\w+\s+){0,2}(?:рассчит|рассчитыв|выполн|провод|начисл|организ)', positive, re.I,
         ))
         if family_intent and not forbidden and not wants_exception:
-            families = [family for profile in profiles
-                        if (family := _sibling_family(sections, list(pool.values()), profile, visible, requested))]
-            sibling_family = max(families, key=lambda family: family['score']) if families else None
+            family_profiles, profile_limits = [], []
+            for profile in profiles:
+                limits = {}
+                family = _sibling_family(sections, list(pool.values()), profile, visible, requested,
+                                         diagnostics=limits)
+                if family:
+                    family_profiles.append((profile, family))
+                if limits:
+                    profile_limits.append((profile, limits))
+            sibling_family = max((family for _, family in family_profiles),
+                                 key=lambda family: family['score'], default=None)
+            chosen_profiles = {profile for profile, family in family_profiles
+                               if sibling_family and family['id'] == sibling_family['id']}
+            primary = (_query_groups(search_focus.subjects[0].text, subject_phrase=True)
+                       if search_focus is not None and len(search_focus.subjects) == 1 else None)
+            for profile, limits in profile_limits:
+                alias_only = (primary is not None and primary in chosen_profiles and profile != primary
+                              and profile not in chosen_profiles
+                              and _group_coverage(primary, term_keys(positive)) == 1)
+                if selection_meta is not None and not alias_only:
+                    selection_meta.update({key: value for key, value in limits.items()
+                                           if key in ('family_coverage_incomplete', 'family_coverage_incomplete_reason')})
             if sibling_family:
                 for child in sibling_family['children'][:12]:
                     offer(child, 'subject-child')
@@ -1556,15 +2684,65 @@ class SectionEvidenceIndex:
                 ):
                     item['_score'] -= 1.2
                     item['section_role_penalty'] = -1.2
-        if search_focus is None and literal_anchors and any(literal_anchors <= item['_anchors'] for item in candidates):
-            candidates = [item for item in candidates if literal_anchors <= item['_anchors']
-                          or item['selection_reason'] == 'subject-child' or item.get('reference_from')]
+        if search_focus is None:
+            candidates = _filter_original_subjects(candidates, positive, literal_anchors)
+        if rank_context is not None:
+            marginal = rank_context.allocator(set().union(*(item['_query_origins'] for item in candidates)))
+        table_subjects = _original_table_subjects(positive)
+        table_field_requests = term_keys(positive) & term_keys('формула единицы условия formula units conditions')
+        for candidate in candidates:
+            text = str(candidate.get('text', ''))
+            blocks = _content_blocks(text) if '[TABLE_ROW_V1]' in text else []
+            candidate['_table_blocks'] = blocks
+            candidate['_table_subject_supported'] = _table_body_subject_supported(candidate, table_subjects, candidates)
+            candidate['_table_support'] = (_typed_table_body_plan(blocks, positive, groups)[1]
+                                           if blocks and candidate['_table_subject_supported'] else [])
+            candidate['_table_required'] = {number for cohort in candidate['_table_support'] if cohort['bounded']
+                                            for number in cohort['core']}
+            candidate['_table_cost'] = sum(len(blocks[number]) + len(_EXCERPT_MARKER)
+                                           for number in candidate['_table_required'])
+            calculation_core = {number for cohort in (_scoped_cohorts(blocks, positive, groups)
+                if scope_calculation else ())
+                if cohort.get('calculation_root') and cohort['bounded'] for number in cohort['core']}
+            if calculation_core:
+                calculation_core |= candidate['_table_required']
+                # The excerpt reserves an equation's adjacent native guards as
+                # well. Budget the same closure, including a following "Где:"
+                # line, instead of missing the whole legend by a few characters.
+                calculation_core.update(guard for number in list(calculation_core)
+                    if _math_expressions(blocks[number]) for guard in _equation_guards(blocks, number))
+            candidate['_calculation_packet_cost'] = (sum(len(blocks[number]) + len(_EXCERPT_MARKER)
+                for number in calculation_core | candidate['_table_required']) if calculation_core else 0)
+            candidate['_table_fields'] = frozenset(field for cohort in candidate['_table_support'] if cohort['bounded']
+                                                   for field in cohort['requested_fields'])
         # Do not veto semantic evidence solely because a literal/acronym hit
         # exists elsewhere. A definition may spell the entire term without its
         # acronym; the bounded semantic-rank contribution and later applicability
         # review decide its utility. Literal named-entity constraints above are
         # separate, and category/source/negative restrictions remain enforced.
         selected, covered, used, families = [], set(), 0, {}
+        table_coverage = []
+        original_table_scopes = _original_subject_scopes(positive)
+
+        def remember_table_support(candidate, packed):
+            # A duplicate is optional only after a complete already selected
+            # packet proves all its native data, applicability and closure.
+            # Unmatched words/conditions/subjects are never inferred equivalent.
+            """Зафиксировать полные исходные табличные свидетельства для проверки дублирующих пакетов."""
+            keys = term_keys(str(candidate.get('text', '')) + ' ' + str(candidate.get('section_title', '')))
+            profile_ids = frozenset(number for number, scope in enumerate(original_table_scopes)
+                                    if _group_coverage(scope['groups'], keys) == 1
+                                    and all(target <= keys for target in scope['guards']))
+            for cohort in candidate['_table_support']:
+                native = [candidate['_table_blocks'][number] for number in cohort['core']]
+                witnesses = set()
+                for block in native:
+                    unit = parse_table_unit(block.strip()) if block.strip().startswith('[TABLE_ROW_V1]') else None
+                    witnesses.add(json.dumps({key:value for key,value in unit.items() if key != 'table_id'},
+                                             ensure_ascii=False, sort_keys=True) if unit is not None else block)
+                table_coverage.append({'profiles':profile_ids, 'witnesses':frozenset(witnesses),
+                                       'complete':cohort['bounded'] and all(block in packed for block in native)})
+        diversity_cache = {}
         family_used = 0
         incomplete_inventory = []
         limit = max(top_k, min(24, len(facet_groups) + min(2, len(roots))))
@@ -1574,19 +2752,54 @@ class SectionEvidenceIndex:
             pending_subjects = set(focus_facets) - covered
 
             def priority(item):
+                """Оценить полезность кандидата с учетом еще не покрытых тем и связанных пакетов."""
                 family = (source_key(item.get('file')), str(item.get('section_path', '')).rsplit(' > ', 1)[0])
+                gain = (item['_score'] + 2.2 * len(item['_facets'] - covered)
+                        - 0.25 * families.get(family, 0))
+                # This signal never discards evidence or overrides uncovered
+                # subjects/atomic packets. Negative gain must not be promoted.
+                if gain > 0 and preferred_passages:
+                    gain *= priority_multiplier(item, selected, cache=diversity_cache)
+                matched_preferences = _matching_preferred_passages(
+                    item, tuple(item['_reader_preferences'].values()), origin_ids=item['_reader_origin_ids'],
+                    projections=_preferred_projection_map(item))
+                reader_order = min((bound_preference_positions.get(_preferred_passage_key(preference),
+                                  len(preferred_passages)) for preference in matched_preferences),
+                                  default=len(preferred_passages))
                 return (not wants_exception and item['evidence_role'] == 'exception',
                         not bool(item['_facets'] & pending_subjects),
                         not bool(item.get('_inventory_rows')),
                         not bool(item.get('_family_id')),
-                        -(item['_score'] + 2.2 * len(item['_facets'] - covered)
-                          - 0.25 * families.get(family, 0)), item['_rank'], item.get('position', 100000))
+                        not bool(matched_preferences), reader_order,
+                        -marginal.gain(item['_query_origins']) if marginal is not None else 0,
+                        -gain, not bool(item['_table_support']), item['_rank'], item.get('position', 100000))
 
             candidate = min(candidates, key=priority)
             candidates.remove(candidate)
             item = {key: value for key, value in candidate.items() if not key.startswith('_')
                     and key not in {'heading_keys', 'position'}}
             text, remaining = str(item.get('text', '')), max_chars - used
+            # The whole-section fast path must enforce the same integrity
+            # contract as excerpting; fitting the budget cannot bless a broken
+            # table binding and send its raw values directly to a writer.
+            _table_content_runs(text)
+            native_preferences = _matching_preferred_passages(
+                item, tuple(candidate['_reader_preferences'].values()), origin_ids=candidate['_reader_origin_ids'],
+                projections=_preferred_projection_map(candidate))
+            origin_contexts = {}
+            for preference in native_preferences:
+                key = _preferred_passage_key(preference)
+                contexts = candidate['_reader_contexts'][key]
+                maps = candidate['_reader_projections'].get(key, {})
+                origin_contexts.setdefault(preference['quote'], set()).update(
+                    maps[context].context if context in maps else context for context in contexts)
+            native_equations = _reader_native_equations(candidate, native_preferences)
+            preferred_formula = {}
+            native_blocks, preferred_packets = (_preferred_native_packets(
+                text, (preference['quote'] for preference in native_preferences), question=positive, groups=groups,
+                origin_contexts=origin_contexts, native_equations=native_equations,
+                formula_diagnostics=preferred_formula)
+                if native_preferences else ([], {}))
             # Every still-selectable slot needs a useful payload, not only the
             # first four long hits. Short complete sections release their spare
             # allowance to subsequent candidates. This is facet/item fairness,
@@ -1594,6 +2807,7 @@ class SectionEvidenceIndex:
             remaining_slots = min(limit - len(selected), len(candidates) + 1)
             budget = max(0, remaining // max(1, remaining_slots))
             other_subjects = pending_subjects - candidate['_facets']
+            reserve_others = 0
             if candidate['_facets'] & pending_subjects:
                 # Before optional sibling completion, retain space for a native
                 # payload of each independent subject that is still available.
@@ -1602,6 +2816,42 @@ class SectionEvidenceIndex:
                                      for label in other_subjects)
                 if len(text) <= remaining - reserve_others:
                     budget = max(budget, len(text))
+            # An exact native subject heading plus one indivisible equation
+            # paragraph must not lose its own allowance to a weaker table.
+            # This neither reserves a whole long chapter nor changes slots.
+            heading = term_keys(str(candidate.get('section_title', '')))
+            if (not candidate['_table_blocks'] and heading and _math_expressions(text)
+                    and len(_content_blocks(text)) == 1 and any(
+                        heading <= frozenset().union(*subject_groups) for _, subject_groups in table_subjects
+                        if subject_groups) and len(text) <= remaining - reserve_others):
+                budget = max(budget, len(text))
+            # Protect all explicitly requested native fields before a stronger
+            # UI/header hit spends their allowance. Relevance still determines
+            # selection order; this reserves no unrequested related table.
+            if table_field_requests and not table_field_requests <= candidate['_table_fields']:
+                field_packets = [other for other in candidates
+                                 if table_field_requests <= other['_table_fields'] and other['_table_cost']
+                                 and other['_table_cost'] <= remaining - reserve_others]
+                if field_packets:
+                    native_primary = max(field_packets, key=lambda other:other['_score'])
+                    budget = min(budget, max(0, remaining - native_primary['_table_cost'] - reserve_others))
+            # A fair share smaller than its native body cohort would leave a
+            # table's header while discarding every actual answer cell. Reserve
+            # that bounded packet from existing remaining space, preserving
+            # independently requested subjects and the overall character cap.
+            table_blocks, table_support = candidate['_table_blocks'], candidate['_table_support']
+            table_required, table_cost = candidate['_table_required'], candidate['_table_cost']
+            if table_required and table_cost <= remaining - reserve_others:
+                budget = max(budget, table_cost)
+            calculation_cost = candidate['_calculation_packet_cost']
+            if calculation_cost and calculation_cost <= remaining - reserve_others:
+                budget = max(budget, calculation_cost)
+            preferred_formula_blocks = set().union(*(value['blocks'] for value in preferred_formula.values())) if preferred_formula else set()
+            preferred_formula_cost = sum(len(native_blocks[number]) + len(_EXCERPT_MARKER)
+                                         for number in preferred_formula_blocks)
+            if preferred_formula_cost and preferred_formula_cost <= remaining - reserve_others:
+                budget = max(budget, preferred_formula_cost)
+            incomplete_preferred_formula |= bool(preferred_formula_cost > budget)
             if complete_family_fits and candidate.get('_family_id') and not other_subjects:
                 # Reserve each complete child's native payload as a bundle,
                 # while retaining separate evidence identities and locators.
@@ -1611,6 +2861,13 @@ class SectionEvidenceIndex:
             excerpt_signals = {}
             if candidate.get('_inventory_rows'):
                 excerpt_signals['inventory_enumeration_reserved'] = True
+                if forbidden:
+                    # A legacy inventory prelude/header packet is already
+                    # indivisible. Do not invent block coordinates by filtering
+                    # a previously projected packet; retain the existing path
+                    # and surface the unresolved negative scope explicitly.
+                    excerpt_signals.update(negative_scope_checked=False, negative_scope_unresolved=True,
+                        negative_scope_unresolved_reason='atomic-inventory-packet-not-projected')
                 if len(text) > budget:
                     packet = '\n\n'.join(candidate['_inventory_rows'])
                     if len(packet) > budget:
@@ -1630,28 +2887,53 @@ class SectionEvidenceIndex:
                     candidate['_facets'] = {label for label in candidate['_facets']
                                             if not facet_groups.get(label)
                                             or facet_coverage(label, packet_keys) >= 0.7}
-            if len(text) > budget:
+            selective_negative = bool(forbidden and not candidate.get('_inventory_rows'))
+            if len(text) > budget or selective_negative:
                 excerpt, indices = _focused_excerpt(text, budget, groups, facet_groups,
                                                     question=positive, diagnostics=excerpt_signals,
                                                     subject_profiles=profiles if search_focus is not None else None,
                                                     formula_subjects=tuple(phrase for subject in search_focus.subjects
                                                         for phrase in (subject.text, *subject.alternatives))
-                                                    if search_focus is not None else None)
+                                                    if search_focus is not None else None,
+                                                    preferred_quotes=tuple(preference['quote']
+                                                                           for preference in native_preferences),
+                                                    preferred_origin_contexts=origin_contexts,
+                                                    preferred_native_equations=native_equations,
+                                                    excluded_topics=tuple(forbidden) if selective_negative else (),
+                                                    reserve_table_body=candidate['_table_subject_supported'])
+                remember_negative_scope(excerpt_signals)
                 if not excerpt or not _substantive_text(excerpt, str(item.get('section_title', ''))):
+                    remember_table_support(candidate, excerpt)
                     continue
                 item['text'] = excerpt
-                item['evidence_truncated'] = True
-                item['evidence_excerpt'] = True
-                item['evidence_block_indices'] = indices
+                if excerpt != text:
+                    item['evidence_truncated'] = True
+                    item['evidence_excerpt'] = True
+                    item['evidence_block_indices'] = indices
                 actual = term_keys(item['text']) | term_keys(str(item.get('section_title', '')))
                 actual_facets = {label for label in candidate['_facets'] if not facet_groups.get(label)
                                  or facet_coverage(label, actual) >= 0.7}
             else:
                 actual_facets = candidate['_facets']
+                remember_negative_scope(excerpt_signals)
             item['coverage_facets'] = sorted(actual_facets)
+            remember_table_support(candidate, item['text'])
             if candidate.get('_family_id'):
                 item['evidence_family_id'] = candidate['_family_id']
             item['selection_score'] = round(candidate['_score'], 4)
+            if preferred_formula:
+                missing = set().union(*(value['missing_symbols'] for value in preferred_formula.values()))
+                unretained = any(native_blocks[number] not in item['text'] for number in preferred_formula_blocks)
+                incomplete_preferred_formula |= bool(missing or unretained)
+                excerpt_signals.update(preferred_formula_dependency_blocks=sorted(preferred_formula_blocks),
+                    definition_closure_incomplete=bool(excerpt_signals.get('definition_closure_incomplete') or missing or unretained),
+                    missing_definition_symbols=sorted(set(excerpt_signals.get('missing_definition_symbols', ())) | missing))
+            retained_preferences = tuple(preference for preference in _matching_preferred_passages(
+                item, native_preferences, origin_ids=candidate['_reader_origin_ids'],
+                projections=_preferred_projection_map(candidate))
+                if preference['quote'] in preferred_packets and all(
+                    native_blocks[number] in item['text'] for number in preferred_packets[preference['quote']]))
+            retained_preference_keys.update(_preferred_passage_key(preference) for preference in retained_preferences)
             item['selection_signals'] = {
                 'heading_coverage': round(candidate['_heading_coverage'], 4),
                 'heading_specificity': round(candidate['_heading_specificity'], 4),
@@ -1661,20 +2943,49 @@ class SectionEvidenceIndex:
                 'reserved_payload_slots': remaining_slots,
                 'section_role_penalty': candidate.get('section_role_penalty', 0),
                 'search_focus_used': search_focus is not None,
+                'source_reading_preferred': bool(retained_preferences),
+                'table_body_subject_supported': candidate['_table_subject_supported'],
                 **excerpt_signals,
             }
+            if candidate['_reader_preferences']:
+                item['selection_signals'].update(
+                    preferred_passage_requested_count=len(candidate['_reader_preferences']),
+                    preferred_passage_retained_count=len(retained_preferences),
+                    preferred_passage_retention_incomplete=len(retained_preferences) < len(candidate['_reader_preferences']))
             item['applicability'] = ('referenced' if candidate.get('reference_from') else
                                      ('mixed' if len(candidate['scope_categories']) > 1 else
                                       ('specific' if candidate['scope_categories'] else 'shared')))
             if forbidden:
                 item['excluded_topics'] = forbidden
             selected.append(item)
+            if marginal is not None:
+                rank_context.register_packed(item, candidate['_query_origins'], self._native_pack_witness)
+                marginal.accept(item, candidate['_query_origins'])
             used += len(item['text'])
             if candidate.get('_family_id'):
                 family_used += len(item['text'])
             covered.update(actual_facets)
             family = (source_key(item.get('file')), str(item.get('section_path', '')).rsplit(' > ', 1)[0])
             families[family] = families.get(family, 0) + 1
+        if selection_meta is not None:
+            if incomplete_preferred_formula:
+                selection_meta['definition_closure_incomplete'] = True
+            complete_tables = [packet for packet in table_coverage if packet['complete']]
+            missing_tables, alternatives = [], 0
+            for packet in table_coverage:
+                if packet['complete']:
+                    continue
+                duplicate = (not forbidden and packet['profiles'] and any(
+                    packet['profiles'] <= complete['profiles']
+                    and packet['witnesses'] <= complete['witnesses'] for complete in complete_tables))
+                if duplicate:
+                    alternatives += 1
+                else:
+                    missing_tables.append(packet)
+            if missing_tables:
+                selection_meta.update(table_body_coverage_incomplete=True, scoped_cohort_incomplete=True)
+            if alternatives:
+                selection_meta['table_body_declined_alternatives'] = alternatives
         scoped_inventory_warnings = []
         for warning in incomplete_inventory:
             carrier = next((item for item in selected
@@ -1693,6 +3004,9 @@ class SectionEvidenceIndex:
         if scoped_inventory_warnings and selection_meta is not None:
             selection_meta.update({'inventory_enumeration_incomplete': True,
                                    'inventory_enumeration_scoped_warnings': scoped_inventory_warnings})
+        if sibling_family and not selected and selection_meta is not None:
+            selection_meta.update(family_coverage_incomplete=True,
+                                  family_coverage_incomplete_reason='payload-or-slot-budget')
         if sibling_family and selected:
             bounded_children = sibling_family['children'][:12]
             expected = [child['section_path'] for child in bounded_children]
@@ -1701,6 +3015,11 @@ class SectionEvidenceIndex:
             missing = [path for path in expected if path not in present]
             excerpted = [item['section_path'] for item in members if item.get('evidence_excerpt')]
             complete = len(present) == len(sibling_family['children']) and not excerpted
+            if not complete and selection_meta is not None:
+                selection_meta.update(family_coverage_incomplete=True,
+                                      family_coverage_incomplete_reason='family-limit' if len(sibling_family['children']) > 12
+                                      else 'family-char-limit' if sibling_family['total_chars'] > 6000
+                                      else 'payload-or-slot-budget')
             anchor = members[0] if members else selected[0]
             anchor['evidence_family'] = {
                 'id': sibling_family['id'], 'file': sibling_family['file'],
@@ -1718,17 +3037,34 @@ class SectionEvidenceIndex:
                                       else 'family-char-limit' if sibling_family['total_chars'] > 6000
                                       else 'payload-or-slot-budget'),
             }
+        if bound_preferences and selection_meta is not None:
+            unretained = len(set(bound_preferences) - retained_preference_keys)
+            selection_meta['preferred_passage_retention'] = {
+                'requested_count': len(bound_preferences), 'retained_count': len(retained_preference_keys),
+                'unretained_count': unretained}
+            if unretained:
+                selection_meta['preferred_passage_retention_incomplete'] = True
         return selected
 
     def select(
         self, question: str, ranked: list[dict], *, excluded_sources: set[str] | None = None,
         allowed_sources: set[str] | None = None, top_k: int = 10, max_chars: int = 36000,
+        constraint_question: str | None = None, query_rank_context: QueryRankContext | None = None,
     ) -> list[dict]:
+        """Старый ограниченный отбор разделов для совместимости прямых вызовов.
+
+        Разрешения и редакции учитываются до расширения контекста. Режим coverage
+        вызывается явно через select_v2; отсутствие режима не включает его автоматически."""
         excluded = {source_key(value) for value in (excluded_sources or ())}
         allowed = {source_key(value) for value in (allowed_sources or ())}
-        kind = requested_source_kind(question)
+        authoritative = constraint_question if constraint_question is not None else question
+        kind = requested_source_kind(authoritative)
+        rank_context = (query_rank_context if isinstance(query_rank_context, QueryRankContext)
+                        and query_rank_context.question == authoritative else None)
+        marginal = rank_context.allocator() if rank_context is not None else None
 
         def visible(item: dict) -> bool:
+            """Применить разрешения, исключения и тип документа до включения записи в старый селектор."""
             key = source_key(item.get("file"))
             return key not in excluded and (allowed_sources is None or key in allowed) and (
                 not kind or kind in str(item.get("file", "")).casefold()
@@ -1777,25 +3113,55 @@ class SectionEvidenceIndex:
         candidates.extend(children)
         # Preserve strong full-subject body matches when no governing heading
         # was found. Do not fill the evidence with unrelated price/cost hits.
-        direct = [item for item in ranked if visible(item) and item.get('lexical_coverage') == 1.0]
+        user_subject_keys = term_keys(authoritative) - _LOOKUP_WORDS
+        direct = [item for item in ranked if visible(item) and item.get('lexical_coverage') == 1.0
+                  and (user_subject_keys.issubset(term_keys(str(item.get('text', ''))))
+                       or marginal is not None and marginal.active and
+                       marginal.gain(rank_context.origins(item)) > 0)]
         if not roots and direct:
             candidates.extend(direct)
-        subject_keys = set(direct[0].get('lexical_subject_keys', ())) if direct and not roots else set()
+        elif roots and len(user_subject_keys) >= 2:
+            # A heading cannot erase a complete original body subject. Rank
+            # diversity alone is not proof of that literal subject match.
+            candidates.extend(item for item in direct
+                              if user_subject_keys.issubset(term_keys(str(item.get('text', '')))))
+        subject_keys = user_subject_keys if direct and not roots else set()
         candidates.extend(
             item for item in ranked if visible(item) and (
                 not roots or keys.issubset(term_keys(
                     str(item.get("section_path", "")) + " " + str(item.get("text", ""))
                 ))
-            ) and (not subject_keys or subject_keys.issubset(term_keys(str(item.get('text', '')))))
+            ) and (not subject_keys or subject_keys.issubset(term_keys(str(item.get('text', ''))))
+                   or marginal is not None and marginal.active and marginal.gain(rank_context.origins(item)) > 0)
         )
+        candidates = filter_query_applicability(candidates, authoritative)
+        candidate_origins = {}
+        if rank_context is not None:
+            eligible_inputs = filter_query_applicability([item for item in ranked if visible(item)], authoritative)
+            offered_origins = set().union(*(rank_context.origins(item) for item in eligible_inputs))
+            # Legacy subject roots are assembled before ranked rows are added.
+            # Establish ancestry only from the current eligible ranked pool,
+            # never from a whole-index witness alone or an uploaded field.
+            candidate_origins = {id(item): (rank_context.origins(item) & offered_origins) | rank_context.native_ancestry(
+                item, offered_origins, self._native_pack_witness) for item in candidates}
+            marginal = rank_context.allocator(set().union(*candidate_origins.values()))
         selected, seen, used = [], set(), 0
         limit = max(top_k, min(24, len(roots) + len(children)))
-        for candidate in candidates:
+        while candidates:
+            if marginal is not None and marginal.active:
+                candidate = min(enumerate(candidates), key=lambda pair: (
+                    not _EXCEPTION.search(question) and evidence_role(pair[1]) == 'exception',
+                    pair[1].get('selection_reason') not in {'subject-heading', 'subject-child'},
+                    -marginal.gain(candidate_origins[id(pair[1])]), pair[0]))[1]
+                candidates.remove(candidate)
+            else:
+                candidate = candidates.pop(0)
             item = {key: value for key, value in candidate.items() if key not in {"heading_keys", "position"}}
             identity = evidence_id(item)
             if identity in seen:
                 continue
             text = str(item.get("text", ""))
+            _table_content_runs(text)
             # Whole-section packing has a separate input budget. Never cut an
             # equation mid-token or silently turn a partial section into whole.
             remaining = max_chars - used
@@ -1816,6 +3182,10 @@ class SectionEvidenceIndex:
             item.setdefault("selection_reason", "retrieval-rank")
             used += len(item["text"])
             selected.append(item)
+            if marginal is not None:
+                offered_origins = candidate_origins[id(candidate)]
+                rank_context.register_packed(item, offered_origins, self._native_pack_witness)
+                marginal.accept(item, offered_origins)
             seen.add(identity)
             if len(selected) >= limit:
                 break
@@ -1825,6 +3195,7 @@ class SectionEvidenceIndex:
 
 
 def generation_evidence_prompt(context: list[dict]) -> str:
+    """Сформировать подсказку о ролях уже выбранных фрагментов; ничего не добавляет к доказательствам."""
     roles = {"main": "основное правило", "definition": "определение", "exception": "частный случай или исключение"}
     return "\n".join(
         f"- {item.get('file', '')}, {item.get('section_path', '')}: "
@@ -1851,6 +3222,7 @@ def overview_sections(question: str, context: list[dict]) -> list[dict]:
 
 
 def missing_overview_sections(answer: str, sections: list[dict]) -> list[dict]:
+    """Найти разделы обзора без соответствующего заголовка ответа; проверка эвристическая."""
     headings = re.findall(r'(?m)^\s*(?:#{1,6}\s+|\*\*)([^\n]+)', answer)
     heading_keys = [term_keys(heading.strip('* ')) for heading in headings]
     return [item for item in sections if not any(

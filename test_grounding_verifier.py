@@ -1,3 +1,4 @@
+import json
 import re
 
 import pytest
@@ -519,7 +520,14 @@ def test_empty_uncertain_passages_leave_claim_unassessed_not_verified_or_crashed
 
 def test_passage_judge_payload_does_not_ask_model_to_copy_source_quotes():
     prompt = build_grounding_judge_prompt("Канал проходит два этапа проверки. [E1]", [evidence("Канал проходит два этапа проверки.")])
-    assert '"passage_ids":["E1:P1"]' in prompt
+    schema = json.JSONDecoder().raw_decode(prompt.split("JSON Schema: ", 1)[1])[0]
+    row_schema = schema["properties"]["claims"]["items"]
+    assert set(row_schema["required"]) == {"claim_id", "context_ids", "support", "passage_ids"}
+    assert row_schema["properties"]["support"]["enum"] == ["supported", "unsupported", "contradicted", "uncertain"]
+    assert "claims" not in schema and "E1:P1" not in json.dumps(schema)
+    data = json.JSONDecoder().raw_decode(prompt[prompt.index('{"question":'):])[0]
+    assert data["answer_claims"][0]["cited_evidence_ids"] == ["E1"]
+    assert data["evidence"][0]["passages"][0]["passage_id"] == "E1:P1"
     assert '"passages"' in prompt
     assert "Не копируй цитаты" in prompt
     assert '"quotes":[' not in prompt

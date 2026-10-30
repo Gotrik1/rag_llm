@@ -20,6 +20,7 @@ def _value(spec: Any, data: Mapping[str, Any]) -> Any:
 
 
 def evaluate_condition(condition: Mapping[str, Any], data: Mapping[str, Any]) -> bool:
+    """Evaluate the supported nested ABAC condition language; unknown comparison operators deny the condition."""
     if not condition: return True
     if "all" in condition: return all(evaluate_condition(item, data) for item in condition["all"])
     if "any" in condition: return any(evaluate_condition(item, data) for item in condition["any"])
@@ -36,7 +37,9 @@ def evaluate_condition(condition: Mapping[str, Any], data: Mapping[str, Any]) ->
 
 
 class PolicyProvider:
+    """Evaluate persisted ABAC rules while keeping rule interpretation outside HTTP handlers."""
     def decide(self, principal: Principal, action: str, resource: str, context: Mapping[str, Any] | None = None) -> bool | None:
+        """Return deny, allow or no decision; a matching explicit deny wins over all matching allows."""
         data = {
             "principal": {"subject": principal.subject, "roles": list(principal.roles), "permissions": list(principal.permissions), **dict(principal.attributes)},
             "resource": {"id": resource, **dict((context or {}).get("resource", {}))},
@@ -52,4 +55,5 @@ _provider = PolicyProvider()
 
 
 def policy_provider() -> PolicyProvider:
+    """Return the shared stateless policy evaluator; policy records are loaded for each decision."""
     return _provider

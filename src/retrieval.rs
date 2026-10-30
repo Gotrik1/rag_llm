@@ -1,3 +1,10 @@
+//! Two distinct candidate sources for the optional Rust path.
+//!
+//! Canonical retrieval scans the Python docstore with lexical prefix matching;
+//! it is not Tantivy BM25 or Python's evidence selector. `Retriever` instead
+//! fuses the independent Rust vector/Tantivy indexes. Neither path replaces
+//! caller-side project/chat authorization, citation checks or answer validation.
+
 use crate::bm25::Bm25Index;
 use crate::embed::Embedder;
 use crate::store::{SearchResult, VectorStore};
@@ -12,6 +19,8 @@ const RRF_K: f32 = 60.0;
 
 /// Lexical candidates from the same persisted docstore used by Python.
 /// This machine path requires neither a second embedding model nor Qdrant.
+/// Deleted nodes are skipped, but access control and active document-version
+/// scope must be applied by the orchestrator before evidence reaches a model.
 pub fn retrieve_canonical(question: &str) -> Result<Vec<crate::agent::RetrievalEvidence>> {
     use std::{env, path::PathBuf};
     let data = env::var("RAG_DATA_DIR").unwrap_or_else(|_| ".data".to_string());
@@ -20,6 +29,8 @@ pub fn retrieve_canonical(question: &str) -> Result<Vec<crate::agent::RetrievalE
     parse_canonical(&content, question)
 }
 
+/// Read persisted nodes and rank body/header prefix overlap, capped at 40 hits.
+/// The chunk ordinal is local to this scan, not a stable cross-index identity.
 fn parse_canonical(content: &str, question: &str) -> Result<Vec<crate::agent::RetrievalEvidence>> {
     let corpus: serde_json::Value = serde_json::from_str(content)?;
     let nodes = corpus.get("docstore/data").and_then(|v| v.as_object())
@@ -52,12 +63,14 @@ fn parse_canonical(content: &str, question: &str) -> Result<Vec<crate::agent::Re
     Ok(results)
 }
 
+/// Cheap shared prefix keys for canonical scanning; not a linguistic stemmer.
 fn lexical_keys(value: &str) -> std::collections::HashSet<String> {
     value.to_lowercase().split(|c: char| !c.is_alphanumeric())
         .filter(|word| word.chars().count() >= 2 && !["на", "по", "из", "со", "во", "как", "что", "для"].contains(word))
         .map(|word| word.chars().take(5).collect()).collect()
 }
 
+/// Borrow the separately initialized Rust vector, embedding and lexical stores.
 pub struct Retriever<'a> {
     store: &'a VectorStore,
     embedder: &'a Embedder,
@@ -65,10 +78,13 @@ pub struct Retriever<'a> {
 }
 
 impl<'a> Retriever<'a> {
+    /// Bind existing stores without loading or rebuilding their data.
     pub fn new(store: &'a VectorStore, embedder: &'a Embedder, bm25: &'a Bm25Index) -> Self {
         Self { store, embedder, bm25 }
     }
 
+    /// Fuse vector, full-text and abbreviation-heading ranks and return ten hits.
+    /// Ranking scores are RRF weights; they are not answer-confidence estimates.
     pub async fn retrieve(&self, question: &str) -> Result<Vec<SearchResult>> {
         // chunk_id -> (rrf_score, SearchResult)
         let mut scores: HashMap<(String, usize), (f32, Option<SearchResult>)> = HashMap::new();

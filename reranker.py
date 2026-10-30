@@ -17,6 +17,7 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class RerankerSettings:
+    """Bounded optional HTTP reranker settings; default mode leaves the ordinary ranking path unchanged."""
     mode: str = "off"
     url: str = "http://llm-bridge:11434/api/rerank"
     model: str = "BAAI/bge-reranker-base"
@@ -27,6 +28,7 @@ class RerankerSettings:
 
     @classmethod
     def from_env(cls) -> "RerankerSettings":
+        """Resolve supported reranker settings and disable unknown modes rather than guessing a transport."""
         mode = os.getenv("RAG_RERANKER_MODE", "off").strip().lower()
         if mode not in {"off", "http"}:
             LOGGER.warning("Unknown RAG_RERANKER_MODE=%s; reranker is disabled", mode)
@@ -78,9 +80,11 @@ class HttpReranker:
 
     @property
     def enabled(self) -> bool:
+        """Report configured HTTP reranking intent without claiming endpoint/model readiness."""
         return self.settings.mode == "http" and bool(self.settings.url)
 
     def rerank(self, question: str, ranked: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Rerank only a bounded candidate prefix and retain deterministic fallback when the HTTP stage fails."""
         if not self.enabled or len(ranked) < 2:
             return ranked
         candidate_count = min(len(ranked), self.settings.candidate_limit)

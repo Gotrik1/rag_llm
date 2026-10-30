@@ -26,10 +26,12 @@ def sqlalchemy_database_url(url: str) -> str:
 
 
 class Base(DeclarativeBase):
+    """Declarative metadata root for access-control, audit and persistent background-job tables."""
     pass
 
 
 class PrincipalRow(Base):
+    """Persist an external subject and its active status independently of local session accounts."""
     __tablename__ = "principals"
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     subject: Mapped[str] = mapped_column(String(255), unique=True, index=True)
@@ -39,30 +41,35 @@ class PrincipalRow(Base):
 
 
 class RoleRow(Base):
+    """Named RBAC role shared by principal-role and role-permission associations."""
     __tablename__ = "roles"
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     name: Mapped[str] = mapped_column(String(128), unique=True)
 
 
 class PermissionRow(Base):
+    """Named permission, including the explicit wildcard used by the bootstrap administrator."""
     __tablename__ = "permissions"
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     name: Mapped[str] = mapped_column(String(128), unique=True)
 
 
 class PrincipalRoleRow(Base):
+    """Unique principal-to-role association; assigning a role does not create duplicate links."""
     __tablename__ = "principal_roles"
     principal_id: Mapped[str] = mapped_column(ForeignKey("principals.id", ondelete="CASCADE"), primary_key=True)
     role_id: Mapped[str] = mapped_column(ForeignKey("roles.id", ondelete="CASCADE"), primary_key=True)
 
 
 class RolePermissionRow(Base):
+    """Unique role-to-permission association used when enriching an authenticated principal."""
     __tablename__ = "role_permissions"
     role_id: Mapped[str] = mapped_column(ForeignKey("roles.id", ondelete="CASCADE"), primary_key=True)
     permission_id: Mapped[str] = mapped_column(ForeignKey("permissions.id", ondelete="CASCADE"), primary_key=True)
 
 
 class PolicyRow(Base):
+    """Persist a prioritized ABAC rule and its resource/action matching conditions."""
     __tablename__ = "abac_policies"
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     name: Mapped[str] = mapped_column(String(255), unique=True)
@@ -75,6 +82,7 @@ class PolicyRow(Base):
 
 
 class AuditEventRow(Base):
+    """Persist structured security and lifecycle events for retention-controlled auditing."""
     __tablename__ = "audit_events"
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     created_at: Mapped[float] = mapped_column(Float, index=True)
@@ -86,6 +94,7 @@ class AuditEventRow(Base):
 
 
 class JobRow(Base):
+    """Persist background-job lifecycle state separately from Redis delivery and worker-only payload access."""
     __tablename__ = "jobs"
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     kind: Mapped[str] = mapped_column(String(64), index=True)
@@ -101,6 +110,7 @@ class JobRow(Base):
 
 
 class Persistence:
+    """SQLAlchemy gateway for identity policy, audit and job state; an absent URL disables persistence."""
     def __init__(self, url: str | None = None) -> None:
         configured_url = url if url is not None else os.getenv("RAG_DATABASE_URL") or os.getenv("DATABASE_URL", "")
         self.url = sqlalchemy_database_url(configured_url)
@@ -108,9 +118,11 @@ class Persistence:
 
     @property
     def enabled(self) -> bool:
+        """Report whether an engine was configured, without issuing a readiness query."""
         return self.engine is not None
 
     def bootstrap_superadmin(self, subject: str) -> None:
+        """Idempotently create the configured bootstrap subject and wildcard administrator grants."""
         if not self.engine:
             return
         with Session(self.engine) as session:
@@ -132,12 +144,14 @@ class Persistence:
             session.commit()
 
     def ping(self) -> bool:
+        """Probe the configured engine; disabled persistence is considered optional and returns True."""
         if not self.engine: return True
         from sqlalchemy import text
         with self.engine.connect() as connection: connection.execute(text("SELECT 1"))
         return True
 
     def enrich_principal(self, principal: Principal) -> Principal:
+        """Merge persisted grants into an authenticated identity and reject an inactive persisted subject."""
         if not self.engine:
             return principal
         with Session(self.engine) as session:
@@ -173,6 +187,7 @@ class Persistence:
             return Principal(principal.subject, frozenset(roles) | principal.roles, frozenset(permissions) | principal.permissions, {**row.attributes, **principal.attributes}, principal.provider)
 
     def active_policies(self, action: str) -> list[dict[str, Any]]:
+        """Return active exact-action or wildcard policies in descending priority order."""
         if not self.engine:
             return []
         with Session(self.engine) as session:
@@ -180,6 +195,7 @@ class Persistence:
             return [{"name": r.name, "effect": r.effect, "action": r.action, "resource": r.resource, "condition": r.condition, "priority": r.priority} for r in rows]
 
     def upsert_policy(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create or replace one named ABAC policy and return its public persisted fields."""
         if not self.engine: raise RuntimeError("RAG_DATABASE_URL is required")
         with Session(self.engine) as session:
             row = session.scalar(select(PolicyRow).where(PolicyRow.name == payload["name"]))
@@ -191,6 +207,7 @@ class Persistence:
             return {"id": row.id, **{key: getattr(row, key) for key in ("name", "effect", "action", "resource", "condition", "priority", "active")}}
 
     def grant_role(self, subject: str, role_name: str, permissions: list[str]) -> None:
+        """Idempotently attach a role and its requested permissions to an external subject."""
         if not self.engine: raise RuntimeError("RAG_DATABASE_URL is required")
         with Session(self.engine) as session:
             principal = session.scalar(select(PrincipalRow).where(PrincipalRow.subject == subject))
@@ -209,6 +226,7 @@ class Persistence:
             session.commit()
 
     def record_audit(self, payload: dict[str, Any]) -> None:
+        """Commit one structured audit event; disabled persistence leaves no durable audit record."""
         if not self.engine:
             return
         with Session(self.engine) as session:
@@ -216,6 +234,7 @@ class Persistence:
             session.commit()
 
     def purge_audit(self, retention_days: int) -> int:
+        """Delete audit events older than the supplied retention interval and return the affected count."""
         if not self.engine: return 0
         cutoff = time.time() - retention_days * 86400
         with Session(self.engine) as session:
@@ -224,12 +243,14 @@ class Persistence:
             return int(result.rowcount or 0)
 
     def create_job(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create a queued job identity and persist it when enabled; queue submission requires persistence."""
         job = JobRow(id=uuid.uuid4().hex, kind=kind, status="queued", progress=0, created_at=time.time(), payload=payload)
         if self.engine:
             with Session(self.engine, expire_on_commit=False) as session: session.add(job); session.commit()
         return self.job_dict(job)
 
     def update_job(self, job_id: str, **values: Any) -> None:
+        """Commit supplied lifecycle fields for an existing job; a missing record is a no-op."""
         if not self.engine: return
         with Session(self.engine) as session:
             row = session.get(JobRow, job_id)
@@ -238,6 +259,7 @@ class Persistence:
                 session.commit()
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
+        """Return the public job projection, excluding its worker-only request payload."""
         if not self.engine: return None
         with Session(self.engine) as session:
             row = session.get(JobRow, job_id)
@@ -251,6 +273,7 @@ class Persistence:
             return dict(row.payload) if row and isinstance(row.payload, dict) else None
 
     def request_cancel(self, job_id: str) -> bool:
+        """Set the cancellation flag only for a nonterminal persisted job."""
         if not self.engine: return False
         with Session(self.engine) as session:
             row = session.get(JobRow, job_id)
@@ -259,6 +282,7 @@ class Persistence:
 
     @staticmethod
     def job_dict(row: JobRow) -> dict[str, Any]:
+        """Serialize lifecycle fields and result/error data without the private job payload."""
         return {key: getattr(row, key) for key in ("id", "kind", "status", "progress", "cancel_requested", "created_at", "started_at", "finished_at", "result", "error")}
 
 
@@ -266,6 +290,7 @@ _store: Persistence | None = None
 
 
 def get_store() -> Persistence:
+    """Return the process-local persistence facade, constructing its engine lazily on first access."""
     global _store
     if _store is None: _store = Persistence()
     return _store

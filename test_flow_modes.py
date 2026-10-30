@@ -91,7 +91,9 @@ class FlowModeTests(unittest.TestCase):
              patch.object(web_ui, "get_profile", return_value={"prompt": "test", "id": "test"}), \
              patch.object(web_ui, "get_workspace", return_value={"active_chat_id": "active-chat"}), \
              patch.object(web_ui, "get_project_conversation", return_value={"project_name": "test", "memory": {}, "messages": []}), \
-             patch.object(web_ui, "retrieval_document_scope", return_value=(set(), {})), \
+             patch.object(web_ui, "retrieval_document_scope", return_value=(set(), {
+                 "python.docx": "python.docx", "rust.docx": "rust.docx",
+             })), \
              patch.object(web_ui, "shared_global_document_sources", return_value={"python.docx", "rust.docx"}), \
              patch.object(web_ui, "validate_retrieval", return_value=[]), \
              patch.object(web_ui, "extract_formula_lines", return_value=[]), \

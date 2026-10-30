@@ -57,6 +57,7 @@ class SourceCard:
     sides: tuple[tuple[str, ...], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
+        """Export only declared card relations and offered passage/requirement IDs for the writer guide."""
         result = {
             "id": self.id, "kind": self.kind,
             "passage_ids": list(self.passage_ids),
@@ -70,6 +71,7 @@ class SourceCard:
 
 @dataclass(frozen=True)
 class SourcePassage:
+    """A verbatim offered passage bound to its evidence ID and source metadata."""
     passage_id: str
     evidence_id: str
     quote: str
@@ -78,6 +80,7 @@ class SourcePassage:
 
 @dataclass(frozen=True)
 class SourceReading:
+    """Snapshot-bound model reading result; assessed cards are guidance, not independently proven facts."""
     snapshot_id: str
     assessed: bool
     question: str
@@ -431,6 +434,37 @@ def _writer_projection(trusted: Mapping[str, Any]) -> dict[str, Any]:
         evidence_id = passage["evidence_id"]
         result["quoted_passages"][passage_id] = {"evidence_id": evidence_id, "quote": passage["quote"]}
     return result
+
+
+def selection_preferences(
+    reading: SourceReading | Mapping[str, Any],
+    question: str,
+    plan_payload: Mapping[str, Any],
+    evidence: Sequence[Mapping[str, Any]],
+    selection_limits: Mapping[str, Any] | None = None,
+    *,
+    user_task: UserTask | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Private packing hints, bound to this exact candidate snapshot/task.
+
+    A selected PID is not an entailment or completeness certificate. It may
+    only prefer an existing native passage; it cannot create evidence, change
+    scope or become a writer guide for a different final context snapshot.
+    """
+    if validated_writer_payload(
+        reading, question, plan_payload, evidence, selection_limits,
+        max_chars=MAX_RESOLVED_PAYLOAD_CHARS, user_task=user_task,
+    ) is None:
+        return ()
+    data = reading.to_dict() if isinstance(reading, SourceReading) else deepcopy(dict(reading))
+    passage_ids = dict.fromkeys(
+        passage_id for card in data['judgments']['cards'] if card['kind'] != 'uncertainty'
+        for group in (card['passage_ids'], *(card.get('sides') or {}).values())
+        for passage_id in group
+    )
+    return tuple({key: deepcopy(data['quoted_passages'][passage_id][key])
+                  for key in ('evidence_id', 'quote', 'source')}
+                 for passage_id in passage_ids)
 
 
 def read_sources(

@@ -291,6 +291,8 @@ services:
     depends_on:
       app:
         condition: service_healthy
+      model-gateway:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8080/nginx-health"]
       interval: 15s
@@ -641,6 +643,34 @@ services:
       - no-new-privileges:true
     logging: *common-logging
 
+  model-gateway:
+    build:
+      context: .
+      dockerfile: deploy/model-gateway/Dockerfile
+    image: rag-model-gateway:${RAG_IMAGE_TAG:-local}
+    environment:
+      MODEL_UPSTREAM_BASE_URL: http://vllm:8000
+      MODEL_API_TOKEN_HASHES_FILE: /run/secrets/model_api_token_hashes
+      MODEL_API_REQUEST_TIMEOUT: ${MODEL_API_REQUEST_TIMEOUT:-900}
+      MODEL_API_MAX_REQUEST_BYTES: ${MODEL_API_MAX_REQUEST_BYTES:-2097152}
+    secrets:
+      - model_api_token_hashes
+    networks:
+      - backend
+    depends_on:
+      vllm:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *common-logging
+
 networks:
   frontend:
   egress:
@@ -670,3 +700,5 @@ secrets:
     file: ${GRAFANA_ADMIN_PASSWORD_FILE:-./deploy/secrets/grafana_admin_password}
   app_secret_key:
     file: ${APP_SECRET_KEY_FILE:-./deploy/secrets/app_secret_key}
+  model_api_token_hashes:
+    file: ${MODEL_API_TOKEN_HASHES_FILE:-./deploy/secrets/model_api_token_hashes}

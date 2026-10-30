@@ -1,28 +1,67 @@
 [run]
 branch = True
 source =
+    answer_citations
+    answer_draft_protocol
+    answer_sources
+    api_openapi
+    application_services
     asgi_app
+    atomic_publication
     audit
+    candidate_admission
+    citation_scopes
+    conversation_context
+    corrective_rag
     db_store
+    deletion_task
     document_catalog
     document_ingestion
+    document_navigation
     docx_parser
+    domain_routing
+    evidence_anchors
+    evidence_diversity
+    evidence_selection
     generation_worker
+    grounding_schema
+    grounding_verifier
+    image_parsing
     ingestion_task
     ingestion_worker
     jobs
     legacy_adapter
     llm_providers
     local_auth
+    native_prompt_counter
+    native_source_rows
+    ordinary_answer_guard
     persistence
     policy
+    prepack_reading
+    prompt_payload
+    provider_runtime
     quality_eval
+    query_rank
+    question_service
     rag_agent
+    reranker
     response_cache
+    review_protocol
     runtime_paths
+    search_focus
     security
+    source_model_view
+    source_navigation
+    source_reader
+    source_semantics
     system_prompts
+    table_chunking
+    table_context
+    table_model_view
+    task_intent
     telemetry
+    user_task
     web_ui
 
 [report]

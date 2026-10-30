@@ -22,12 +22,14 @@ deployment.
 
 - [User guide](docs/USER_GUIDE_RU.md) — detailed Russian-language instructions.
 - [Architecture](architecture.md) — current runtime and data-flow boundaries.
+- [Developer handoff](docs/DEVELOPER_HANDOFF_RU.md) — module ownership, HTTP/service boundaries, checks, and known refactoring debt.
 - [Deployment](DEPLOYMENT.md) — production deployment, verification, backup, and rollback.
 - [Historical production report](docs/PRODUCTION_READINESS_REPORT.md) — release-scoped capabilities and tests, not current answer-quality certification.
 - [RAG quality gate](docs/QUALITY_EVALUATION.md) — corpus-level 9/10 acceptance method.
 - [Context ablation](docs/ORACLE_CONTEXT_EVALUATION.md) — isolate evidence-selection errors from generation errors.
 - [Evidence-first pipeline](docs/CORRECTIVE_RAG.md) — bounded corrective search, traces, evaluation and rollback.
 - Live API schema: `/api/openapi.json`; Swagger UI: `/docs`.
+- [API contract maintenance](docs/API_CONTRACT.md) — native routes, legacy facade, auth/CSRF and contract checks.
 
 ## Local verification
 
@@ -37,7 +39,8 @@ stack is `compose.yaml`, Compose project `rag-assistant`.
 ```powershell
 git status --short --branch
 docker compose -f compose.yaml config --quiet
-python -m pytest -q
+.\.venv312\Scripts\python.exe -m pip install -r requirements.test.txt
+.\.venv312\Scripts\python.exe -m pytest -q
 Push-Location ui
 npm test -- --run
 npm run build
@@ -70,8 +73,12 @@ remain on internal networks.
 
 | Path | Responsibility |
 | --- | --- |
-| `asgi_app.py` | FastAPI facade, auth, persistent generation, uploads, jobs, metrics |
-| `web_ui.py` | RAG request orchestration and compatibility routes |
+| `asgi_app.py` | FastAPI transport, auth, service wiring, jobs, metrics |
+| `application_services.py` | generation/message and document lifecycle use cases |
+| `question_service.py` | scoped question orchestration behind HTTP adapters |
+| `web_ui.py` | compatibility routes, legacy helper bindings, source visibility |
+| `api_openapi.py` | current native API schema plus explicit legacy operations |
+| `answer_sources.py` | shared source presentation with optional ranking metadata |
 | `rag_agent.py` | chunking, hybrid retrieval, reranking, grounding, formulas, cache keys |
 | `corrective_rag.py` | opt-in bounded planning, repeated search, coverage and answer checks |
 | `evidence_selection.py` | applicability-aware section and paragraph packing |
@@ -92,5 +99,6 @@ remain on internal networks.
 - Keep `RAG_WORKER_CONCURRENCY=1` while BM25 uses one shared snapshot.
 - Scale `RAG_GENERATION_CONCURRENCY` independently from ingestion, after
   measuring model memory and tokens-per-second under concurrent prompts.
-- Keep production authentication in `oidc` mode with real issuer/audience/JWKS values.
+- Keep authentication enabled: use the configured local sessions with strong
+  session secrets/CSRF protection, or configure OIDC issuer/audience/JWKS values.
 - Treat answer text as a synthesis; use its source links to verify critical facts.

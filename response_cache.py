@@ -21,7 +21,7 @@ except ImportError:  # Allows local code inspection before runtime dependencies 
 # global corpus snapshot are current.  A day preserves cross-user reuse for
 # recurring questions without retaining a long tail of abandoned exact keys.
 DEFAULT_TTL_SECONDS = 24 * 60 * 60
-CACHE_NAMESPACE = "rag:answer:v2:"
+CACHE_NAMESPACE = "rag:answer:v3:"
 
 
 class ResponseCache:
@@ -49,6 +49,7 @@ class ResponseCache:
         return f"{CACHE_NAMESPACE}{key}"
 
     def get(self, key: str) -> dict[str, Any] | None:
+        """Read one exact JSON object; Redis failures and malformed entries are cache misses."""
         if self.client is None:
             return None
         try:
@@ -61,6 +62,7 @@ class ResponseCache:
             return None
 
     def set(self, key: str, value: dict[str, Any]) -> None:
+        """Write with TTL; the caller supplies an already scope-safe composite key."""
         if self.client is None:
             return
         try:
@@ -73,6 +75,7 @@ class ResponseCache:
             pass
 
     def clear(self) -> None:
+        """Invalidate this namespace in bounded batches without touching unrelated Redis keys."""
         if self.client is None:
             return
         try:

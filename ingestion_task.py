@@ -7,6 +7,7 @@ import sys
 
 
 def main() -> int:
+    """Ingest one CLI-supplied path and emit the worker's final JSON result or serialized failure."""
     if len(sys.argv) != 2:
         print(json.dumps({"error": "path argument is required"})); return 2
     try:

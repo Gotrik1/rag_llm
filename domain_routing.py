@@ -26,6 +26,7 @@ def _source_reservation_key(value: object) -> str:
 
 @dataclass(frozen=True)
 class DomainRouting:
+    """Soft multi-domain search preferences and matched terms; these weights never replace document access rules."""
     focus: str
     weights: dict[str, float]
     matched_terms: dict[str, tuple[str, ...]]
@@ -33,6 +34,7 @@ class DomainRouting:
 
     @property
     def active_domains(self) -> tuple[str, ...]:
+        """Return explicitly selected or lexically inferred priority domains used for evidence reservation."""
         if self.focus == "both":
             return ("rre", "orem")
         if self.focus in {"rre", "orem"}:
@@ -42,10 +44,12 @@ class DomainRouting:
 
 @lru_cache(maxsize=1)
 def load_domain_rules() -> dict:
+    """Load and cache the repository's domain routing configuration; invalid JSON propagates to the caller."""
     return json.loads(RULES_PATH.read_text(encoding="utf-8"))
 
 
 def normalize_retrieval_focus(value: object) -> str:
+    """Map an absent or unsupported client focus to auto rather than introducing an unknown domain."""
     focus = str(value or "auto").strip().casefold()
     return focus if focus in VALID_RETRIEVAL_FOCUS else "auto"
 
@@ -110,6 +114,7 @@ def route_query(question: str, focus: str = "auto") -> DomainRouting:
 
 
 def source_domains_for(file_name: object, source_domains: dict[str, Iterable[str]] | None) -> tuple[str, ...]:
+    """Resolve allowed domain tags from a document basename, defaulting unclassified sources to shared."""
     key = Path(str(file_name or "")).name.casefold()
     values = (source_domains or {}).get(key, ("shared",))
     result = tuple(str(value).casefold() for value in values if str(value).casefold() in {"rre", "orem", "shared"})

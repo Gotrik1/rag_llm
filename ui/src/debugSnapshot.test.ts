@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { contextFromCompletedJob, preserveContextSnapshot } from "./debugSnapshot";
+import { contextFromCompletedJob, isApiContextChunk, preserveContextSnapshot } from "./debugSnapshot";
 
 const chunk = { file: "расчёт.docx", text: "Точная цитата\nСебестоимость (УУ)", score: 0.76, extra: { revision: "v1" } };
 type Answer = { chat_id?: string; message_id?: string; job_id?: string; context?: typeof chunk[] };
-const isChunk = (value: unknown): value is typeof chunk => typeof value === "object" && value !== null && "text" in value;
+const isChunk = isApiContextChunk;
 const expected = { jobId: "job-1", messageId: "answer-1" };
 const validJob = () => ({
   id: "job-1", kind: "generation", status: "completed",
@@ -55,6 +55,23 @@ describe("current answer's original evidence snapshot", () => {
 });
 
 describe("durable original evidence recovery", () => {
+  it.each([undefined, null, 0, 0.76])("keeps canonical sections with optional rank %s", (score) => {
+    const section = { file: "native.docx", text: "Полный исходный раздел", score };
+    if (score === undefined) delete section.score;
+    const job = { ...validJob(), result: { ...validJob().result, context: [section] } };
+    expect(contextFromCompletedJob(job, expected, isChunk)).toBe(job.result.context);
+    expect(contextFromCompletedJob(job, expected, isChunk)[0]).toBe(section);
+  });
+
+  it.each([
+    { text: "missing source" }, { file: "missing text.docx" },
+    { file: 1, text: "invalid file" }, { file: "source", text: 1 },
+    ...[NaN, Infinity, -Infinity, "0.5", false].map((score) => ({ file: "source", text: "quote", score }))
+  ])("rejects invalid source content or nonfinite/non-numeric rank %j", (section) => {
+    const job = { ...validJob(), result: { ...validJob().result, context: [section] } };
+    expect(() => contextFromCompletedJob(job, expected, isChunk)).toThrow("отсутствует или повреждён");
+  });
+
   it("returns the original array unchanged, including order, extra fields and exact quotes", () => {
     const job = validJob();
     const context = contextFromCompletedJob(job, expected, isChunk);

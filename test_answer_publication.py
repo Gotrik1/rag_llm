@@ -54,29 +54,49 @@ def test_safe_partial_delegates_without_neutral_message_heuristics():
     assert answer not in missing.answer
 
 
-def test_judge_examples_use_only_real_current_evidence_aliases():
+def test_judge_schema_is_neutral_and_payload_uses_current_evidence_aliases():
     prompt, data = payload("Inspect every hour [E7].")
-    assert '"passage_ids":["E7:P1"]' in prompt
+    schema = json.JSONDecoder().raw_decode(prompt.split("JSON Schema: ", 1)[1])[0]
+    row_schema = schema["properties"]["claims"]["items"]
+    assert set(row_schema["required"]) == {"claim_id", "context_ids", "support", "passage_ids", "task_relevance"}
+    assert row_schema["properties"]["support"]["enum"] == ["supported", "unsupported", "contradicted", "uncertain"]
+    assert "claims" not in schema
+    assert all('"' + key + '":' not in json.dumps(schema) for key in ("default", "example", "examples", "const"))
+    assert "E7:P1" not in json.dumps(schema)
     assert "E1" not in prompt
+    assert data["answer_claims"][0]["claim_id"] == "C1"
     assert data["answer_claims"][0]["cited_evidence_ids"] == ["E7"]
+    assert data["evidence"][0]["passages"][0]["passage_id"] == "E7:P1"
     empty = build_grounding_judge_prompt("No data.", [], user_task=TASK)
-    assert '"passage_ids":[]' in empty and "E1" not in empty
+    empty_data = json.JSONDecoder().raw_decode(empty[empty.index('{"question":'):])[0]
+    assert empty_data["evidence"] == [] and "E1" not in empty
+    assert empty_data["answer_claims"][0]["cited_evidence_ids"] == []
 
 
-def test_judge_example_respects_the_sample_claims_actual_citation():
+def test_judge_payload_preserves_actual_citation_without_a_preselected_verdict():
     other = {"evidence_id": "E92", "file": "other.txt", "text": "Another fact."}
     prompt = build_grounding_judge_prompt("Inspect every hour [E7].", [other, *SOURCES], user_task=TASK)
-    example = json.JSONDecoder().raw_decode(prompt.split("Только JSON: ", 1)[1])[0]
-    assert example["claims"][0]["passage_ids"] == ["E7:P1"]
+    schema = json.JSONDecoder().raw_decode(prompt.split("JSON Schema: ", 1)[1])[0]
+    data = json.JSONDecoder().raw_decode(prompt[prompt.index('{"question":'):])[0]
+    assert data["answer_claims"][0]["cited_evidence_ids"] == ["E7"]
+    assert {item["evidence_id"] for item in data["evidence"]} == {"E92", "E7"}
+    assert "support" not in data["answer_claims"][0]
+    assert "passage_ids" not in data["answer_claims"][0]
+    assert "E7:P1" not in json.dumps(schema)
     no_citation = build_grounding_judge_prompt("Inspect every hour.", SOURCES, user_task=TASK)
-    row = json.JSONDecoder().raw_decode(no_citation.split("Только JSON: ", 1)[1])[0]["claims"][0]
-    assert row["support"] == "uncertain" and row["passage_ids"] == []
+    no_citation_data = json.JSONDecoder().raw_decode(no_citation[no_citation.index('{"question":'):])[0]
+    row = no_citation_data["answer_claims"][0]
+    assert row["cited_evidence_ids"] == []
+    assert "support" not in row and "passage_ids" not in row
 
 
-def test_empty_answer_does_not_invent_a_claim_in_judge_example():
+def test_empty_answer_has_no_actual_claim_or_prefilled_schema_row():
     prompt = build_grounding_judge_prompt("", SOURCES, user_task=TASK, excluded_topics=("Another topic",))
-    example = json.JSONDecoder().raw_decode(prompt.split("Только JSON: ", 1)[1])[0]
-    assert example == {"claims": []}
+    schema = json.JSONDecoder().raw_decode(prompt.split("JSON Schema: ", 1)[1])[0]
+    data = json.JSONDecoder().raw_decode(prompt[prompt.index('{"question":'):])[0]
+    assert data["answer_claims"] == []
+    assert schema["properties"]["claims"]["type"] == "array"
+    assert "claims" not in schema
 
 
 def test_headings_are_exact_catalogued_ancestors_once_not_copied_into_claim_text():

@@ -49,14 +49,17 @@ def request_scope(
 
 
 def current_subject() -> str | None:
+    """Return the request-local owner; None denotes the internal unscoped context."""
     return _request_subject.get()
 
 
 def current_is_admin() -> bool:
+    """Return the administrative flag installed by request_scope, not a database role lookup."""
     return _request_admin.get()
 
 
 def current_can_manage_global_documents() -> bool:
+    """Return the current request's explicit permission to modify the shared document registry."""
     return _request_global_document_manager.get()
 
 
@@ -81,6 +84,7 @@ def load_dotenv() -> None:
 
 
 def database_url() -> str:
+    """Resolve DATABASE_URL after optional local dotenv loading; fail instead of selecting another database."""
     load_dotenv()
     url = os.environ.get("DATABASE_URL", "").strip()
     if not url:
@@ -146,6 +150,7 @@ def close_thread_connection() -> None:
 
 
 def run_migrations() -> None:
+    """Apply unapplied ordered SQL files and refresh the document-version backfill when its schema exists."""
     migration_files = sorted(MIGRATIONS_DIR.glob("*.sql"))
     if not migration_files:
         return
@@ -174,6 +179,7 @@ def run_migrations() -> None:
 
 
 def ensure_default_workspace(default_mode: str, default_provider: str, default_model: str) -> dict:
+    """Load or create the current owner's initial project, chat and workspace settings, committing new rows."""
     conn = db()
     subject = current_subject()
     with conn.cursor() as cur:
@@ -217,6 +223,7 @@ def ensure_default_workspace(default_mode: str, default_provider: str, default_m
 
 
 def list_projects() -> list[dict]:
+    """List non-deleted projects visible to the current request owner in creation order."""
     subject = current_subject()
     with read_cursor() as cur:
         query = """
@@ -237,6 +244,7 @@ def list_projects() -> list[dict]:
 
 
 def create_project(payload: dict) -> dict:
+    """Create and commit an owner-bound project with normalized knowledge scope and JSON settings."""
     conn = db()
     subject = current_subject()
     with conn.cursor() as cur:
@@ -259,6 +267,7 @@ def create_project(payload: dict) -> dict:
 
 
 def get_project(project_id: str) -> dict | None:
+    """Return a non-deleted project owned by the current subject, or None when unavailable."""
     subject = current_subject()
     with read_cursor() as cur:
         if subject:
@@ -273,6 +282,7 @@ def get_project(project_id: str) -> dict | None:
 
 
 def update_project(project_id: str, payload: dict) -> dict | None:
+    """Update allowed project fields after ownership lookup; an inaccessible project returns None."""
     fields, values = _update_values(payload, ("name", "description"), ("settings", "memory"))
     if "knowledge_scope" in payload:
         fields.append("knowledge_scope = %s")
@@ -285,6 +295,7 @@ def update_project(project_id: str, payload: dict) -> dict | None:
 
 
 def delete_project(project_id: str) -> bool:
+    """Soft-delete an accessible project and detach its surviving chats in the same committed transaction."""
     if get_project(project_id) is None:
         return False
     conn = db()
@@ -303,6 +314,7 @@ def delete_project(project_id: str) -> bool:
 
 
 def list_chats(project_id: str | None = None) -> list[dict]:
+    """List the current owner's non-deleted chats, optionally restricted to one project."""
     query = "SELECT * FROM chats WHERE deleted_at IS NULL"
     params: list[object] = []
     subject = current_subject()
@@ -319,6 +331,7 @@ def list_chats(project_id: str | None = None) -> list[dict]:
 
 
 def create_chat(project_id: str | None, payload: dict, default_mode: str, default_provider: str, default_model: str) -> dict:
+    """Create and commit a free or project chat; reject an inaccessible parent project."""
     normalized_project_id = str(project_id or "").strip() or None
     if normalized_project_id is not None and get_project(normalized_project_id) is None:
         raise ValueError("project not found")
@@ -344,6 +357,7 @@ def create_chat(project_id: str | None, payload: dict, default_mode: str, defaul
 
 
 def get_chat(chat_id: str) -> dict | None:
+    """Resolve a non-deleted chat within the current request's owner scope."""
     subject = current_subject()
     with read_cursor() as cur:
         if subject:
@@ -358,6 +372,7 @@ def get_chat(chat_id: str) -> dict | None:
 
 
 def update_chat(chat_id: str, payload: dict) -> dict | None:
+    """Patch permitted chat fields and reject reassignment to an unavailable project."""
     if get_chat(chat_id) is None:
         return None
     fields, values = _update_values(payload, ("title", "mode", "provider", "model_name"), ("metadata",))
@@ -373,12 +388,14 @@ def update_chat(chat_id: str, payload: dict) -> dict | None:
 
 
 def delete_chat(chat_id: str) -> bool:
+    """Soft-delete an accessible chat; return False for a missing or inaccessible identifier."""
     if get_chat(chat_id) is None:
         return False
     return _soft_delete("chats", chat_id)
 
 
 def list_messages(chat_id: str) -> list[dict]:
+    """Return live messages in creation order only after checking access to the parent chat."""
     if get_chat(chat_id) is None:
         return []
     with read_cursor() as cur:
@@ -479,6 +496,7 @@ def get_project_conversation(chat_id: str, limit: int = 40) -> dict | None:
 
 
 def create_message(chat_id: str, payload: dict) -> dict:
+    """Persist a message in an accessible chat; the default status is complete, not a queue status."""
     if get_chat(chat_id) is None:
         raise ValueError("chat not found")
     conn = db()
@@ -501,6 +519,7 @@ def create_message(chat_id: str, payload: dict) -> dict:
 
 
 def get_message(message_id: str) -> dict | None:
+    """Resolve a live message through its owner's chat before allowing further operations."""
     subject = current_subject()
     with read_cursor() as cur:
         if subject:
@@ -517,6 +536,7 @@ def get_message(message_id: str) -> dict | None:
 
 
 def update_message(message_id: str, payload: dict) -> dict | None:
+    """Patch message text, status or metadata after access checking; preserve text whitespace."""
     if get_message(message_id) is None:
         return None
     fields, values = _update_values(payload, ("content", "content_html", "status"), ("metadata",), strip_text=False)
@@ -526,12 +546,14 @@ def update_message(message_id: str, payload: dict) -> dict | None:
 
 
 def delete_message(message_id: str) -> bool:
+    """Soft-delete a message only when its parent chat is accessible in the current scope."""
     if get_message(message_id) is None:
         return False
     return _soft_delete("messages", message_id)
 
 
 def list_documents(project_id: str | None = None, chat_id: str | None = None) -> list[dict]:
+    """List registry records visible in the requested project/chat scope, honoring project_only for projects."""
     subject = current_subject()
     query = "SELECT * FROM documents WHERE deleted_at IS NULL"
     params: list[object] = []
@@ -725,6 +747,7 @@ def _backfill_document_versions(conn: object) -> None:
 
 
 def create_document(project_id: str | None, chat_id: str | None, payload: dict) -> dict:
+    """Register a scoped upload, enforce shared-library management rights and rebuild its version chain."""
     subject = current_subject()
     project_id = project_id or None
     chat_id = chat_id or None
@@ -780,6 +803,7 @@ def create_document(project_id: str | None, chat_id: str | None, payload: dict) 
 
 
 def get_document(document_id: str) -> dict | None:
+    """Return a live document visible to its owner or through the shared library, allowing administrator lookup."""
     subject = current_subject()
     with read_cursor() as cur:
         if subject and not current_is_admin():
@@ -796,6 +820,7 @@ def get_document(document_id: str) -> dict | None:
 
 
 def update_document(document_id: str, payload: dict) -> dict | None:
+    """Patch permitted document fields, merge metadata and relink affected same-scope version families."""
     document = get_document(document_id)
     if document is None:
         return None
@@ -919,10 +944,12 @@ def document_sources(source_names: list[str]) -> dict[str, dict]:
 
 
 def get_workspace(default_mode: str, default_provider: str, default_model: str) -> dict:
+    """Return the current owner's workspace, creating the default workspace when absent."""
     return ensure_default_workspace(default_mode, default_provider, default_model)
 
 
 def update_workspace(payload: dict, default_mode: str, default_provider: str, default_model: str) -> dict:
+    """Patch workspace settings and active selections after validating ownership of referenced resources."""
     fields, values = _update_values(payload, (), ("settings",))
     if "active_project_id" in payload:
         project_id = str(payload.get("active_project_id") or "").strip() or None

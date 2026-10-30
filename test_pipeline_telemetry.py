@@ -53,8 +53,11 @@ class FakeHistogram:
 
 
 class HitCache:
+    def __init__(self, value):
+        self.value = value
+
     def get(self, _key: str):
-        return {"answer": "cached answer"}
+        return self.value
 
 
 class PipelineTelemetryTests(unittest.TestCase):
@@ -62,9 +65,13 @@ class PipelineTelemetryTests(unittest.TestCase):
         telemetry_tracer = FakeTracer()
         histogram = FakeHistogram()
         agent = object.__new__(rag_agent.RAGAgent)
-        agent.response_cache = HitCache()
         agent._generation_state = SimpleNamespace(from_cache=False)
         agent.llm_model = "test-model"
+        # Intentional runtime-cache contract: telemetry observes a legitimate
+        # producer-bound hit, not a legacy answer-only entry. No LLM is needed
+        # to render a valid cached response in this diagnostic-only agent.
+        agent.response_cache = HitCache({"answer": "cached answer",
+            "runtime_identity": agent._runtime_identity(None), "producer": agent._producer(None)})
 
         with patch.object(rag_agent, "tracer", return_value=telemetry_tracer), patch.object(
             rag_agent, "PIPELINE_SECONDS", histogram

@@ -108,6 +108,7 @@ async def generate_answer_job(ctx: dict, job_id: str, payload: dict | None = Non
 
 
 class WorkerSettings:
+    """ARQ generation queue configuration; durable messages and job records provide recovery after API restarts."""
     functions = [generate_answer_job]
     queue_name = GENERATION_QUEUE_NAME
     redis_settings = RedisSettings.from_dsn(os.getenv("RAG_REDIS_URL", "redis://localhost:6379/0"))

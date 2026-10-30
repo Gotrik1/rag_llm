@@ -12,6 +12,8 @@ from bisect import bisect_right
 from itertools import chain
 from typing import Any, Mapping, Sequence
 
+from table_context import parse_table_unit
+
 
 TARGET_PASSAGE_CHARS = 1200
 PRESERVE_PARAGRAPH_CHARS = 2400
@@ -258,7 +260,59 @@ def _safe_break(position: int, spans: list[tuple[int, int]], starts: list[int]) 
     return index < 0 or not spans[index][0] < position < spans[index][1]
 
 
+def _table_bound_units(text: str, split_plain):
+    """Preserve table-line bytes and their column context in every passage.
+
+    The unit carries its own complete provenance and header context. It can be
+    larger than a passage target, like an unsplittable formula, but cannot be
+    divided into apparently independent header/value quotations. Whitespace
+    outside units is retained as well so concatenated anchors remain verbatim.
+    """
+    if '[TABLE_ROW_V1]' not in text:
+        return None
+    runs, pending, found = [], [], False
+    # Only physical LF delimits serialized units; Unicode separators inside
+    # an otherwise valid JSON cell string must not break its table context.
+    for line in re.findall(r'[^\n]*\n|[^\n]+$', text):
+        if line.strip().startswith('[TABLE_ROW_V1]'):
+            if parse_table_unit(line.strip()) is None:
+                raise ValueError('invalid-table-unit')
+            if pending:
+                runs.append((False, ''.join(pending)))
+                pending = []
+            runs.append((True, line))
+            found = True
+        else:
+            pending.append(line)
+    if pending:
+        runs.append((False, ''.join(pending)))
+    if not found:
+        return None
+    result, prefix = [], ''
+    for table, run in runs:
+        if not run.strip():
+            if result:
+                result[-1] += run
+            else:
+                prefix += run
+            continue
+        units = [run] if table else split_plain(run)
+        if prefix and units:
+            units[0] = prefix + units[0]
+            prefix = ''
+        result.extend(units)
+    if prefix:
+        if result:
+            result[-1] += prefix
+        else:
+            result.append(prefix)
+    return result
+
+
 def _large_paragraph_units(text: str) -> list[str]:
+    table_units = _table_bound_units(text, _large_paragraph_units)
+    if table_units is not None:
+        return table_units
     if len(text) <= PRESERVE_PARAGRAPH_CHARS:
         return [text]
     spans = _math_spans(text)
@@ -289,6 +343,9 @@ def _large_paragraph_units(text: str) -> list[str]:
 
 
 def _passages(text: str) -> list[str]:
+    table_units = _table_bound_units(text, _passages)
+    if table_units is not None:
+        return table_units
     if not text.strip():
         return []
     spans = _math_spans(text)

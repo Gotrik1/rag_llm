@@ -1,3 +1,9 @@
+"""Compatibility HTTP adapter and request-time bindings for the RAG application.
+
+The production entry point is asgi_app. Question orchestration is delegated to
+question_service; remaining provider/settings handlers retain legacy contracts
+while their adapters migrate. Helpers here must not capture another chat's state.
+"""
 from __future__ import annotations
 
 import base64
@@ -9,6 +15,7 @@ import re
 import subprocess
 import threading
 import time
+import tempfile
 import uuid
 from contextlib import contextmanager
 from email.parser import BytesParser
@@ -21,6 +28,9 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 from urllib.error import URLError
 
+from application_services import ServiceError
+from question_service import QuestionService
+from types import SimpleNamespace
 from conversation_context import resolve_conversation_context
 from db_store import (
     close_thread_connection,
@@ -52,7 +62,10 @@ from document_catalog import annotate_document_versions, build_document_catalog_
 from domain_routing import infer_document_domains, normalize_retrieval_focus
 from evidence_selection import term_keys
 from llm_providers import DEFAULTS, ProviderLLM
+from provider_runtime import RuntimeConfigError, _endpoint
 from rag_agent import CACHE_VERSION, DATA_DIR, GROUNDED_SYSTEM_PROMPT, LLM_MODEL, OLLAMA_BASE_URL, QDRANT_URL, RAGAgent, TOP_K, _cleanup_formula_noise, clean_formula_artifacts, extract_formula_lines_from_texts, format_formula_for_display, is_document_occurrence_question, is_formula_question, refine_prism_query, source_locator, user_facing_source_name, validate_retrieval
+from rag_agent import _resolve_evidence_selection_mode
+from rag_agent import COVERAGE_SYSTEM_PROMPT
 from runtime_paths import MATHML_CACHE_DIR, STATE_DIR, UPLOAD_DIR
 from system_prompts import get_profile, profiles
 from opentelemetry.trace import Status, StatusCode
@@ -103,6 +116,7 @@ class RetrievalDocumentScope(tuple):
         source_domains: dict[str, tuple[str, ...]],
         source_versions: dict[str, str],
     ) -> "RetrievalDocumentScope":
+        """Preserve two-value tuple unpacking while attaching non-security retrieval metadata."""
         instance = super().__new__(cls, (excluded, aliases))
         instance.source_domains = source_domains
         instance.source_versions = source_versions
@@ -178,6 +192,7 @@ def _pipeline_span(
 _agent: RAGAgent | None = None
 _agent_lock = threading.Lock()
 _request_lock = threading.Lock()
+_provider_config_write_lock = threading.Lock()
 
 
 SWAGGER_UI_HTML = """<!doctype html>
@@ -207,29 +222,49 @@ SWAGGER_UI_HTML = """<!doctype html>
 
 
 def load_openapi_spec() -> dict:
-    try:
-        spec = json.loads(OPENAPI_SPEC_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise RuntimeError(f"Не удалось прочитать OpenAPI-спецификацию: {exc}") from exc
-    if not isinstance(spec, dict):
-        raise RuntimeError("OpenAPI-спецификация должна быть JSON-объектом.")
-    return spec
+    """Use the assembled live contract for both ASGI and compatibility Swagger."""
+    # Import lazily: ASGI itself imports this adapter only when a request needs it.
+    from asgi_app import app
+    return app.openapi()
 
 
 def load_provider_config() -> dict:
+    """Read the stored provider snapshot or use the initial local-model default."""
     try:
         config = json.loads(PROVIDERS_CONFIG_PATH.read_text(encoding="utf-8"))
-        return config if isinstance(config, dict) else {}
-    except (OSError, ValueError):
+        if not isinstance(config, dict):
+            raise ValueError("Invalid provider configuration")
+        return config
+    except FileNotFoundError:
         return {"provider": "ollama", "model": LLM_MODEL}
+    except (OSError, ValueError):
+        raise RuntimeError("Provider configuration is unavailable") from None
 
 
 def save_provider_config(config: dict) -> None:
-    PROVIDERS_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PROVIDERS_CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+    # Readers in API/ARQ processes see either complete version, never a
+    # truncated intermediate file. This lock protects writes, not generation.
+    """Publish a complete provider snapshot atomically for API and worker readers."""
+    encoded = json.dumps(config, ensure_ascii=False, allow_nan=False)
+    with _provider_config_write_lock:
+        PROVIDERS_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False,
+                    dir=PROVIDERS_CONFIG_PATH.parent, prefix=".provider-", suffix=".tmp") as handle:
+                temporary = Path(handle.name)
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, PROVIDERS_CONFIG_PATH)
+            temporary = None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
 
 def load_system_prompt_id() -> str:
+    """Read the selected prompt profile, falling back to the grounded profile."""
     try:
         payload = json.loads(SYSTEM_PROMPT_CONFIG_PATH.read_text(encoding="utf-8"))
         return str(payload.get("selected", "rag-grounded"))
@@ -238,11 +273,13 @@ def load_system_prompt_id() -> str:
 
 
 def save_system_prompt_id(prompt_id: str) -> None:
+    """Persist the selected prompt identifier for subsequent requests."""
     SYSTEM_PROMPT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     SYSTEM_PROMPT_CONFIG_PATH.write_text(json.dumps({"selected": prompt_id}), encoding="utf-8")
 
 
 def load_flow_mode() -> str:
+    """Read a supported processing mode and fail back to Python on invalid saved state."""
     try:
         mode = str(json.loads(FLOW_CONFIG_PATH.read_text(encoding="utf-8")).get("mode", "python"))
         return mode if mode in FLOW_MODES else "python"
@@ -251,6 +288,7 @@ def load_flow_mode() -> str:
 
 
 def storage_defaults() -> tuple[str, str, str]:
+    """Resolve default flow, provider and model for workspace initialization."""
     config = load_provider_config()
     return (
         load_flow_mode(),
@@ -276,6 +314,7 @@ def current_chat_user_messages(scope: dict, chat_id: str) -> list[dict]:
 
 
 def request_conversation_context(question: str, scope: dict, chat_id: str):
+    """Resolve user intent from the current chat window and the occurrence-query contract."""
     return resolve_conversation_context(
         question, current_chat_user_messages(scope, chat_id), chat_id=chat_id,
         occurrence_question=is_document_occurrence_question(question),
@@ -379,9 +418,11 @@ def enrich_answer_source_citations(answer: str, sources: list[dict]) -> str:
     pattern = re.compile(r"\[Источник:\s*([^\];]+?)(?:\s*(?:—|;)\s*(?:раздел:\s*)?([^\]]+?))?\]", re.IGNORECASE)
 
     def normalized_locator(value: object) -> str:
+        """Normalize locator punctuation before comparing model markers with document sections."""
         return re.sub(r"\s+", " ", str(value or "")).strip().strip(". ").casefold()
 
     def replace(match: re.Match[str]) -> str:
+        """Resolve a matched citation marker against the available source records."""
         name = user_facing_source_name(match.group(1).strip())
         candidates = by_name.get(name.casefold(), [])
         requested_section = (match.group(2) or "").strip().strip(". ")
@@ -434,6 +475,7 @@ def enrich_answer_source_citations(answer: str, sources: list[dict]) -> str:
     seen_inline: set[str] = set()
 
     def keep_first_citation(match: re.Match[str]) -> str:
+        """Retain the first rendered citation for each duplicate source marker."""
         key = match.group(1).casefold()
         if key in seen_inline:
             return ""
@@ -579,7 +621,13 @@ def context_is_shared_global(context: list[dict], shared_sources: set[str]) -> b
 
 
 def filter_scoped_context(items: list[dict], excluded_sources: set[str], allowed_sources: set[str] | None = None) -> list[dict]:
-    if not excluded_sources:
+    """Enforce source membership even when the exclusion set is empty.
+
+    ``None`` keeps the legacy unrestricted allowlist contract; an explicit empty
+    set permits no sources. Membership uses the physical upload basename, with
+    its UUID/version identity intact, rather than a shared display filename.
+    """
+    if not excluded_sources and allowed_sources is None:
         return items
     return [
         item for item in items
@@ -589,11 +637,13 @@ def filter_scoped_context(items: list[dict], excluded_sources: set[str], allowed
 
 
 def save_flow_mode(mode: str) -> None:
+    """Persist the processing mode after caller-side validation and cache invalidation."""
     FLOW_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     FLOW_CONFIG_PATH.write_text(json.dumps({"mode": mode}), encoding="utf-8")
 
 
 def _rust_command() -> list[str]:
+    """Choose the configured Rust binary or the repository development command."""
     configured = os.environ.get("RUST_CLI_PATH", "").strip()
     if configured:
         return [configured]
@@ -633,6 +683,7 @@ def _run_rust_json(command: str, question: str, *, flow: str = "rust") -> dict |
 
 
 def rust_context(question: str, *, flow: str = "rust") -> list[dict]:
+    """Normalize the Rust CLI context response into the compatibility evidence list."""
     payload = _run_rust_json("retrieve-json", question, flow=flow)
     if not isinstance(payload, list):
         raise RuntimeError("Некорректный retrieval-ответ Rust flow")
@@ -645,6 +696,7 @@ def rust_context(question: str, *, flow: str = "rust") -> list[dict]:
 
 
 def fuse_contexts(python_items: list[dict], rust_items: list[dict], top_k: int = TOP_K, *, flow: str = "hybrid") -> list[dict]:
+    """Accept supported adapter signatures before fusing authoritative Python and Rust evidence."""
     with _pipeline_span(
         "retrieval.cross_runtime_fusion",
         flow=flow,
@@ -663,20 +715,27 @@ def _fuse_contexts(python_items: list[dict], rust_items: list[dict], top_k: int 
     slots for the current UI knowledge base and use Rust evidence to complement
     it.  Exact duplicate chunks are removed and deleted evidence is rejected.
     """
+    from query_rank import native_identity
+    from table_context import map_table_prose
+
     selected: list[dict] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[object] = set()
 
     def add(items: list[dict], origin: str, limit: int) -> None:
+        """Append non-deleted evidence within the limit, preserving native source identities."""
         for raw in items:
             if len(selected) >= limit or raw.get("status") == "deleted":
                 continue
             item = dict(raw)
             item["flow_origin"] = origin
-            key = (
-                Path(str(item.get("file", ""))).name.lower(),
-                str(item.get("section_path", "")).strip().lower(),
-                re.sub(r"\s+", " ", str(item.get("text", "")))[:500].lower(),
-            )
+            text = str(item.get("text", ""))
+            if '[TABLE_ROW_V1]' in text:
+                map_table_prose(text, lambda prose: prose)  # Reject corrupt own-format bindings.
+            # Both prose and tables keep full text and native source/version/
+            # locator identity. A common prefix, basename or normalized case
+            # cannot establish that two source records are interchangeable.
+            identity = native_identity(item)
+            key = identity if identity is not None else object()
             if key in seen:
                 continue
             seen.add(key)
@@ -727,14 +786,17 @@ def rust_generate(
     project_context: str = "",
     *,
     cache_enabled: bool = False,
+    runtime=None,
 ) -> tuple[str, bool]:
+    """Adapt Rust generation arguments while preserving optional provider runtime snapshots."""
     with _pipeline_span(
         "rust.generate",
         flow="rust",
         attributes={"rag.context.count": len(context)},
     ) as span:
         answer, from_cache = _rust_generate(
-            question, context, project_context, cache_enabled=cache_enabled
+            question, context, project_context, cache_enabled=cache_enabled,
+            **({"runtime": runtime} if runtime is not None else {}),
         )
         span.set_attribute("rag.cache.hit", from_cache)
         span.set_attribute("rag.response.chars", len(answer))
@@ -747,7 +809,25 @@ def _rust_generate(
     project_context: str = "",
     *,
     cache_enabled: bool = False,
+    runtime=None,
 ) -> tuple[str, bool]:
+    """Generate against supplied evidence with shared caching only when explicitly enabled."""
+    agent = get_agent()
+    capture = getattr(agent, "capture_runtime", None)
+    if runtime is None and callable(capture):
+        runtime = capture(load_provider_config())
+    if runtime is not None:
+        # Rust's native generator cannot represent the complete provider,
+        # endpoint, auth and effective-settings snapshot. Keep its retrieved
+        # evidence, but dispatch generation through the exact Python adapter.
+        prompt = GROUNDED_SYSTEM_PROMPT
+        if project_context:
+            prompt += "\n\n" + project_context
+        answer = agent._generate_grounded_answer(
+            question, context, extract_formula_lines(context, question),
+            refine_prism_query(question), prompt, cache_enabled=cache_enabled, runtime=runtime,
+        )
+        return answer, bool(agent.last_generation_from_cache)
     context_text = "\n\n---\n\n".join(
         f"[Источник: {item.get('file', '?')}, Раздел: {item.get('section_path', '')}]\n{item.get('text', '')}"
         for item in context
@@ -791,6 +871,7 @@ def _rust_generate(
 
 
 def public_provider_config(config: dict) -> dict:
+    """Hide the stored API key while exposing its presence and a masked hint."""
     result = {key: value for key, value in config.items() if key != "api_key"}
     key = str(config.get("api_key", ""))
     result["has_api_key"] = bool(key)
@@ -799,6 +880,7 @@ def public_provider_config(config: dict) -> dict:
 
 
 def llm_label(config: dict | None = None) -> dict:
+    """Describe the configured producer for display; this label is not a connectivity probe."""
     config = load_provider_config() if config is None else config
     provider = str(config.get("provider", "ollama"))
     provider_names = {
@@ -814,13 +896,13 @@ def llm_label(config: dict | None = None) -> dict:
     return {"provider": provider, "model": model, "label": f"{runtime} · {model}"}
 
 
-def ollama_models() -> list[str]:
+def ollama_models(base_url: str | None = None) -> list[str]:
     """Return locally installed Ollama model names."""
     try:
-        with urlopen(f"{OLLAMA_BASE_URL.rstrip('/')}/api/tags", timeout=3) as response:
+        with urlopen(f"{(base_url or OLLAMA_BASE_URL).rstrip('/')}/api/tags", timeout=3) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (URLError, TimeoutError, ValueError, OSError) as exc:
-        raise RuntimeError(f"Ollama недоступен: {OLLAMA_BASE_URL}") from exc
+        raise RuntimeError("Ollama недоступен") from None
     # Embedding-only models (for example nomic-embed-text) cannot answer a chat
     # request, so keep the selector limited to completion-capable models.
     models = []
@@ -833,23 +915,24 @@ def ollama_models() -> list[str]:
 
 
 def get_agent() -> RAGAgent:
+    """Initialize one shared agent while retaining request-local generation state."""
     global _agent
     with _agent_lock:
         if _agent is None:
             _agent = RAGAgent()
-            config = load_provider_config()
-            if config.get("provider") and (config.get("provider") != "ollama" or config.get("model") != LLM_MODEL):
-                _agent.set_llm_provider(config)
+            _agent._runtime_config_reader = load_provider_config
         return _agent
 
 
 def render_text(value: str) -> str:
+    """Render Markdown and supported mathematical notation for the existing HTML display."""
     value = _cleanup_formula_noise(value or "")
     value = clean_formula_artifacts(value)
     value = cleanup_llm_markup(value)
     mathml_blocks: list[str] = []
 
     def stash_mathml(match: re.Match[str]) -> str:
+        """Store inline MathML temporarily while Markdown text is rendered."""
         try:
             mathml = base64.b64decode(match.group(1)).decode("utf-8")
         except Exception:
@@ -861,6 +944,7 @@ def render_text(value: str) -> str:
     value = re.sub(r"\[\[MATHML:([A-Za-z0-9+/=]+)\]\]", stash_mathml, value)
 
     def stash_mathml_ref(match: re.Match[str]) -> str:
+        """Resolve a stored MathML reference during display conversion."""
         ref = match.group(1)
         if not re.fullmatch(r"[a-f0-9]{24}", ref):
             return ""
@@ -882,6 +966,7 @@ def render_text(value: str) -> str:
     value = re.sub(r"\bИВО\b", "ИВ0", value)
 
     def formula(match: re.Match[str]) -> str:
+        """Normalize one matched mathematical fragment for the HTML renderer."""
         body = match.group(1)
         body = body.replace("\\", "")
         if "_sub(" in body:
@@ -913,6 +998,7 @@ def cleanup_llm_markup(value: str) -> str:
 
 
 def extract_formula_lines(chunks: list[dict], question: str = "") -> list[str]:
+    """Delegate extraction of the formula lines relevant to the supplied question."""
     return extract_formula_lines_from_texts([chunk.get("text", "") for chunk in chunks], question)
 
 
@@ -922,10 +1008,12 @@ def requested_response_formulas(chunks: list[dict], question: str) -> list[str]:
 
 
 def estimate_tokens(value: str) -> int:
+    """Return the existing approximate display/accounting token estimate."""
     return max(1, round(len(value or "") / 4))
 
 
 def usage_stats(answer: str = "", context: list[dict] | None = None) -> dict:
+    """Describe response/context size for the UI using the current estimate contract."""
     context_text = "\n".join(item.get("text", "") for item in (context or []))
     return {
         "answer_chars": len(answer or ""),
@@ -1201,14 +1289,65 @@ $("cacheBtn").onclick = async () => {
 """
 
 
+def _question_dependencies() -> SimpleNamespace:
+    """Capture request-time helper bindings, including supported adapter overrides."""
+    return SimpleNamespace(
+        COVERAGE_SYSTEM_PROMPT=COVERAGE_SYSTEM_PROMPT,
+        GROUNDED_SYSTEM_PROMPT=GROUNDED_SYSTEM_PROMPT,
+        LLM_MODEL=LLM_MODEL,
+        TOP_K=TOP_K,
+        _resolve_evidence_selection_mode=_resolve_evidence_selection_mode,
+        _writer_history=_writer_history,
+        build_document_catalog_answer=build_document_catalog_answer,
+        context_is_shared_global=context_is_shared_global,
+        contextualize_retrieval_question=contextualize_retrieval_question,
+        current_chat_user_messages=current_chat_user_messages,
+        domain_source_map=domain_source_map,
+        enrich_answer_source_citations=enrich_answer_source_citations,
+        enrich_source_links=enrich_source_links,
+        extract_formula_lines=extract_formula_lines,
+        filter_rust_context=filter_rust_context,
+        filter_scoped_context=filter_scoped_context,
+        format_formula_for_display=format_formula_for_display,
+        fuse_contexts=fuse_contexts,
+        get_agent=get_agent,
+        get_profile=get_profile,
+        get_project_conversation=get_project_conversation,
+        get_workspace=get_workspace,
+        is_document_catalog_question=is_document_catalog_question,
+        list_documents=list_documents,
+        llm_label=llm_label,
+        load_flow_mode=load_flow_mode,
+        load_provider_config=load_provider_config,
+        load_system_prompt_id=load_system_prompt_id,
+        normalize_retrieval_focus=normalize_retrieval_focus,
+        project_context_prompt=project_context_prompt,
+        refine_prism_query=refine_prism_query,
+        render_text=render_text,
+        request_conversation_context=request_conversation_context,
+        requested_response_formulas=requested_response_formulas,
+        retrieval_document_scope=retrieval_document_scope,
+        rust_context=rust_context,
+        rust_generate=rust_generate,
+        select_user_facing_sources=select_user_facing_sources,
+        shared_global_document_sources=shared_global_document_sources,
+        supported_retrieval_options=supported_retrieval_options,
+        usage_stats=usage_stats,
+        validate_retrieval=validate_retrieval,
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
+    """Compatibility HTTP routing; question use cases are delegated to QuestionService."""
     def finish(self) -> None:
+        """Always close the thread-local database connection after the legacy request finishes."""
         try:
             super().finish()
         finally:
             close_thread_connection()
 
     def do_GET(self) -> None:
+        """Route legacy read operations and preserve their existing response envelopes."""
         path = urlparse(self.path).path
         if path == "/docs":
             self.send_html(SWAGGER_UI_HTML)
@@ -1278,6 +1417,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"error": "not found"}, 404)
 
     def do_POST(self) -> None:
+        """Route legacy mutations while rolling back failed compatibility transactions."""
         try:
             path = urlparse(self.path).path
             if path == "/api/upload":
@@ -1328,6 +1468,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, 500)
 
     def do_PATCH(self) -> None:
+        """Dispatch workspace resource updates through the scoped persistence facade."""
         try:
             path = urlparse(self.path).path
             body = self.read_json()
@@ -1346,6 +1487,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, 500)
 
     def do_DELETE(self) -> None:
+        """Dispatch workspace resource deletion through the scoped persistence facade."""
         try:
             path = urlparse(self.path).path
             if path.startswith("/api/projects/") and path.count("/") == 3:
@@ -1363,10 +1505,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, 500)
 
     def handle_models(self) -> None:
+        """Expose model discovery while retaining the configured model on an auxiliary timeout."""
         saved = load_provider_config()
-        selected = _agent.llm_model if _agent is not None else (saved.get("model") if saved.get("provider") == "ollama" else LLM_MODEL)
+        selected = saved.get("model") if saved.get("provider") == "ollama" else LLM_MODEL
         try:
-            models = ollama_models()
+            models = ollama_models(base_url=str(saved.get("base_url") or OLLAMA_BASE_URL)
+                                   if saved.get("provider") == "ollama" else OLLAMA_BASE_URL)
             available = True
         except RuntimeError as exc:
             # Model discovery is auxiliary UI data.  During CPU-heavy OCR or
@@ -1382,23 +1526,27 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(payload)
 
     def handle_model_select(self, body: dict) -> None:
+        """Validate a local model choice before atomically publishing provider settings."""
         model = str(body.get("model", "")).strip()
-        models = ollama_models()
+        config = load_provider_config()
+        endpoint = str(config.get("base_url") or OLLAMA_BASE_URL) if config.get("provider") == "ollama" else OLLAMA_BASE_URL
+        models = ollama_models(base_url=endpoint)
         if model not in models:
             self.send_json({"error": "Выбранная модель не установлена в Ollama."}, 400)
             return
         with _request_lock:
-            agent = get_agent()
-            agent.set_llm_model(model)
             config = load_provider_config()
-            config.update({"provider": "ollama", "model": model, "base_url": OLLAMA_BASE_URL})
+            config.update({"provider": "ollama", "model": model, "base_url": endpoint})
             save_provider_config(config)
         self.send_json({"model": model})
 
     def handle_provider_get(self) -> None:
-        self.send_json({"config": public_provider_config(load_provider_config()), "defaults": DEFAULTS})
+        """Return masked provider settings and the supported default templates."""
+        self.send_json({"config": public_provider_config(load_provider_config()),
+            "defaults": {**DEFAULTS, "ollama": {"base_url": OLLAMA_BASE_URL, "model": LLM_MODEL}}})
 
     def handle_system_prompts(self) -> None:
+        """List public prompt-profile metadata without exposing full prompt contents."""
         available = profiles(GROUNDED_SYSTEM_PROMPT)
         selected = load_system_prompt_id()
         if not any(item["id"] == selected for item in available):
@@ -1409,6 +1557,7 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def handle_system_prompt_select(self, body: dict) -> None:
+        """Accept only a known prompt profile and persist its identifier."""
         prompt_id = str(body.get("prompt_id", "")).strip()
         available = profiles(GROUNDED_SYSTEM_PROMPT)
         if not any(item["id"] == prompt_id for item in available):
@@ -1418,6 +1567,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"selected": prompt_id})
 
     def handle_flow_mode(self, body: dict) -> None:
+        """Validate a flow switch and invalidate answers cached under the previous mode."""
         mode = str(body.get("mode", "")).strip()
         if mode not in FLOW_MODES:
             self.send_json({"error": "Неизвестный режим flow."}, 400)
@@ -1432,6 +1582,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"mode": mode, "cache_cleared": mode != previous_mode})
 
     def handle_provider_save(self, body: dict) -> None:
+        """Validate provider settings while preserving only same-provider stored credentials."""
         provider = str(body.get("provider", "")).strip()
         if provider not in {"ollama", *DEFAULTS}:
             self.send_json({"error": "Неподдерживаемый провайдер."}, 400)
@@ -1447,7 +1598,7 @@ class Handler(BaseHTTPRequestHandler):
         api_key = str(body.get("api_key", "")).strip()
         config["api_key"] = api_key or (str(previous.get("api_key", "")) if previous.get("provider") == provider else "")
         if provider == "ollama":
-            models = ollama_models()
+            models = ollama_models(base_url=config["base_url"] or OLLAMA_BASE_URL)
             if config["model"] not in models:
                 self.send_json({"error": "Выбранная модель не установлена в Ollama."}, 400)
                 return
@@ -1455,232 +1606,53 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "Укажите модель и API-ключ."}, 400)
             return
         with _request_lock:
-            get_agent().set_llm_provider(config)
             save_provider_config(config)
         self.send_json({"config": public_provider_config(config)})
 
     def handle_provider_test(self, body: dict) -> None:
+        """Probe supplied provider overrides without inheriting another provider credentials."""
         config = load_provider_config()
+        if "provider" in body and str(body["provider"]).strip() != config.get("provider"):
+            # A partial test request cannot inherit a previous provider's
+            # endpoint or credentials. Explicit custom endpoints remain valid.
+            config = {"provider": str(body["provider"]).strip()}
         for key in ("provider", "model", "base_url", "folder_id", "auth_type"):
             if key in body:
                 config[key] = str(body[key]).strip()
         if str(body.get("api_key", "")).strip():
             config["api_key"] = str(body["api_key"]).strip()
         if config.get("provider") == "ollama":
-            self.send_json({"message": f"Ollama: модель {config.get('model')} доступна."})
+            try:
+                endpoint = _endpoint(config.get("base_url") or OLLAMA_BASE_URL)
+            except RuntimeConfigError:
+                self.send_json({"error": "Укажите корректный HTTP(S) адрес Ollama без учётных данных, параметров и фрагмента."}, 400)
+                return
+            try:
+                models = ollama_models(base_url=endpoint)
+            except RuntimeError:
+                self.send_json({"error": "Не удалось подключиться к Ollama. Проверьте адрес сервера и повторите проверку."}, 503)
+                return
+            model = str(config.get("model") or LLM_MODEL)
+            if model not in models:
+                self.send_json({"error": "Выбранная модель не установлена в Ollama. Обновите список моделей."}, 400)
+                return
+            self.send_json({"message": f"Ollama доступен; модель {model} установлена. Генерация не проверялась."})
             return
         llm = ProviderLLM(**config)
         response = llm.complete("Ответь одним словом: OK")
         self.send_json({"message": f"Соединение успешно: {str(response).strip()[:120]}"})
 
     def handle_ask(self, body: dict) -> None:
-        question = str(body.get("question", "")).strip()
-        if not question:
-            self.send_json({"error": "empty question"}, 400)
+        """Translate the shared question use-case result into the legacy HTTP shape."""
+        try:
+            result = QuestionService(_question_dependencies()).answer(body)
+        except ServiceError as exc:
+            self.send_json({"error": exc.detail}, exc.status_code)
             return
-        chat_id = str(body.get("chat_id", "")).strip()
-        if not chat_id:
-            workspace = get_workspace(*storage_defaults())
-            chat_id = str(workspace.get("active_chat_id") or "").strip()
-        if not chat_id:
-            self.send_json({"error": "active chat not found"}, 409)
-            return
-        scope = get_project_conversation(chat_id)
-        if scope is None:
-            self.send_json({"error": "chat not found"}, 404)
-            return
-        if is_document_catalog_question(question):
-            started = time.time()
-            project_id = str(scope.get("project_id") or "").strip()
-            documents = list_documents(project_id or None, None if project_id else chat_id)
-            catalog = build_document_catalog_answer(
-                str(scope.get("project_name") or "Свободный чат"),
-                documents,
-            )
-            answer = str(catalog["answer"])
-            self.send_json({
-                "answer": answer,
-                "html_answer": render_text(answer),
-                "formulas": [],
-                "warnings": [],
-                "sources": catalog["sources"],
-                "documents": catalog["documents"],
-                "context": [],
-                "from_cache": False,
-                "llm": {
-                    "provider": "workspace",
-                    "model": "postgresql-registry",
-                    "label": "Реестр документов · PostgreSQL",
-                },
-                "flow_mode": "workspace",
-                "elapsed_s": time.time() - started,
-                "usage": usage_stats(answer, []),
-            })
-            return
-        retrieval_scope = retrieval_document_scope(scope, chat_id)
-        excluded_sources, source_aliases = retrieval_scope
-        source_domains = getattr(retrieval_scope, "source_domains", domain_source_map(source_aliases))
-        source_versions = getattr(retrieval_scope, "source_versions", {})
-        retrieval_focus = normalize_retrieval_focus(body.get("retrieval_focus"))
-        shared_sources = shared_global_document_sources()
-        priority_sources = {
-            source for source in source_aliases
-            if Path(source).name.casefold() not in shared_sources
-        }
-
-        mode = load_flow_mode()
-        agent = get_agent()
-        # Worker threads are reused across chats and flows. Thread-local state
-        # from a prior Python ask must not be exposed by Rust/hybrid or a
-        # cache-only adapter that does not populate fresh request diagnostics.
-        request_state = getattr(agent, "_generation_state", None)
-        if request_state is not None:
-            request_state.retrieval_trace = {}
-            request_state.retrieved_context = None
-        retrieval_question = contextualize_retrieval_question(question, scope, chat_id)
-        t0 = time.time()
-        profile = get_profile(load_system_prompt_id(), GROUNDED_SYSTEM_PROMPT)
-        scoped_prompt = f"{profile['prompt']}\n\n{project_context_prompt(scope, chat_id)}"
-        ask_domain_options = supported_retrieval_options(
-            agent.ask,
-            source_domains=source_domains,
-            source_versions=source_versions,
-            retrieval_focus=retrieval_focus,
-        )
-        retrieve_domain_options = supported_retrieval_options(
-            agent.retrieve_context,
-            source_domains=source_domains,
-            source_versions=source_versions,
-            retrieval_focus=retrieval_focus,
-        )
-        if mode == "python":
-            ask_options = {
-                "retrieval_query": retrieval_question,
-                "shared_cache_sources": shared_sources,
-                "shared_system_prompt": profile["prompt"],
-                "source_aliases": source_aliases,
-                "priority_sources": priority_sources,
-                **ask_domain_options,
-            }
-            if excluded_sources:
-                ask_options["excluded_sources"] = excluded_sources
-            answer, sources, from_cache = agent.ask(question, scoped_prompt, profile["id"], **ask_options)
-            context_reader = getattr(agent, "last_retrieved_context", None)
-            context = context_reader() if callable(context_reader) else None
-            # Keep compatibility with lightweight test doubles and external
-            # agents while production RAG reuses the exact evidence from ask().
-            if context is None:
-                context = agent.retrieve_context(
-                    retrieval_question,
-                    TOP_K,
-                    excluded_sources=excluded_sources or None,
-                    source_aliases=source_aliases,
-                    priority_sources=priority_sources,
-                    **retrieve_domain_options,
-                )
-        elif mode == "rust":
-            python_items = agent.retrieve_context(
-                retrieval_question,
-                TOP_K,
-                excluded_sources=excluded_sources or None,
-                source_aliases=source_aliases,
-                priority_sources=priority_sources,
-                **retrieve_domain_options,
-            )
-            rust_items = filter_scoped_context(
-                filter_rust_context(retrieval_question, rust_context(retrieval_question)), excluded_sources, set(source_aliases)
-            )
-            context = fuse_contexts(python_items, rust_items, max(TOP_K, len(python_items)))
-            cache_enabled = (
-                retrieval_question == question
-                and context_is_shared_global(context, shared_sources)
-            )
-            rust_result = rust_generate(
-                question,
-                context,
-                "" if cache_enabled else project_context_prompt(scope, chat_id),
-                cache_enabled=cache_enabled,
-            )
-            if isinstance(rust_result, tuple):
-                answer, from_cache = rust_result
-            else:  # Keeps the callable easy to mock in contract tests.
-                answer, from_cache = str(rust_result), False
-            sources = [{
-                "file": item["file"], "section": item.get("section_path", ""), "score": item["score"],
-                "text_preview": item["text"][:120],
-            } for item in context]
-        else:
-            python_items = agent.retrieve_context(
-                retrieval_question,
-                TOP_K,
-                excluded_sources=excluded_sources or None,
-                source_aliases=source_aliases,
-                priority_sources=priority_sources,
-                **retrieve_domain_options,
-            )
-            rust_items = filter_scoped_context(
-                filter_rust_context(retrieval_question, rust_context(retrieval_question)), excluded_sources, set(source_aliases)
-            )
-            context = fuse_contexts(python_items, rust_items, max(TOP_K, len(python_items)))
-            spec = refine_prism_query(question)
-            calculations = extract_formula_lines(context, question)
-            cache_enabled = (
-                retrieval_question == question
-                and context_is_shared_global(context, shared_sources)
-            )
-            answer = agent._generate_grounded_answer(
-                question,
-                context,
-                calculations,
-                spec,
-                profile["prompt"] if cache_enabled else scoped_prompt,
-                cache_enabled=cache_enabled,
-            )
-            from_cache = bool(getattr(agent, "last_generation_from_cache", False))
-            sources = [{"file": item["file"], "section": item.get("section_path", ""), "score": item["score"], "text_preview": item["text"][:120]} for item in context]
-        sources = enrich_source_links(sources)
-        answer = enrich_answer_source_citations(answer, sources)
-        sources = select_user_facing_sources(answer, sources)
-        formulas = requested_response_formulas(context, question)
-        warnings = validate_retrieval(question, context, answer)
-        trace_reader = getattr(agent,'last_retrieval_trace',None) if mode == 'python' else None
-        retrieval_trace = trace_reader() if callable(trace_reader) else {}
-        retrieval_trace = retrieval_trace if isinstance(retrieval_trace,dict) else {}
-        verification = retrieval_trace.get('verification',{})
-        latest_check = verification.get('after_repair',verification.get('initial',{}))
-        if retrieval_trace.get('mode')=='corrective' and latest_check and not latest_check.get('assessment_complete'):
-            warnings.append('Автоматическая проверка доказательств выполнена не полностью. Проверьте существенные выводы по ссылкам на документы.')
-        if retrieval_trace.get('mode')=='corrective' and not retrieval_trace.get('coverage_complete'):
-            warnings.append('Не все части вопроса удалось покрыть источниками. Ответ может быть неполным; проверьте ограничения и ссылки на документы.')
-        retrieval_trace['conversation_context'] = request_conversation_context(question,scope,chat_id).to_dict()
-        retrieval_trace['conversation_context']['history_window'] = {
-            'source':'active_chat_user_messages' if 'active_user_messages' in scope else 'legacy_message_feed',
-            'retained_user_turns':len(current_chat_user_messages(scope,chat_id)),
-            'limit':scope.get('active_user_history_limit'),
-            'truncated':bool(scope.get('active_user_history_truncated',False)),
-        }
-        retrieval_trace['conversation_context']['writer_history_window'] = _writer_history(scope,chat_id)[1]
-        response_llm = llm_label({"provider":retrieval_trace['provider'],"model":retrieval_trace['model']}) \
-            if retrieval_trace.get('mode')=='corrective' and retrieval_trace.get('model') else llm_label()
-        self.send_json({
-            "answer": answer,
-            "html_answer": render_text(answer),
-            "formulas": [{"text": f, "html": render_text(format_formula_for_display(f))} for f in formulas],
-            "warnings": warnings,
-            "retrieval_trace": retrieval_trace,
-            "sources": sources,
-            "context": [
-                {**c, "html_text": render_text(c["text"])}
-                for c in context
-            ],
-            "from_cache": from_cache,
-            "llm": {**response_llm, "label": f"{mode.title()} flow · {response_llm['label']}"},
-            "flow_mode": mode,
-            "elapsed_s": time.time() - t0,
-            "usage": usage_stats(answer, context),
-        })
+        self.send_json(result)
 
     def handle_debug(self, body: dict) -> None:
+        """Inspect scoped retrieval diagnostics without invoking the answer-generation path."""
         question = str(body.get("question", "")).strip()
         if not question:
             self.send_json({"error": "empty question"}, 400)
@@ -1706,34 +1678,44 @@ class Handler(BaseHTTPRequestHandler):
             if Path(source).name.casefold() not in shared_global_document_sources()
         }
         retrieval_question = contextualize_retrieval_question(question, scope, chat_id)
-        with _request_lock:
-            mode = load_flow_mode()
-            agent = get_agent()
-            retrieve_domain_options = supported_retrieval_options(
-                agent.retrieve_context,
-                source_domains=source_domains,
-                source_versions=source_versions,
-                retrieval_focus=retrieval_focus,
-            )
-            python_items = agent.retrieve_context(
-                retrieval_question,
-                TOP_K,
-                excluded_sources=excluded_sources or None,
-                source_aliases=source_aliases,
-                priority_sources=priority_sources,
-                **retrieve_domain_options,
-            )
-            rust_items = filter_scoped_context(
-                filter_rust_context(retrieval_question, rust_context(retrieval_question)),
-                excluded_sources,
-                set(source_aliases),
-            ) if mode != "python" else []
-            context = python_items if mode == "python" else fuse_contexts(python_items, rust_items, max(TOP_K, len(python_items)))
+        mode = load_flow_mode()
+        agent = get_agent()
+        capture = getattr(agent, "capture_runtime", None)
+        runtime = capture(load_provider_config()) if callable(capture) else None
+        retrieve_domain_options = supported_retrieval_options(
+            agent.retrieve_context, source_domains=source_domains,
+            source_versions=source_versions, retrieval_focus=retrieval_focus,
+            **({"runtime": runtime} if runtime is not None else {}),
+        )
+        # This is a fresh diagnostic request, not a replay of the last answer.
+        # Only the ordinary Python flow opts in; Rust/hybrid keep their contract.
+        retrieval_trace = {}
+        if mode == "python":
+            selection_mode, selection_source = _resolve_evidence_selection_mode(use_environment=True)
+            retrieval_trace.update(mode="legacy", selection_mode_requested=selection_mode,
+                selection_mode_source=selection_source, selection_mode="not_applied",
+                selection_applied=False)
+            selection_options = supported_retrieval_options(agent.retrieve_context,
+                selection_mode=selection_mode, retrieval_trace=retrieval_trace)
+            if selection_mode == "coverage" and "selection_mode" not in selection_options:
+                raise RuntimeError("Python debug adapter does not support the coverage selector")
+            retrieve_domain_options.update(selection_options)
+        python_items = agent.retrieve_context(
+            retrieval_question, TOP_K, excluded_sources=excluded_sources or None,
+            source_aliases=source_aliases, priority_sources=priority_sources,
+            **retrieve_domain_options,
+        )
+        rust_items = filter_scoped_context(
+            filter_rust_context(retrieval_question, rust_context(retrieval_question)),
+            excluded_sources, set(source_aliases),
+        ) if mode != "python" else []
+        context = python_items if mode == "python" else fuse_contexts(python_items, rust_items, max(TOP_K, len(python_items)))
         formulas = requested_response_formulas(context, question)
         warnings = validate_retrieval(question, context)
         self.send_json({
             "formulas": [{"text": f, "html": render_text(format_formula_for_display(f))} for f in formulas],
             "warnings": warnings,
+            "retrieval_trace": retrieval_trace,
             "context": [
                 {**c, "html_text": render_text(c["text"])}
                 for c in context
@@ -1743,11 +1725,13 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def handle_cache_clear(self) -> None:
+        """Invalidate cached responses through the active agent cache interface."""
         with _request_lock:
             get_agent().clear_cache()
         self.send_json({"message": "кэш ответов очищен"})
 
     def handle_load(self, body: dict) -> None:
+        """Run synchronous legacy ingestion for compatibility callers and queue workers."""
         raw_path = str(body.get("path", "")).strip()
         if not raw_path:
             self.send_json({"error": "empty path"}, 400)
@@ -1764,6 +1748,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"chunks": chunks})
 
     def handle_upload(self) -> None:
+        """Handle bounded legacy multipart uploads; the production ASGI upload uses DocumentService."""
         files = self.read_multipart_files()
         if not files:
             self.send_json({"error": "no files uploaded"}, 400)
@@ -1796,6 +1781,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def qdrant_error() -> str | None:
+        """Return a vector-storage readiness error without exposing query content."""
         try:
             with urlopen(f"{QDRANT_URL.rstrip('/')}/readyz", timeout=3) as response:
                 if response.status < 500:
@@ -1807,6 +1793,7 @@ class Handler(BaseHTTPRequestHandler):
         return f"Qdrant не запущен или недоступен: {QDRANT_URL}. Запусти Qdrant на порту 6333 и повтори загрузку."
 
     def read_multipart_files(self) -> list[dict]:
+        """Read the bounded multipart body and extract only accepted file parts."""
         content_type = self.headers.get("Content-Type", "")
         if "multipart/form-data" not in content_type:
             return []
@@ -1818,16 +1805,19 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def safe_upload_name(filename: str) -> str:
+        """Normalize legacy upload filenames without trusting client paths."""
         name = Path(filename).name.strip() or "upload.bin"
         name = re.sub(r"[^A-Za-zА-Яа-я0-9._ -]+", "_", name)
         return name[:180] or "upload.bin"
 
     def read_json(self) -> dict:
+        """Decode the request body according to the compatibility JSON contract."""
         length = int(self.headers.get("Content-Length", "0"))
         data = self.rfile.read(length).decode("utf-8")
         return json.loads(data or "{}")
 
     def send_html(self, html: str) -> None:
+        """Write one UTF-8 HTML response with its explicit content length."""
         payload = html.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1836,6 +1826,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def send_json(self, data: dict, status: int = 200) -> None:
+        """Write the compatibility JSON envelope and supplied HTTP status."""
         payload = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1845,10 +1836,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def log_message(self, fmt: str, *args: object) -> None:
+        """Suppress the base server's stderr access log for the compatibility adapter."""
         return
 
 
 def main() -> None:
+    """Start the standalone compatibility server; production deployments use asgi_app."""
     try:
         run_migrations()
         get_workspace(*storage_defaults())

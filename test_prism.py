@@ -305,6 +305,7 @@ class PrismQueryTests(unittest.TestCase):
             "score": 2.0,
             "section_path": "5 > Расчет",
             "parent_section": "5",
+            "status": "active",  # Processed retrieval rows carry computed status.
         }]
 
         expanded = relationship_expansion_results(nodes, ranked, "Как рассчитывается цена?", limit=4)

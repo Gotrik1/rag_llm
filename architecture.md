@@ -10,11 +10,11 @@ retained only for legacy development compatibility.
 flowchart LR
     U[Browser user]
     R[RAG Assistant]
-    I[OIDC identity provider]
-    D[DOCX PDF MD TXT]
+    I[Configured identity provider]
+    D[Documents and supported images]
     M[vLLM Qwen model]
     U -->|HTTPS questions uploads projects chats| R
-    R -->|validate bearer token and claims| I
+    R -->|local session or OIDC validation| I
     D -->|queued ingestion| R
     R -->|OpenAI-compatible generation| M
 ```
@@ -32,6 +32,11 @@ flowchart TB
     APP --> LB[llm-bridge]
     LB --> VL[vLLM GPU]
     APP -->|enqueue| RD
+    GW[generation-worker] -->|consume generation queue| RD
+    GW --> PG
+    GW --> LB
+    GW --> QD
+    GW --> BM
     IW[ingestion-worker single writer] -->|consume| RD
     IW --> PG
     IW --> QD
@@ -53,8 +58,12 @@ default; `proxy` and Grafana bind to loopback unless explicitly changed.
 
 | Component | Owns | Does not own |
 | --- | --- | --- |
-| FastAPI (`asgi_app.py`) | HTTP contract, OIDC/RBAC, request IDs, durable assistant-message lifecycle, upload validation, job API | retrieval algorithms |
-| Compatibility orchestration (`web_ui.py`) | chat-aware query contextualization, project prompt scope, Python/Rust flow selection, source enrichment and document isolation | persistence schema |
+| FastAPI (`asgi_app.py`) | HTTP validation, authentication/authorization, request IDs, service wiring, job API | retrieval algorithms and extracted document/generation state transitions |
+| Application services (`application_services.py`) | generation/message and document lifecycle, queue submission, upload validation and cleanup | FastAPI, HTTP response rendering |
+| Question service (`question_service.py`) | chat-aware query contextualization, prompt scope, Python/Rust flow selection, source enrichment | sockets and HTTP response writes |
+| Compatibility adapter (`web_ui.py`) | legacy dispatch, helper bindings, source visibility and link adapters; remaining settings/provider/debug orchestration | persistence schema |
+| API contract (`api_openapi.py`) | registered FastAPI schema plus explicit legacy-operation descriptions | runtime permissions and response filtering |
+| Source presentation (`answer_sources.py`) | shared source preview/section and nullable score serialization | evidence selection and ranking |
 | RAG agent (`rag_agent.py`) | section-aware chunking, Qdrant/BM25 retrieval, reranking, prompt construction, exact answer cache keys, formula cleanup | project/chat lifecycle |
 | PostgreSQL (`db_store.py`) | projects, chats, messages, document registry, policies, roles, jobs/audit references | vector content |
 | ARQ worker (`ingestion_worker.py`) | single-writer ingestion execution, cancellation, progress and terminal status | interactive answers |
@@ -69,21 +78,24 @@ sequenceDiagram
     participant UI as React UI
     participant API as FastAPI
     participant DB as PostgreSQL
+    participant Queue as ARQ queue
     participant RAG as RAG worker thread
     UI->>DB: POST user message through API
     UI->>API: POST /api/ask with chat_id
     API->>DB: insert assistant status=running
-    API->>RAG: start server-owned task
+    alt Durable generation enabled
+        API->>Queue: enqueue before generation
+        Queue->>RAG: generation worker claims job
+    else Non-durable compatibility mode
+        API->>RAG: start shielded server-owned task
+    end
     alt Browser remains connected
         RAG-->>API: answer and evidence
         API->>DB: assistant status=complete/error
         API-->>UI: answer + message_id
     else Browser refreshes or disconnects
         UI-xAPI: HTTP delivery cancelled
-        API->>Queue: persist generation job
-        Queue->>RAG: generation worker claims job
-        RAG-->>API: result persists independently of API process
-        API->>DB: assistant status=complete/error
+        RAG->>DB: persist assistant status=complete/error
         UI->>DB: reload chat messages through API
         loop while assistant status=running
             UI->>DB: poll chat messages every 1.5 s through API
@@ -93,9 +105,13 @@ sequenceDiagram
 
 The browser never owns the authoritative assistant record. A refresh can stop
 delivery to that browser, but it does not cancel the server-owned task. A full
-service/process restart is a different failure mode and requires a future
-durable generation queue if zero-loss in-flight generation across deployments
-is required.
+service/process restart is a different failure mode. With
+`RAG_DURABLE_GENERATION=true`, the job is submitted before generation to the
+separate ARQ generation queue and processed by `generation-worker`. The diagram
+shows the user-visible recovery behavior; enqueueing is not triggered by a
+disconnect. In non-durable mode, `asyncio.shield` protects delivery cancellation
+only; process death can still interrupt in-flight work. Neither mode promises
+exactly-once external model execution.
 
 ## Ingestion lifecycle
 
@@ -118,9 +134,11 @@ transactional/immutable index service before increasing concurrency.
 
 ## Retrieval and prompt budget
 
-The prompt contains the system policy, bounded project memory/history, the user
-question, and up to `TOP_K=10` selected evidence chunks. It never injects an
-entire project corpus into the system prompt. Retrieval combines:
+The prompt contains system policy, bounded project memory/history, the question
+and selected evidence. `TOP_K=10` is a retrieval default, not a universal bound
+on all reference expansion or packing modes. Coverage mode additionally checks
+the complete model input budget. The whole project corpus is not injected into
+the system prompt. Retrieval combines:
 
 - section/formula/exact-concept seed matches;
 - vector candidates from Qdrant;
@@ -154,6 +172,10 @@ the source came through the registry. React renders Markdown/GFM and KaTeX;
 legacy HTML formulas use sanitized MathJax rendering. Raw document HTML is not
 executed.
 
+Ranking score may be absent or null for canonical sections. It is metadata, not
+evidence validity; the API must not invent a zero or discard a section merely
+because its rank was not measured.
+
 ## Persistence and scaling boundaries
 
 - PostgreSQL is the source of truth for product/session state.
@@ -165,8 +187,19 @@ executed.
 
 ## Security boundaries
 
-Production uses OIDC bearer validation and policy checks. Secrets are mounted as
+Authentication uses configured local sessions with CSRF protection or OIDC
+bearer validation, followed by policy checks. Secrets are mounted as
 Compose files and converted to process environment only inside the container
 entrypoint. Nginx enforces body limits, request rate limits, security headers,
 and disabled SSE buffering. Logs/traces must contain operation metadata, not
 prompts, document chunks, answers, bearer tokens, or secret values.
+
+## Developer handoff and remaining debt
+
+See [Developer handoff](docs/DEVELOPER_HANDOFF_RU.md) for verified local checks,
+module contracts and staged refactoring priorities. The service boundary is
+incremental: the question service still receives compatibility helpers from
+`web_ui`, and the large RAG/selector/UI modules require further decomposition.
+See [API contract](docs/API_CONTRACT.md) for Swagger maintenance and the legacy
+operation allowlist. Rust standalone `Agent::ask` is a CLI experiment, not the
+tenant-aware HTTP cache or authorization boundary.

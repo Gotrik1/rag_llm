@@ -1,0 +1,6 @@
+# Development/CI entry point: collect both pytest functions and unittest cases.
+# Pytest 9 includes unittest subtest support without a separate plugin.
+-r requirements.docker.txt
+pytest>=9.1,<10
+coverage>=7.6,<8
+jsonschema>=4,<5

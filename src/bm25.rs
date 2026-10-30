@@ -1,4 +1,7 @@
-/// BM25 полнотекстовый поиск через Tantivy.
+//! Tantivy BM25 index for the standalone Rust path, separate from Python BM25.
+//!
+//! Documents carry source, section and text fields but no user/project ACL.
+//! `add_doc` appends; callers own deduplication, deletion and corpus lifecycle.
 use anyhow::Result;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
@@ -6,6 +9,7 @@ use tantivy::schema::*;
 use tantivy::{doc, Index, IndexWriter, ReloadPolicy};
 use std::path::Path;
 
+/// A persisted Tantivy index with fixed source/section/text field bindings.
 pub struct Bm25Index {
     index: Index,
     chunk_id_field: Field,
@@ -15,6 +19,7 @@ pub struct Bm25Index {
 }
 
 impl Bm25Index {
+    /// Open `tantivy_index` below the supplied directory, creating it if absent.
     pub fn open_or_create(dir: &str) -> Result<Self> {
         let path = Path::new(dir).join("tantivy_index");
         std::fs::create_dir_all(&path)?;
@@ -35,10 +40,12 @@ impl Bm25Index {
         Ok(Self { index, chunk_id_field, source_field, section_field, text_field })
     }
 
+    /// Allocate a writer with a 50 MB indexing memory budget.
     pub fn writer(&self) -> Result<IndexWriter> {
         Ok(self.index.writer(50_000_000)?)
     }
 
+    /// Stage one document; no replacement or duplicate-source detection occurs.
     pub fn add_doc(
         &self,
         writer: &mut IndexWriter,
@@ -56,6 +63,7 @@ impl Bm25Index {
         Ok(())
     }
 
+    /// Commit staged documents; readers use Tantivy's delayed reload policy.
     pub fn commit(writer: &mut IndexWriter) -> Result<()> {
         writer.commit()?;
         Ok(())
@@ -95,6 +103,7 @@ impl Bm25Index {
         self.collect_results(&searcher, &query, top_k)
     }
 
+    /// Open a reader whose committed index changes are refreshed with a delay.
     fn reader(&self) -> Result<tantivy::IndexReader> {
         Ok(self.index
             .reader_builder()
@@ -122,6 +131,7 @@ impl Bm25Index {
     }
 }
 
+/// Stored evidence fields plus Tantivy's query-dependent lexical score.
 pub struct Bm25Result {
     pub chunk_id: usize,
     pub source: String,
@@ -130,6 +140,7 @@ pub struct Bm25Result {
     pub score: f32,
 }
 
+/// Treat user punctuation as literal text rather than Tantivy query operators.
 fn escape_query(s: &str) -> String {
     let special = ['+', '-', '!', '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':', '\\', '/'];
     let mut out = String::with_capacity(s.len() * 2);

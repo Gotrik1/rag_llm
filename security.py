@@ -25,6 +25,7 @@ class AuthorizationError(Exception):
 
 @dataclass(frozen=True)
 class Principal:
+    """Immutable authenticated subject, grants and attributes passed across the authorization boundary."""
     subject: str
     roles: frozenset[str] = field(default_factory=frozenset)
     permissions: frozenset[str] = field(default_factory=frozenset)
@@ -33,7 +34,10 @@ class Principal:
 
 
 class IdentityProvider(Protocol):
-    def authenticate(self, authorization: str | None) -> Principal: ...
+    """Adapter contract for turning an Authorization header into a principal or AuthenticationError."""
+    def authenticate(self, authorization: str | None) -> Principal:
+        """Validate adapter-specific credentials and return the authenticated subject and mapped grants."""
+        ...
 
 
 class DevelopmentIdentityProvider:
@@ -43,6 +47,7 @@ class DevelopmentIdentityProvider:
         self.bootstrap_subject = bootstrap_subject
 
     def authenticate(self, authorization: str | None) -> Principal:
+        """Interpret the test/development token format; missing headers use the configured bootstrap identity."""
         if not authorization:
             return Principal(
                 subject=self.bootstrap_subject,
@@ -87,6 +92,7 @@ class OidcIdentityProvider:
         return frozenset()
 
     def authenticate(self, authorization: str | None) -> Principal:
+        """Validate JWT signature, issuer, audience and required time/subject claims before mapping grants."""
         scheme, _, token = (authorization or "").partition(" ")
         if scheme.lower() != "bearer" or not token:
             raise AuthenticationError("Expected a Bearer token")
@@ -107,6 +113,7 @@ class OidcIdentityProvider:
 
 @lru_cache(maxsize=2)
 def configured_identity_provider() -> IdentityProvider:
+    """Build and cache the configured development or OIDC adapter; reject unsupported authentication modes."""
     mode = os.getenv("RAG_AUTH_MODE", "development").lower()
     if mode == "development":
         return DevelopmentIdentityProvider(os.getenv("BOOTSTRAP_SUPERADMIN_SUBJECT", "rag-superadmin"))

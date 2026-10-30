@@ -1,3 +1,4 @@
+/** Same-origin cookie/CSRF transport. Browser timeouts do not cancel durable server jobs. */
 type ApiErrorPayload = {
   error?: string;
   detail?: string;
@@ -5,10 +6,12 @@ type ApiErrorPayload = {
 
 let csrfToken = "";
 
+/** Install the current session token in memory; session cookies remain browser-managed. */
 export function setCsrfToken(value?: string | null): void {
   csrfToken = value?.trim() ?? "";
 }
 
+/** Drop the mutation token when the UI leaves an authenticated session. */
 export function clearCsrfToken(): void {
   csrfToken = "";
 }
@@ -67,6 +70,7 @@ async function request<T>(
   }
 }
 
+/** POST JSON with the current session and a bounded browser wait. */
 export function postJson<T>(path: string, body: unknown, timeoutMs: number): Promise<T> {
   return request<T>(
     path,
@@ -80,6 +84,7 @@ export function postJson<T>(path: string, body: unknown, timeoutMs: number): Pro
   );
 }
 
+/** Upload multipart data; fetch supplies its boundary instead of a hard-coded content type. */
 export function postFormData<T>(path: string, body: FormData, timeoutMs: number): Promise<T> {
   return request<T>(
     path,
@@ -89,6 +94,7 @@ export function postFormData<T>(path: string, body: FormData, timeoutMs: number)
   );
 }
 
+/** Read fresh API state without reusing a browser HTTP-cache response. */
 export function getJson<T>(path: string, timeoutMs: number): Promise<T> {
   return request<T>(
     path,
@@ -98,6 +104,7 @@ export function getJson<T>(path: string, timeoutMs: number): Promise<T> {
   );
 }
 
+/** PATCH JSON with the shared session, CSRF and error-handling contract. */
 export function patchJson<T>(path: string, body: unknown, timeoutMs: number): Promise<T> {
   return request<T>(
     path,
@@ -111,6 +118,7 @@ export function patchJson<T>(path: string, body: unknown, timeoutMs: number): Pr
   );
 }
 
+/** DELETE with CSRF protection; callers still own user-visible confirmation and state updates. */
 export function deleteJson<T>(path: string, timeoutMs: number): Promise<T> {
   return request<T>(
     path,

@@ -8,7 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from corrective_rag import EvidenceSelection, SearchPlan, assess_coverage, generation_prompt, run_corrective
+from corrective_rag import (EvidenceSelection, SearchPlan, assess_coverage, generation_prompt,
+                            preference_retention_limits, run_corrective)
 from evidence_anchors import (evidence_anchor_payload, inventory_limits_after_filter,
                               inventory_carrier_signals, normalize_inventory_evidence,
                               normalize_inventory_selection_limits)
@@ -218,7 +219,9 @@ def test_agent_select_callback_allocates_fresh_metadata_for_every_invocation(mon
                  'matching_explicit_sources': lambda *args: set(), 'TOP_K': 10, 'os': os,
                  'filter_scoped_evidence': lambda evidence, *args, **kwargs: evidence,
                  'refine_prism_query': lambda *args: None, 'EvidenceSelection': EvidenceSelection,
-                 'SearchFocus': SearchFocus}
+                 'SearchFocus': SearchFocus,
+                 'request_query_ranks': None,
+                 'preference_retention_limits': preference_retention_limits}
     exec(compile(ast.Module(body=[callback], type_ignores=[]), '<agent select callback>', 'exec'), namespace)
     first, second = (namespace['select'](QUESTION, [], [], search_focus=None, constraint_question=QUESTION)
                      for _ in range(2))

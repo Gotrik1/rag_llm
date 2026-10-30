@@ -18,6 +18,7 @@ from runtime_paths import UPLOAD_DIR
 
 
 async def ingest_document_job(ctx: dict, job_id: str, payload: dict | None = None) -> dict:
+    """Run extraction/indexing in a cancellable subprocess and persist consistent job/document terminal states."""
     del ctx
     store = get_store()
     job = await asyncio.to_thread(store.get_job, job_id)
@@ -211,11 +212,13 @@ async def delete_document_job(ctx: dict, job_id: str, payload: dict | None = Non
 
 
 async def purge_expired_audit_events(ctx: dict) -> int:
+    """Run the configured audit-retention cleanup outside the event-loop thread."""
     del ctx
     return await asyncio.to_thread(get_store().purge_audit, int(os.getenv("RAG_AUDIT_RETENTION_DAYS", "90")))
 
 
 class WorkerSettings:
+    """ARQ ingestion/deletion worker configuration; the persisted BM25 docstore requires a single writer."""
     functions = [ingest_document_job, delete_document_job]
     queue_name = INGESTION_QUEUE_NAME
     cron_jobs = [cron(purge_expired_audit_events, hour=3, minute=15)]

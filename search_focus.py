@@ -20,6 +20,7 @@ FocusStatus = Literal['valid', 'absent', 'rejected']
 
 
 class SearchOperation(str, Enum):
+    """Supported task operations for planning search without assuming an answer or document."""
     LOOKUP = 'lookup'
     ENUMERATE = 'enumerate'
     COMPARE = 'compare'
@@ -54,6 +55,7 @@ def _key(value: str) -> str:
 
 @dataclass(frozen=True)
 class SearchSubject:
+    """A validated requested subject with bounded alternative search phrases, not asserted synonyms."""
     text: str
     alternatives: tuple[str, ...] = ()
 
@@ -71,6 +73,7 @@ class SearchSubject:
 
 @dataclass(frozen=True)
 class SearchFocus:
+    """A validated operation and distinct subjects used to guide retrieval while retaining user-task constraints."""
     operation: SearchOperation
     subjects: tuple[SearchSubject, ...]
 
@@ -87,6 +90,7 @@ class SearchFocus:
 
 @dataclass(frozen=True)
 class FocusParseResult:
+    """Explicit accepted, absent or rejected focus outcome with a diagnostic reason."""
     focus: SearchFocus | None
     status: FocusStatus
     reason: str | None = None

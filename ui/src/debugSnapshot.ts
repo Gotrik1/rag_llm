@@ -1,3 +1,23 @@
+/** Durable answer evidence is independent of retrieval rank: native reads have none. */
+export type ApiContextChunk = {
+  file: string;
+  section_path?: string;
+  chunk_type?: string;
+  status?: string;
+  score?: number | null;
+  text: string;
+  html_text?: string;
+  flow_origin?: "python" | "rust";
+};
+
+/** Validate mandatory source content; a present rank must be a finite number. */
+export function isApiContextChunk(value: unknown): value is ApiContextChunk {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const chunk = value as Record<string, unknown>;
+  return typeof chunk.file === "string" && typeof chunk.text === "string"
+    && (chunk.score == null || (typeof chunk.score === "number" && Number.isFinite(chunk.score)));
+}
+
 type SnapshotCarrier = {
   chat_id?: string;
   message_id?: string;

@@ -10,7 +10,7 @@ vi.mock("@assistant-ui/react", async () => {
   const { createElement } = await import("react");
   return {
     AssistantRuntimeProvider: ({ children }: { children?: import("react").ReactNode }) => createElement("div", null, children),
-    useExternalStoreRuntime: vi.fn(() => ({})),
+    useExternalStoreRuntime: vi.fn(() => ({ threads: { getState: () => ({}) } })),
     ThreadPrimitive: { Root: "div", Viewport: "div", Empty: "div", Messages: () => null, ViewportFooter: "div" },
     ComposerPrimitive: {
       Root: "div",

@@ -1,0 +1,1728 @@
+{
+  "mode": "retrieval-only",
+  "minimum_retrieval_recall": 1.0,
+  "passed": false,
+  "retrieval": {
+    "source_recall": 0.7306,
+    "locator_recall": 0.9333,
+    "mean_reciprocal_rank": 0.5055
+  },
+  "results": [
+    {
+      "id": "price-category-concept-01",
+      "retrieval": {
+        "source_recall": 0.6667,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 7.081,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "price-category-concept-02",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.4833,
+        "latency_s": 8.145,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "price-category-concept-03",
+      "retrieval": {
+        "source_recall": 0.6667,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 7.608,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "price-category-concept-04",
+      "retrieval": {
+        "source_recall": 0.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.0,
+        "latency_s": 7.593,
+        "candidate_count": 1,
+        "missing_sources": [
+          "04.05.2012 N 442",
+          "29.12.2011 N 1179",
+          "Методика расчета стоимости 1-6ЦК"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "price-category-concept-05",
+      "retrieval": {
+        "source_recall": 0.6667,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 5.929,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "price-category-concept-06",
+      "retrieval": {
+        "source_recall": 0.6667,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 7.214,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "price-category-concept-07",
+      "retrieval": {
+        "source_recall": 0.6667,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 6.001,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "price-category-concept-08",
+      "retrieval": {
+        "source_recall": 0.6667,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 6.835,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "second-category-law-01",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.375,
+        "latency_s": 8.934,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "second-category-law-02",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 7.161,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "second-category-law-03",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.6,
+        "latency_s": 8.648,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "second-category-law-04",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 7.68,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "second-category-law-05",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.25,
+        "latency_s": 9.149,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "second-category-law-06",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 7.946,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "second-category-law-07",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.6,
+        "latency_s": 8.333,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "second-category-law-08",
+      "retrieval": {
+        "source_recall": 0.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.0,
+        "latency_s": 5.636,
+        "candidate_count": 10,
+        "missing_sources": [
+          "04.05.2012 N 442",
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "sixth-category-services-01",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 8.603,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "sixth-category-services-02",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 7.415,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "sixth-category-services-03",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 9.099,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "sixth-category-services-04",
+      "retrieval": {
+        "source_recall": 0.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.0,
+        "latency_s": 6.506,
+        "candidate_count": 10,
+        "missing_sources": [
+          "Методика расчета стоимости 1-6ЦК"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "sixth-category-services-05",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 7.971,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "sixth-category-services-06",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 9.568,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "sixth-category-services-07",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.25,
+        "latency_s": 8.438,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "sixth-category-services-08",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 7.543,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "transmission-calculation-01",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 5.71,
+        "candidate_count": 10,
+        "missing_sources": [
+          "Методика расчета стоимости 1-6ЦК"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "transmission-calculation-02",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 9.3,
+        "candidate_count": 10,
+        "missing_sources": [
+          "Методика расчета стоимости на передачу"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "transmission-calculation-03",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 5.771,
+        "candidate_count": 10,
+        "missing_sources": [
+          "Методика расчета стоимости 1-6ЦК"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "transmission-calculation-04",
+      "retrieval": {
+        "source_recall": 0.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.0,
+        "latency_s": 7.424,
+        "candidate_count": 10,
+        "missing_sources": [
+          "Методика расчета стоимости на передачу",
+          "Методика расчета стоимости 1-6ЦК"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "transmission-calculation-05",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.6667,
+        "latency_s": 5.432,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "transmission-calculation-06",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 5.373,
+        "candidate_count": 10,
+        "missing_sources": [
+          "Методика расчета стоимости 1-6ЦК"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "transmission-calculation-07",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.25,
+        "latency_s": 7.803,
+        "candidate_count": 10,
+        "missing_sources": [
+          "Методика расчета стоимости на передачу"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "transmission-calculation-08",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5625,
+        "latency_s": 10.809,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "compare-fourth-fifth-01",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.6,
+        "latency_s": 8.052,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "compare-fourth-fifth-02",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.25,
+        "latency_s": 6.965,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "compare-fourth-fifth-03",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.6,
+        "latency_s": 8.354,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "compare-fourth-fifth-04",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.6,
+        "latency_s": 8.12,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "compare-fourth-fifth-05",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.6667,
+        "latency_s": 8.446,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "compare-fourth-fifth-06",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.2917,
+        "latency_s": 8.893,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "compare-fourth-fifth-07",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.6,
+        "latency_s": 7.236,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "compare-fourth-fifth-08",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 5.578,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "advances-01",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 5.698,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "advances-02",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 5.28,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "advances-03",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 5.435,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "advances-04",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 6.076,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "advances-05",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 0.0,
+        "mean_reciprocal_rank": 0.1111,
+        "latency_s": 5.514,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [
+          "4.1.2.1 Авансы"
+        ],
+        "error": ""
+      }
+    },
+    {
+      "id": "advances-06",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 4.251,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "advances-07",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 6.082,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "advances-08",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 7.218,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "punce-01",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 5.443,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "punce-02",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.1667,
+        "latency_s": 6.827,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "punce-03",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.25,
+        "latency_s": 7.625,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "punce-04",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.0833,
+        "latency_s": 6.268,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "punce-05",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.1667,
+        "latency_s": 6.959,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "punce-06",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.0625,
+        "latency_s": 7.103,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "punce-07",
+      "retrieval": {
+        "source_recall": 0.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.0,
+        "latency_s": 4.625,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179",
+          "Методика расчета стоимости 1-6ЦК"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "punce-08",
+      "retrieval": {
+        "source_recall": 0.5,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 6.591,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "electricity-price-composition-01",
+      "retrieval": {
+        "source_recall": 0.6667,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.15,
+        "latency_s": 5.273,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "electricity-price-composition-02",
+      "retrieval": {
+        "source_recall": 0.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.0,
+        "latency_s": 8.208,
+        "candidate_count": 10,
+        "missing_sources": [
+          "Методика расчета стоимости 1-6ЦК",
+          "29.12.2011 N 1179",
+          "04.05.2012 N 442"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "electricity-price-composition-03",
+      "retrieval": {
+        "source_recall": 0.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.0,
+        "latency_s": 10.686,
+        "candidate_count": 10,
+        "missing_sources": [
+          "Методика расчета стоимости 1-6ЦК",
+          "29.12.2011 N 1179",
+          "04.05.2012 N 442"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "electricity-price-composition-04",
+      "retrieval": {
+        "source_recall": 0.6667,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.1778,
+        "latency_s": 5.726,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "electricity-price-composition-05",
+      "retrieval": {
+        "source_recall": 0.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.0,
+        "latency_s": 6.382,
+        "candidate_count": 10,
+        "missing_sources": [
+          "Методика расчета стоимости 1-6ЦК",
+          "29.12.2011 N 1179",
+          "04.05.2012 N 442"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "electricity-price-composition-06",
+      "retrieval": {
+        "source_recall": 0.6667,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.4167,
+        "latency_s": 5.223,
+        "candidate_count": 10,
+        "missing_sources": [
+          "04.05.2012 N 442"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "electricity-price-composition-07",
+      "retrieval": {
+        "source_recall": 0.6667,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 8.156,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "electricity-price-composition-08",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5111,
+        "latency_s": 6.58,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "contract-conditions-01",
+      "retrieval": {
+        "source_recall": 0.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.0,
+        "latency_s": 6.414,
+        "candidate_count": 10,
+        "missing_sources": [
+          "Методика расчеты на РРЭ"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "contract-conditions-02",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3333,
+        "latency_s": 6.074,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "contract-conditions-03",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 4.841,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "contract-conditions-04",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 4.905,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "contract-conditions-05",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 5.363,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "contract-conditions-06",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 4.716,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "contract-conditions-07",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 10.31,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "contract-conditions-08",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3333,
+        "latency_s": 5.926,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "rre-contract-prerequisites-01",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3333,
+        "latency_s": 6.352,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "rre-contract-prerequisites-02",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3333,
+        "latency_s": 6.788,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "rre-contract-prerequisites-03",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 6.011,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "rre-contract-prerequisites-04",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3333,
+        "latency_s": 6.438,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "rre-contract-prerequisites-05",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3333,
+        "latency_s": 6.919,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "rre-contract-prerequisites-06",
+      "retrieval": {
+        "source_recall": 0.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.0,
+        "latency_s": 8.049,
+        "candidate_count": 10,
+        "missing_sources": [
+          "Методика расчеты на РРЭ"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "rre-contract-prerequisites-07",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3333,
+        "latency_s": 6.902,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "rre-contract-prerequisites-08",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3333,
+        "latency_s": 6.54,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "accrual-types-01",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 4.258,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "accrual-types-02",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 5.396,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "accrual-types-03",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 5.105,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "accrual-types-04",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3333,
+        "latency_s": 5.462,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "accrual-types-05",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 5.545,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "accrual-types-06",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 5.501,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "accrual-types-07",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 4.248,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "accrual-types-08",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 5.627,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "first-category-calculation-01",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5833,
+        "latency_s": 8.204,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "first-category-calculation-02",
+      "retrieval": {
+        "source_recall": 0.6667,
+        "locator_recall": 0.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 7.347,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [
+          "Порядок определения стоимости 1 ЦК"
+        ],
+        "error": ""
+      }
+    },
+    {
+      "id": "first-category-calculation-03",
+      "retrieval": {
+        "source_recall": 0.3333,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3333,
+        "latency_s": 8.436,
+        "candidate_count": 10,
+        "missing_sources": [
+          "04.05.2012 N 442",
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "first-category-calculation-04",
+      "retrieval": {
+        "source_recall": 0.6667,
+        "locator_recall": 0.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 10.814,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [
+          "Порядок определения стоимости 1 ЦК"
+        ],
+        "error": ""
+      }
+    },
+    {
+      "id": "first-category-calculation-05",
+      "retrieval": {
+        "source_recall": 0.6667,
+        "locator_recall": 0.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 6.704,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [
+          "Порядок определения стоимости 1 ЦК"
+        ],
+        "error": ""
+      }
+    },
+    {
+      "id": "first-category-calculation-06",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.4833,
+        "latency_s": 8.78,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "first-category-calculation-07",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.6111,
+        "latency_s": 11.788,
+        "candidate_count": 3,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "first-category-calculation-08",
+      "retrieval": {
+        "source_recall": 0.6667,
+        "locator_recall": 0.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 8.767,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [
+          "Порядок определения стоимости 1 ЦК"
+        ],
+        "error": ""
+      }
+    },
+    {
+      "id": "sixth-category-calculation-01",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5278,
+        "latency_s": 8.259,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "sixth-category-calculation-02",
+      "retrieval": {
+        "source_recall": 0.6667,
+        "locator_recall": 0.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 7.585,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [
+          "Порядок определения стоимости и цены для 5 и 6 ЦК"
+        ],
+        "error": ""
+      }
+    },
+    {
+      "id": "sixth-category-calculation-03",
+      "retrieval": {
+        "source_recall": 0.3333,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3333,
+        "latency_s": 7.152,
+        "candidate_count": 10,
+        "missing_sources": [
+          "04.05.2012 N 442",
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "sixth-category-calculation-04",
+      "retrieval": {
+        "source_recall": 0.6667,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5,
+        "latency_s": 10.6,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "sixth-category-calculation-05",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.4833,
+        "latency_s": 8.55,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "sixth-category-calculation-06",
+      "retrieval": {
+        "source_recall": 0.3333,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3333,
+        "latency_s": 7.61,
+        "candidate_count": 10,
+        "missing_sources": [
+          "04.05.2012 N 442",
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "sixth-category-calculation-07",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5111,
+        "latency_s": 10.036,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "sixth-category-calculation-08",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.5278,
+        "latency_s": 9.93,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "price-category-documents-01",
+      "retrieval": {
+        "source_recall": 0.8,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.4167,
+        "latency_s": 10.895,
+        "candidate_count": 4,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "price-category-documents-02",
+      "retrieval": {
+        "source_recall": 0.8,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.4167,
+        "latency_s": 9.817,
+        "candidate_count": 4,
+        "missing_sources": [
+          "29.12.2011 N 1179"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "price-category-documents-03",
+      "retrieval": {
+        "source_recall": 0.4,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3,
+        "latency_s": 7.65,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179",
+          "Методика расчеты на РРЭ",
+          "Методика расчета стоимости на передачу"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "price-category-documents-04",
+      "retrieval": {
+        "source_recall": 0.2,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.2,
+        "latency_s": 11.49,
+        "candidate_count": 10,
+        "missing_sources": [
+          "04.05.2012 N 442",
+          "29.12.2011 N 1179",
+          "Методика расчеты на РРЭ",
+          "Методика расчета стоимости на передачу"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "price-category-documents-05",
+      "retrieval": {
+        "source_recall": 0.4,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3,
+        "latency_s": 8.195,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179",
+          "Методика расчеты на РРЭ",
+          "Методика расчета стоимости на передачу"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "price-category-documents-06",
+      "retrieval": {
+        "source_recall": 0.6,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.29,
+        "latency_s": 8.88,
+        "candidate_count": 10,
+        "missing_sources": [
+          "Методика расчеты на РРЭ",
+          "Методика расчета стоимости на передачу"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "price-category-documents-07",
+      "retrieval": {
+        "source_recall": 0.4,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3,
+        "latency_s": 7.841,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179",
+          "Методика расчеты на РРЭ",
+          "Методика расчета стоимости на передачу"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "price-category-documents-08",
+      "retrieval": {
+        "source_recall": 0.4,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3,
+        "latency_s": 6.835,
+        "candidate_count": 10,
+        "missing_sources": [
+          "29.12.2011 N 1179",
+          "Методика расчеты на РРЭ",
+          "Методика расчета стоимости на передачу"
+        ],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "ivo-01",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3333,
+        "latency_s": 7.147,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "ivo-02",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 6.244,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "ivo-03",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 7.339,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "ivo-04",
+      "retrieval": {
+        "source_recall": 0.0,
+        "locator_recall": 0.0,
+        "mean_reciprocal_rank": 0.0,
+        "latency_s": 7.641,
+        "candidate_count": 10,
+        "missing_sources": [
+          "r12.docx"
+        ],
+        "missing_locators": [
+          "Внешняя инициатива ИВ0"
+        ],
+        "error": ""
+      }
+    },
+    {
+      "id": "ivo-05",
+      "retrieval": {
+        "source_recall": 0.0,
+        "locator_recall": 0.0,
+        "mean_reciprocal_rank": 0.0,
+        "latency_s": 5.189,
+        "candidate_count": 10,
+        "missing_sources": [
+          "r12.docx"
+        ],
+        "missing_locators": [
+          "Внешняя инициатива ИВ0"
+        ],
+        "error": ""
+      }
+    },
+    {
+      "id": "ivo-06",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 6.33,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "ivo-07",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 0.3333,
+        "latency_s": 6.402,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    },
+    {
+      "id": "ivo-08",
+      "retrieval": {
+        "source_recall": 1.0,
+        "locator_recall": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "latency_s": 5.663,
+        "candidate_count": 10,
+        "missing_sources": [],
+        "missing_locators": [],
+        "error": ""
+      }
+    }
+  ]
+}

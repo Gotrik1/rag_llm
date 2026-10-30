@@ -4,14 +4,18 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release --locked
 
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-bookworm AS python-runtime-base
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     RUST_CLI_PATH=/usr/local/bin/llm-rust
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     libgomp1 libglib2.0-0 libgl1 ca-certificates openssl \
+    tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus \
+    inkscape fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 COPY certs/ /usr/local/share/ca-certificates/gigachat/
 RUN set -eux; \
@@ -29,6 +33,8 @@ RUN set -eux; \
 ENV GIGACHAT_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 COPY requirements.docker.txt ./
 RUN pip install --no-cache-dir -r requirements.docker.txt
+
+FROM python-runtime-base AS runtime
 COPY --from=rust-builder /src/target/release/llm-rust /usr/local/bin/llm-rust
 COPY . ./
 EXPOSE 8080

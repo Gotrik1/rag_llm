@@ -41,4 +41,5 @@ def configure_telemetry() -> None:
 
 
 def tracer():
+    """Return the service tracer, including the OpenTelemetry no-op implementation when export is not configured."""
     return trace.get_tracer("rag-service")

@@ -1,8 +1,12 @@
-"""
-RAG Agent — LlamaIndex + Qdrant + Ollama (qwen2.5:14b)
-Гибридный поиск: векторный (Qdrant) + BM25
-Детерминизм: temperature=0, seed=42, SQLite кэш по хэшу вопроса
-"""
+"""RAG pipeline orchestration over LlamaIndex, Qdrant/BM25 and request-owned model clients.
+
+HTTP authentication, workspace state and queue admission belong to the application
+adapters. This module owns retrieval, evidence packing and grounded generation.
+Exact answers use ResponseCache (Redis), with corpus/runtime/publication identity;
+SQLite is not the response-cache backend. Model defaults are configured below and
+may be overridden by the persisted provider snapshot captured for each request.
+Coverage, corrective planning and structured writing have independent feature
+switches: their presence in source does not imply they run on every request."""
 
 from __future__ import annotations
 
@@ -17,6 +21,7 @@ import threading
 import unicodedata
 import time
 import zipfile
+from functools import lru_cache
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,12 +53,21 @@ from ollama import Client as OllamaClient
 from document_ingestion import ingest_document
 from domain_routing import apply_domain_routing, route_query, source_domains_for
 from evidence_selection import (SectionEvidenceIndex, generation_evidence_prompt,
-                                overview_sections, missing_overview_sections)
+                                overview_sections, missing_overview_sections,
+                                filter_query_applicability, new_query_rank_context)
 from llm_providers import ProviderLLM
+from provider_runtime import RuntimeSnapshot, capture_runtime
+from native_prompt_counter import count_bound_prompt
+from ordinary_answer_guard import (GUARD_VERSION, build_source_packet, writer_contract,
+    publish_draft, check_formula_draft, extractive_partial, cache_proof, valid_cache_proof, build_formula_requirements)
 from response_cache import ResponseCache
+from answer_sources import build_answer_sources
 from reranker import HttpReranker
-from runtime_paths import DATA_DIR
+from runtime_paths import DATA_DIR, STATE_DIR
 from search_focus import SearchFocus
+from query_rank import IDENTITY_FIELDS, QueryRankContext, native_identity
+from user_task import UserTask
+from table_context import map_table_prose, table_unit_texts
 from opentelemetry.trace import Status, StatusCode
 from telemetry import PIPELINE_SECONDS, tracer
 
@@ -74,9 +88,118 @@ VECTOR_TOP_K     = 12      # кандидатов от вектора
 # A semantic/chunking change must never reuse an older docstore or vector
 # collection: the two indexes must describe precisely the same corpus.
 BM25_PERSIST_DIR = os.environ.get("BM25_PERSIST_DIR", str(DATA_DIR / "bm25_v12"))
-CACHE_VERSION    = "v39-source-scope-and-math-2026-10-22"
+CACHE_VERSION    = "v40-query-rank-and-citations-2026-10-22"
 QUERY_UNDERSTANDING_VERSION = "v2"
 MAX_OUTPUT_TOKENS = int(os.environ.get("RAG_MAX_OUTPUT_TOKENS", "-1"))
+ORDINARY_INPUT_BUDGET_VERSION = 'ordinary-full-input-cl100k-v1'
+_CL100K_ASSET_SHA = '223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7'
+
+
+class OrdinaryInputBudgetError(RuntimeError):
+    """Value-free refusal before a provider can silently truncate evidence."""
+    def __init__(self, diagnostic):
+        self.diagnostic = diagnostic
+        super().__init__(diagnostic['code'])
+
+
+@lru_cache(maxsize=1)
+def _ordinary_input_tokenizer():
+    # Load the already bundled, SHA-pinned BPE directly from disk. No global
+    # tokenizer/env mutation, remote download, or provider-dependent I/O.
+    import llama_index.core.utils as utils
+    import tiktoken
+    from tiktoken.load import load_tiktoken_bpe
+    asset = Path(utils.__file__).parent / '_static' / 'tiktoken_cache' / '9b5ad71b2ce5302211f9c61530b329a4922fc6a4'
+    if hashlib.sha256(asset.read_bytes()).hexdigest() != _CL100K_ASSET_SHA:
+        raise ValueError('bundled-tokenizer-asset-mismatch')
+    return tiktoken.Encoding(name='ordinary-pinned-cl100k',
+        pat_str=r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s",
+        mergeable_ranks=load_tiktoken_bpe(str(asset), expected_hash=_CL100K_ASSET_SHA),
+        special_tokens={})
+
+
+def _ordinary_prompt_preflight(prompt, runtime, client, stage):
+    """Conservative full-input estimate, explicitly not a native Qwen count.
+
+    Reserve is input headroom, not an output-token cap. Physical context and
+    selected producer/output settings are never rewritten by this check.
+    """
+    window = runtime.spec.settings.get('context_window') if runtime is not None else \
+        getattr(getattr(client, 'metadata', None), 'context_window', None)
+    if type(window) is not int or window <= 0:
+        window = 16384  # Existing ordinary request default, never a model claim.
+    diagnostic = {'version': ORDINARY_INPUT_BUDGET_VERSION, 'stage': stage,
+        'estimator': 'cl100k_base_conservative_fallback', 'asset_sha256': _CL100K_ASSET_SHA,
+        'counter_identity': 'cl100k_base:' + _CL100K_ASSET_SHA,
+        'context_window': window, 'template_allowance': 128,
+        'safety_allowance': max(128, math.ceil(window * .02)),
+        'input_headroom': max(4096 if stage == 'critic' else 256, math.ceil(window * .05)),
+        'requested_stage_output_tokens': 4096 if stage == 'critic' else -1}
+    try:
+        bound = count_bound_prompt(prompt, runtime)
+        if bound is None:
+            diagnostic['estimated_text_tokens'] = len(_ordinary_input_tokenizer().encode(prompt, disallowed_special=()))
+        else:
+            if (type(bound.get('tokens')) is not int or bound['tokens'] < 0
+                    or not isinstance(bound.get('identity'), str) or len(bound['identity']) != 64
+                    or type(bound.get('template_included')) is not bool):
+                raise ValueError('invalid-bound-counter-result')
+            diagnostic.update(estimated_text_tokens=bound['tokens'], counter_identity=bound['identity'],
+                estimator=bound['estimator'], provenance=bound['provenance'],
+                template_allowance=0 if bound['template_included'] else 128)
+            diagnostic.pop('asset_sha256')
+    except Exception:
+        diagnostic['code'] = 'input_budget_estimator_unavailable'
+        raise OrdinaryInputBudgetError(diagnostic) from None
+    diagnostic['estimated_input_with_reserve'] = sum(diagnostic[key] for key in (
+        'estimated_text_tokens', 'template_allowance', 'safety_allowance', 'input_headroom'))
+    diagnostic['code'] = 'input_budget_exceeded' if diagnostic['estimated_input_with_reserve'] > window else 'input_budget_fits'
+    if diagnostic['code'] != 'input_budget_fits':
+        raise OrdinaryInputBudgetError(diagnostic)
+    return diagnostic
+
+
+def _resolve_evidence_selection_mode(
+    selection_mode: str | None = None, *, use_environment: bool = False,
+) -> tuple[str, str]:
+    """Resolve the opt-in once at a request boundary, never inside selectors."""
+    source = "explicit"
+    value = selection_mode
+    if value is None:
+        value = os.environ.get("RAG_EVIDENCE_SELECTION_MODE") if use_environment else None
+        source = "environment" if value is not None else "default"
+    if value is None:
+        return "legacy", source
+    label = "RAG_EVIDENCE_SELECTION_MODE" if source == "environment" else "selection_mode"
+    if not isinstance(value, str) or value.strip().casefold() not in {"legacy", "coverage"}:
+        raise ValueError(f"{label} must be 'legacy' or 'coverage'")
+    return value.strip().casefold(), source
+
+
+NEGATIVE_SCOPE_NOTICE = (
+    "Связанные условия источника не удалось полностью отделить от исключённой темы; "
+    "эту часть ответа нужно проверить."
+)
+
+
+def _negative_scope_limits(context: list[dict], metadata: dict | None = None) -> dict:
+    """Carry only observed unknown flags, never native coordinates or titles."""
+    signals = [metadata] if isinstance(metadata, dict) else []
+    signals.extend(item['selection_signals'] for item in context
+                   if isinstance(item.get('selection_signals'), dict))
+    atomic = any(item.get('negative_scope_atomic_conflict_incomplete') is True for item in signals)
+    unresolved = atomic or any(item.get('negative_scope_unresolved') is True for item in signals)
+    if not unresolved:
+        return {}
+    return {'negative_scope_unresolved': True,
+            **({'negative_scope_atomic_conflict_incomplete': True} if atomic else {})}
+
+
+def _with_negative_scope_notice(answer: str, limits: dict) -> str:
+    if limits.get('negative_scope_unresolved') is True and NEGATIVE_SCOPE_NOTICE not in answer:
+        return answer.rstrip() + "\n\n" + NEGATIVE_SCOPE_NOTICE
+    return answer
+
 
 # Soft topic routing never acts as an ACL. It only makes broad business
 # questions probe both implementation manuals and governing regulations.
@@ -172,12 +295,14 @@ class _TracedRetriever:
         self._stage = stage
 
     def retrieve(self, *args: Any, **kwargs: Any):
+        """Выполнить синхронный поиск, записав только длительность и число результатов."""
         with _pipeline_span(self._stage) as span:
             results = self._retriever.retrieve(*args, **kwargs)
             span.set_attribute("rag.results.count", len(results))
             return results
 
     async def aretrieve(self, *args: Any, **kwargs: Any):
+        """Выполнить асинхронный поиск с теми же обезличенными метриками."""
         with _pipeline_span(self._stage) as span:
             results = await self._retriever.aretrieve(*args, **kwargs)
             span.set_attribute("rag.results.count", len(results))
@@ -188,11 +313,13 @@ class _TracedRetriever:
 
 
 def contains_prompt_injection(text: str) -> bool:
+    """Распознать известные маркеры инъекции; эвристика не заменяет проверку источников и прав."""
     normalized = re.sub(r"\s+", " ", (text or "").lower())
     return any(marker in normalized for marker in PROMPT_INJECTION_MARKERS)
 
 
 def refusal_answer() -> str:
+    """Вернуть единый текст отказа, когда подтвержденных сведений для ответа нет."""
     return "Я не знаю: в базе знаний нет подтверждённой информации для ответа."
 
 # Model-specific generation budgets. Qwen 3.5 enables long reasoning by default
@@ -231,6 +358,17 @@ SYSTEM_PROMPT = """\
 5. Не смешивай определения разных разделов.
 6. Если в контексте формулы даны в маркерах вида [С_sub(...)] или [ΔО_sub(...)], сохраняй этот формат и не раскладывай его на отдельные токены вроде [EQ], [s], [].
 7. Форматируй ответ в CommonMark Markdown: отделяй абзацы одной пустой строкой, используй корректные списки и не используй HTML.
+"""
+
+
+COVERAGE_SYSTEM_PROMPT = """\
+Ты — точный ассистент по документам. Отвечай на вопрос пользователя по проверяемому пакету источников.
+Включай только подтверждённые сведения, относящиеся к запрошенной сущности и операции.
+Сначала изложи основное правило; частные случаи отделяй и сохраняй условия их применения.
+Не подменяй цену стоимостью, определение примером или общий порядок редким исключением.
+Формат ссылок и выбор точных формул заданы в проверяемом пакете: используй его реальные ID.
+Если существенная связь, операция или условие не подтверждены, явно обозначь этот пробел, не угадывай.
+Отвечай на русском в CommonMark Markdown, без служебных данных, JSON и придуманных ссылок.
 """
 
 
@@ -289,6 +427,100 @@ class QueryUnderstanding:
     facets: tuple[str, ...]
     retrieval_queries: tuple[str, ...]
     corrections: tuple[str, ...] = ()
+
+
+def _body_probe_queries(retrieval_queries, original_queries: tuple[str, ...]) -> tuple[str, ...]:
+    """Reuse at most six existing soft probes, never requirements or scope.
+
+    Both planners already bound these strings. Enforce the public caller
+    boundary too, rejecting oversized probes atomically instead of clipping
+    an arbitrary condition. The original raw/canonical probes are untouched.
+    """
+    if not isinstance(retrieval_queries, (list, tuple)):
+        return ()
+    seen = {re.sub(r"\s+", " ", value).strip().casefold() for value in original_queries}
+    result = []
+    for value in retrieval_queries:
+        if not isinstance(value, str) or not 2 <= len(value) <= 500:
+            continue
+        query = re.sub(r"\s+", " ", value).strip()
+        key = query.casefold()
+        if not 2 <= len(query) <= 500 or key in seen:
+            continue
+        seen.add(key)
+        result.append(query)
+        if len(result) == 6:
+            break
+    return tuple(result)
+
+
+def _retrieval_record_identity(item: dict) -> object:
+    """Prove exact native equality; opaque metadata never earns a merge.
+
+    Full text, typed physical locators and revision fields belong together.
+    A fresh retained token is deliberately not stable for unprovable records.
+    Scores and channel annotations are not source identity.
+    """
+    identity = native_identity(item)
+    return identity if identity is not None else object()
+
+
+def _native_identity_metadata(metadata: dict) -> dict:
+    """Forward existing optional identity fields, never infer locator values."""
+    return {key: metadata[key] for key in IDENTITY_FIELDS
+            if key not in {'file', 'section_path', 'status'} and key in metadata}
+
+
+def _round_robin_body_probes(groups: list[list[dict]], limit: int,
+                            existing_keys: set[object] | None = None) -> list[dict]:
+    """One extra body budget across probes, with native order and no mutation.
+
+    Use the same identity as the surrounding retrieval merge, so duplicates
+    (including already retained raw hits) cannot consume another probe's slot.
+    """
+    seen = set(existing_keys or ())
+    offsets = [0] * len(groups)
+    result = []
+    while len(result) < limit:
+        added = False
+        for number, group in enumerate(groups):
+            while offsets[number] < len(group):
+                item = group[offsets[number]]
+                offsets[number] += 1
+                key = _retrieval_record_identity(item)
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(item)
+                added = True
+                break
+            if len(result) >= limit:
+                break
+        if not added:
+            break
+    return result
+
+
+def _preserve_body_probe_metadata(body_item: dict, incoming: dict) -> dict:
+    """Keep native lexical provenance only across an exact evidence identity.
+
+    Later seeds can share words but differ in a source condition, physical
+    locator or revision. Incoming priority/status/score metadata remains intact.
+    """
+    if not {'body-lexical', 'body-coverage'} & set(body_item.get('matched_queries', ())):
+        return incoming
+    identity = native_identity(body_item)
+    if identity is None or identity != native_identity(incoming):
+        return incoming
+    result = dict(incoming)
+    fields = ('lexical_coverage', 'lexical_subject_keys', 'lexical_subject_groups')
+    # Do not combine a later, independently authored lexical signature with
+    # another probe's coverage number or subject. Copy the signature atomically.
+    if not any(field in result for field in fields):
+        result.update({field: body_item[field] for field in fields if field in body_item})
+    result['matched_queries'] = list(dict.fromkeys([
+        *incoming.get('matched_queries', ()), *body_item.get('matched_queries', ())]))
+    return result
 
 
 FORMULA_QUERY_MARKERS = (
@@ -409,6 +641,7 @@ def contains_price_category(value: str, number: str) -> bool:
 
 
 def price_category_item_matches(item: dict, number: str) -> bool:
+    """Проверить категорию в тексте и заголовке, сохранив ее номер как существенное условие."""
     haystack = "\n".join([
         str(item.get("section_path", "")),
         str(item.get("section_title", "")),
@@ -483,6 +716,7 @@ def has_document_occurrence_intent(question: str) -> bool:
 
 
 def is_document_occurrence_question(question: str) -> bool:
+    """Отличить запрос перечня документов с упоминанием темы от вопроса о самом правиле."""
     normalized = (question or "").lower().replace("ё", "е")
     return has_document_occurrence_intent(normalized) and bool(
         price_category_number(normalized)
@@ -737,6 +971,11 @@ def _normalize_word_eq(value: str) -> str:
 
 def _cleanup_formula_noise(text: str) -> str:
     """Collapse common tokenized Word formula fragments into readable markers."""
+    return map_table_prose(text, _cleanup_formula_noise_plain)
+
+
+def _cleanup_formula_noise_plain(text: str) -> str:
+    """Legacy prose cleanup; serialized source-bound table bytes are excluded."""
     text = re.sub(r"\[\s*SEQ\s*\][^\n]*?(?=(?:\n|$))", "", text)
     text = re.sub(r"\[\s*REF\s*\][^\n]*?(?=(?:\n|$))", "", text)
     text = re.sub(r"\[\s*Формула\s*\\\*\s*\]", "", text)
@@ -799,6 +1038,7 @@ def _cleanup_formula_noise(text: str) -> str:
 
 
 def requested_formula_terms(question: str) -> set[str]:
+    """Извлечь поддерживаемые отраслевые обозначения из вопроса без исправления исходного текста."""
     known = ("ИВ0-1", "ИВ0", "ИВ1", "ИС", "ИВА", "ИВК", "ИВпр", "ИВон")
     normalized = question.replace("ИВ 1", "ИВ1").replace("ИВ 0", "ИВ0")
     found = {term for term in known if term in normalized}
@@ -808,6 +1048,7 @@ def requested_formula_terms(question: str) -> set[str]:
 
 
 def ordered_requested_terms(question: str) -> list[str]:
+    """Сохранить порядок запрошенных обозначений и не смешать ИВ0 с ИВ0-1."""
     normalized = question.replace("ИВ 1", "ИВ1").replace("ИВ 0", "ИВ0")
     positions: list[tuple[int, str]] = []
     for term in known_formula_terms():
@@ -833,6 +1074,7 @@ def ordered_requested_terms(question: str) -> list[str]:
 
 
 def detect_query_intent(question: str) -> str:
+    """Выбрать эвристический тип вопроса для отбора правил; не является смысловым вердиктом модели."""
     normalized = normalize_user_question(question)[0].lower()
     cost_markers = (
         "стоим", "ставк", "руб", "оплат", "требован", "обязательств", "платеж",
@@ -872,6 +1114,7 @@ def requested_section_numbers(question: str) -> tuple[str, ...]:
 
 
 def section_query_terms(question: str) -> tuple[str, ...]:
+    """Получить поисковые термы без служебных слов и адресов пунктов, сохранив порядок появления."""
     value = re.sub(r"(?<!\d)\d+(?:\.\d+){1,}(?!\d)", " ", question.lower())
     stop = {
         "какие", "какая", "какой", "какое", "формулы", "формула", "расчет",
@@ -1054,6 +1297,7 @@ def matching_explicit_sources(question: str, source_aliases: dict[str, str] | No
 
 
 def known_formula_terms() -> tuple[str, ...]:
+    """Вернуть словарь обозначений старого детерминированного пути; это не каталог всего корпуса."""
     return ("ИВ0-1", "ИВ0", "ИВ1", "ИС", "ИВА", "ИВК", "ИВпр", "ИВон", "ИВ")
 
 
@@ -1092,12 +1336,25 @@ def extract_chunk_metadata(text: str) -> dict:
     """Classify a retrieved chunk so ranking can separate values from prices/rates."""
     cleaned = _cleanup_formula_noise(text or "")
     lower = cleaned.lower()
-    sections = re.findall(r"\[SECTION:\s*([^\]]+)\]", cleaned)
+    marker_text = cleaned
+    if table_unit_texts(cleaned):
+        # Coordinates and literal marker strings in a cell are source data,
+        # not outer section/status bookkeeping. Inspect only actual prose.
+        outer_parts = []
+
+        def collect_prose(prose):
+            """Собрать только внешнюю прозу таблицы для анализа метаданных, не меняя ее текст."""
+            outer_parts.append(prose)
+            return prose
+
+        map_table_prose(cleaned, collect_prose)
+        marker_text = ''.join(outer_parts)
+    sections = re.findall(r"\[SECTION:\s*([^\]]+)\]", marker_text)
     section_path = sections[-1].strip() if sections else ""
     section_parts = [part.strip() for part in section_path.split(">") if part.strip()]
     section_title = section_parts[-1] if section_parts else ""
     parent_section = " > ".join(section_parts[:-1])
-    status = "deleted" if _current_clause_is_deleted(cleaned, section_title) else "active"
+    status = "deleted" if _current_clause_is_deleted(marker_text, section_title) else "active"
 
     chunk_type = "unknown"
     if "[table]" in lower:
@@ -1134,9 +1391,25 @@ def effective_chunk_metadata(text: str, metadata: dict | None = None) -> dict:
         value = (metadata or {}).get(key)
         if value:
             parsed[key] = value
+    # Keep structural/status semantics; an opaque optional value is retained
+    # too, so it cannot silently become apparently proven equality downstream.
+    parsed.update(_native_identity_metadata(metadata or {}))
+    status_text = _cleanup_formula_noise(text or "")
+    has_table_units = bool(table_unit_texts(status_text))
+    if has_table_units:
+        outer_parts = []
+
+        def collect_prose(prose):
+            """Учитывать внешнюю прозу при объединении сохраненных и извлеченных метаданных."""
+            outer_parts.append(prose)
+            return prose
+
+        map_table_prose(status_text, collect_prose)
+        status_text = ''.join(outer_parts)
     parsed["status"] = (
         "deleted"
-        if _current_clause_is_deleted(_cleanup_formula_noise(text or ""), str(parsed.get("section_title", "")))
+        if (has_table_units and (metadata or {}).get("status") == "deleted")
+        or _current_clause_is_deleted(status_text, str(parsed.get("section_title", "")))
         else "active"
     )
     if parsed["status"] == "deleted":
@@ -1204,6 +1477,7 @@ def relationship_expansion_results(
                 if key in {"section_path", "section_title", "parent_section", "status", "chunk_type"}
                 and value
             },
+            **_native_identity_metadata(meta),
         }
         if chunk_meta.get("status") == "deleted" or contains_prompt_injection(text):
             continue
@@ -1218,12 +1492,7 @@ def relationship_expansion_results(
         term for term in section_query_terms(question)
         if len(term) >= 5 and not term.isdigit()
     }
-    existing = {
-        hashlib.sha256(
-            f"{Path(str(item.get('file', ''))).name.casefold()}\n{str(item.get('text', ''))[:700]}".encode("utf-8")
-        ).hexdigest()
-        for item in ranked
-    }
+    existing = {_retrieval_record_identity(item) for item in ranked}
     expanded: list[dict] = []
     for seed in ranked[:8]:
         source_key = Path(str(seed.get("file", ""))).name.casefold()
@@ -1232,9 +1501,7 @@ def relationship_expansion_results(
         seed_score = float(seed.get("score", 0.0))
         related: list[tuple[float, str, dict]] = []
         for candidate in candidates_by_source.get(source_key, []):
-            digest = hashlib.sha256(
-                f"{source_key}\n{candidate['text'][:700]}".encode("utf-8")
-            ).hexdigest()
+            digest = _retrieval_record_identity(candidate)
             if digest in existing:
                 continue
             path = str(candidate.get("section_path", "")).strip()
@@ -1263,9 +1530,7 @@ def relationship_expansion_results(
                 continue
             related.append((bonus + min(lexical_matches, 3) * 0.08, relation, candidate))
         for bonus, relation, candidate in sorted(related, key=lambda item: item[0], reverse=True)[:2]:
-            digest = hashlib.sha256(
-                f"{source_key}\n{candidate['text'][:700]}".encode("utf-8")
-            ).hexdigest()
+            digest = _retrieval_record_identity(candidate)
             if digest in existing:
                 continue
             existing.add(digest)
@@ -1280,6 +1545,7 @@ def relationship_expansion_results(
 
 
 def contains_term(value: str, term: str) -> bool:
+    """Проверить границы отраслевого обозначения, не принимая другой индекс за тот же термин."""
     value = value.replace("ИВ 1", "ИВ1").replace("ИВ 0", "ИВ0")
     if term == "ИВ0":
         return re.search(r"(?<![А-Яа-яA-Za-z0-9-])ИВ0(?!-?1)(?![А-Яа-яA-Za-z0-9-])", value) is not None
@@ -1293,6 +1559,7 @@ def contains_term(value: str, term: str) -> bool:
 
 
 def diversify_context_results(ranked: list[dict], question: str, top_k: int) -> list[dict]:
+    """Разнообразить ранжированный контекст по запрошенным темам в пределах top_k."""
     requested = sorted(requested_formula_terms(question), key=lambda value: (-len(value), value))
     section_numbers = requested_section_numbers(question)
     category = price_category_number(question)
@@ -1330,6 +1597,7 @@ def diversify_context_results(ranked: list[dict], question: str, top_k: int) -> 
     selected_ids: set[int] = set()
 
     def add(item: dict) -> None:
+        """Добавить запись и отметить ее объектную идентичность, чтобы не включить ее повторно."""
         selected.append(item)
         selected_ids.add(id(item))
 
@@ -1660,6 +1928,7 @@ def format_formula_for_katex(formula: str, *, display: bool = False) -> str:
     # that notation to real subscripts instead of displaying source-like code.
     if "\\" not in value:
         def indexed_symbol(match: re.Match) -> str:
+            """Отформатировать индексы и кириллицу для KaTeX без выбора математической операции."""
             symbol = match.group(1)
             raw_parts = [part.strip().strip(",") for part in match.group(2).split(",")]
             parts: list[str] = []
@@ -1788,6 +2057,7 @@ def source_locator(section_path: object, page_number: object = None) -> str:
 
 
 def human_source_reference(item: dict) -> str:
+    """Составить человекочитаемую ссылочную подпись документа и раздела; URL добавляет HTTP-слой."""
     return (
         f"{user_facing_source_name(item.get('file', ''))} — "
         f"{source_locator(item.get('section_path', item.get('section', '')), item.get('page_number'))}"
@@ -2092,6 +2362,7 @@ def generate_extractive_value_answer(
 def build_section_documents(text: str, source_path: Path, backend: str) -> list[Document]:
     """Create one LlamaIndex Document per logical section before chunk splitting."""
     def compact_meta(meta: dict) -> dict:
+        """Ограничить размеры служебных полей метаданных, не сокращая исходный текст документа."""
         limits = {
             "section_path": 360,
             "parent_section": 240,
@@ -2311,6 +2582,26 @@ def derive_worded_formula(question: str, text: str) -> str | None:
 
 def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> list[str]:
     """Extract allowed calculation evidence: symbolic formulas and textual calculation rules."""
+    from table_context import formula_source_segments
+
+    segments: list[str] = []
+    for text in texts:
+        try:
+            segments.extend(formula_source_segments(text))
+        except ValueError:
+            # Invalid structural metadata cannot authorize a formula hidden
+            # inside its JSON bytes. Ordinary source strings are unchanged.
+            continue
+    return _extract_formula_lines_from_plain_texts(segments, question)
+
+
+def _extract_formula_lines_from_plain_texts(texts: list[str], question: str = "") -> list[str]:
+    """Extract source formula candidates under the requested subject/category.
+
+    These heuristics recover notation from extracted text; they are not a
+    symbolic algebra engine or proof of applicability. Preserve complete source
+    expressions and let downstream evidence checks validate their use.
+    """
     calculations: list[str] = []
     seen: set[str] = set()
     requested = requested_formula_terms(question)
@@ -2328,6 +2619,7 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
     )
 
     def add(candidate: str, *, requested_term_already_matched: bool = False) -> None:
+        """Добавить подходящую полную формулу после проверки темы и удаления повторов."""
         candidate = clean_formula_artifacts(_plain_evidence_text(candidate))
         candidate = candidate.strip(" ,;\t")
         minimum_length = 5 if "=" in candidate else 20
@@ -2443,11 +2735,18 @@ def extract_formula_lines_from_texts(texts: list[str], question: str = "") -> li
             for sentence in sentences:
                 if formula_request and re.search(r"[çæøï]", sentence):
                     continue
-                lower = sentence.lower()
+                lower = sentence.lower().replace("ё", "е")
                 if not (
                     "определяется" in lower
                     or "рассчитывается" in lower
-                    or "расчет" in lower
+                    # A calculation mention can be a heading or a pointer to
+                    # another section; require the operation in this sentence.
+                    or ("расчет" in lower and re.search(
+                        r"\b(?:путем|посредством)\s+"
+                        r"(?:умножения|деления|сложения|вычитания|суммирования)\b"
+                        r"|\b(?:умножением|делением|сложением|вычитанием|суммированием)\b",
+                        lower,
+                    ))
                     or "как разность" in lower
                     or "как разница" in lower
                     or "равна разности" in lower
@@ -2490,6 +2789,7 @@ def formula_sibling_results(nodes: list, merged: dict[str, dict], question: str)
         return []
 
     def canonical_source(value: object) -> str:
+        """Сопоставить имена загрузок с UUID-префиксами только для поиска соседних формул."""
         name = Path(str(value)).name.casefold()
         # Uploaded files are persisted with one or more collision-safe UUID
         # prefixes, while the vector payload and registry expose the user-facing
@@ -2541,6 +2841,7 @@ def formula_sibling_results(nodes: list, merged: dict[str, dict], question: str)
             **{k: v for k, v in meta.items() if k in {
                 "section_path", "section_title", "parent_section", "status", "chunk_type",
             } and v},
+            **_native_identity_metadata(meta),
         }
         if chunk_meta.get("status") == "deleted":
             continue
@@ -2612,6 +2913,7 @@ def generate_formula_only_answer(question: str, context: list[dict], calculation
 
 
 def rerank_context_results(results: list[dict], question: str) -> list[dict]:
+    """Применить эвристики релевантности к копиям записей, сохранив исходный ранг в raw_score."""
     intent = detect_query_intent(question)
     requested = requested_formula_terms(question)
     normalized_question = question.lower().replace("ё", "е")
@@ -2630,6 +2932,7 @@ def rerank_context_results(results: list[dict], question: str) -> list[dict]:
     )
 
     def adjusted(item: dict) -> float:
+        """Рассчитать эвристический приоритет с учетом категории, запроса и типа фрагмента."""
         text = item.get("text", "")
         lower = text.lower()
         score = float(item.get("score", 0.0))
@@ -2827,6 +3130,7 @@ def filter_scoped_evidence(context: list[dict], question: str, *, source_aliases
 
 
 def sanitize_grounded_answer(answer: str, question: str, allowed_calculations: list[str]) -> str:
+    """Очистить ответ старого пути; coverage использует отдельный проверяемый пакет источников."""
     if contains_prompt_injection(answer):
         return refusal_answer()
     requested = requested_formula_terms(question)
@@ -2895,6 +3199,18 @@ def sanitize_grounded_answer(answer: str, question: str, allowed_calculations: l
         answer,
     )
     answer = re.sub(r"(?im)^.*учредител\w*\s+пдг.*(?:\n|$)", "", answer)
+    return format_grounded_answer(answer)
+
+
+def format_grounded_answer(answer: str) -> str:
+    """Format a draft without removing factual content before evidence review.
+
+    The verified route checks the whole answer against the immutable packet.
+    Legacy keyword/abbreviation deletion cannot decide which native conditions
+    or variable definitions that reviewer is allowed to see.
+    """
+    if contains_prompt_injection(answer):
+        return refusal_answer()
     # Never expose formula notation as inline code. Convert model-emitted
     # equalities to math delimiters so the React client renders them with KaTeX.
     answer = re.sub(
@@ -3042,8 +3358,15 @@ def ensure_requested_formula_coverage(
     if not grounded_calculations:
         return answer
     def confirms_calculation(calculation: str, item: dict) -> bool:
+        """Подтвердить формулу исходным сегментом, не подставляя произвольную похожую запись."""
+        from table_context import formula_source_segments
+
         text = str(item.get("text", ""))
-        if re.sub(r"\s+", "", calculation) in re.sub(r"\s+", "", text):
+        try:
+            segments = formula_source_segments(text)
+        except ValueError:
+            return False
+        if any(re.sub(r"\s+", "", calculation) in re.sub(r"\s+", "", segment) for segment in segments):
             return True
         formula_key = re.sub(r"\s+", "", format_formula_for_katex(calculation))
         candidates = extract_formula_lines_from_texts([text], f"формула {question}")
@@ -3105,10 +3428,17 @@ def ensure_price_composition_source_coverage(answer: str, question: str, context
 
 
 class RAGAgent:
+    """Оркестратор индексирования, поиска и генерации, общий для HTTP-приложения и CLI.
+
+    Настройки провайдера захватываются на один запрос через RuntimeSnapshot.
+    Источники, диагностика и признак кеша хранятся в локальном состоянии потока;
+    модельный клиент запроса нельзя подменять изменением общего self.llm.
+    Транспорт, пользовательские сессии и постановка заданий находятся вне этого класса."""
     def __init__(self, llm_model: str = LLM_MODEL, *, embedding_base_url: str | None = None):
         # ── LLM ──────────────────────────────────────────────
         self.llm_model = llm_model
         self.llm = self._create_ollama_llm(self.llm_model)
+        self._runtime_config_reader = self._read_provider_config
 
         # ── Embeddings (через Ollama) ─────────────────────────
         self.embed_model = OllamaEmbedding(
@@ -3118,7 +3448,6 @@ class RAGAgent:
         )
 
         # ── Глобальные настройки LlamaIndex ──────────────────
-        Settings.llm = self.llm
         Settings.embed_model = self.embed_model
         Settings.chunk_size = CHUNK_SIZE
         Settings.chunk_overlap = CHUNK_OVERLAP
@@ -3170,55 +3499,98 @@ class RAGAgent:
         return bool(getattr(self._generation_state, "from_cache", False))
 
     @staticmethod
-    def _create_ollama_llm(model: str) -> Ollama:
+    def _create_ollama_llm(model: str, base_url: str | None = None) -> Ollama:
         profile = {**DEFAULT_OLLAMA_PROFILE, **OLLAMA_MODEL_PROFILES.get(model, {})}
         timeout = float(os.environ.get("LLM_REQUEST_TIMEOUT", "900"))
+        endpoint = base_url or OLLAMA_BASE_URL
         return Ollama(
             model=model,
-            base_url=OLLAMA_BASE_URL,
+            base_url=endpoint,
             temperature=0.0,
             context_window=int(profile["context_window"]),
             thinking=profile["thinking"],
             additional_kwargs={"seed": 42, "num_predict": int(profile["num_predict"])},
             request_timeout=timeout,
-            client=OllamaClient(host=OLLAMA_BASE_URL, timeout=timeout, trust_env=False),
+            client=OllamaClient(host=endpoint, timeout=timeout, trust_env=False),
         )
+
+    @staticmethod
+    def _read_provider_config() -> dict:
+        """Read one complete persisted selection at actual ask execution."""
+        try:
+            value = json.loads((STATE_DIR / "llm_providers.json").read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("Invalid provider configuration")
+            return value
+        except FileNotFoundError:
+            return {"provider": "ollama", "model": LLM_MODEL}
+
+    def capture_runtime(self, config: dict | None = None) -> RuntimeSnapshot | None:
+        """Fresh request-owned client; the retrieval agent itself is never swapped.
+
+        Manually constructed diagnostic agents may inject a client without a
+        config reader. The real constructor always installs the persisted reader.
+        """
+        if config is None:
+            reader = getattr(self, "_runtime_config_reader", None)
+            if not callable(reader):
+                return None
+            config = reader()
+        return capture_runtime(
+            config, default_model=LLM_MODEL, ollama_base_url=OLLAMA_BASE_URL,
+            ollama_profiles=OLLAMA_MODEL_PROFILES, default_ollama_profile=DEFAULT_OLLAMA_PROFILE,
+            client_factory=getattr(self, "_runtime_client_factory", None),
+        )
+
+    def _producer(self, runtime: RuntimeSnapshot | None) -> dict:
+        if runtime is not None:
+            return runtime.producer()
+        # Compatibility for explicitly injected, non-service diagnostic agents.
+        # A deterministic/mock-only agent need not have any LLM at all. Do
+        # not invent an Ollama producer, construct a client, or stringify a
+        # dynamic Mock attribute merely to populate diagnostic metadata.
+        provider = getattr(getattr(self, "llm", None), "provider", None)
+        provider = provider if isinstance(provider, str) and provider else "unknown"
+        model = getattr(self, "llm_model", None)
+        model = model if isinstance(model, str) and model else "unknown"
+        return {"provider": provider, "model": model, "label": f"{provider} · {model}",
+                "identity_kind": "injected_diagnostic_client"}
+
+    def last_generation_producer(self) -> dict:
+        """Вернуть копию сведений о провайдере последнего запроса текущего потока."""
+        return dict(getattr(getattr(self, "_generation_state", None), "producer", {}) or {})
+
+    def _runtime_identity(self, runtime: RuntimeSnapshot | None) -> str:
+        return runtime.identity if runtime is not None else "diagnostic-injected:" + self._producer(None)["model"]
+
+    def _runtime_cache_entry(self, value: Any, runtime: RuntimeSnapshot | None) -> bool:
+        return (isinstance(value, dict) and
+                value.get("runtime_identity") == self._runtime_identity(runtime) and
+                value.get("producer") == self._producer(runtime))
 
     def set_llm_model(self, model: str) -> None:
         """Switch the generation model without rebuilding the retrieval indexes."""
         model = model.strip()
-        if not model or model == self.llm_model:
+        if not model:
             return
         self.llm_model = model
         self.llm = self._create_ollama_llm(self.llm_model)
-        Settings.llm = self.llm
         self.clear_cache()
 
     def set_llm_provider(self, config: dict) -> None:
         """Apply a cloud provider without rebuilding retrieval indexes."""
-        provider = str(config.get("provider", "")).strip()
-        if provider == "ollama":
-            self.set_llm_model(str(config.get("model", LLM_MODEL)))
-            return
-        self.llm_model = str(config.get("model", "")).strip()
-        self.llm = ProviderLLM(
-            provider=provider,
-            api_key=str(config.get("api_key", "")),
-            base_url=str(config.get("base_url", "")),
-            model=self.llm_model,
-            folder_id=str(config.get("folder_id", "")),
-            auth_type=str(config.get("auth_type", "api_key")),
-        )
-        Settings.llm = self.llm
+        runtime = self.capture_runtime(config)
+        self.llm_model = runtime.spec.model
+        self.llm = runtime.llama_index_client
         self.clear_cache()
 
     def _load_nodes_from_docstore(self):
         """Загружаем ноды из docstore для BM25."""
         docs = self.docstore.docs
+        nodes = []
         if docs:
             # docstore может хранить и Document, и уже готовые TextNode.
             from llama_index.core.schema import TextNode
-            nodes = []
             for d in docs.values():
                 if not getattr(d, "text", None):
                     continue
@@ -3234,8 +3606,12 @@ class RAGAgent:
                     continue
                 node_id = getattr(d, "doc_id", None) or getattr(d, "id_", None) or getattr(d, "id", None)
                 nodes.append(TextNode(text=d.text, metadata=normalized_meta, id_=node_id))
-            self._all_nodes = nodes
-        self._section_evidence_index = SectionEvidenceIndex(self._all_nodes)
+        # Build before publishing the matching snapshot, including an empty
+        # replacement. The first query must not rebuild this same body index.
+        section_index = SectionEvidenceIndex(nodes)
+        self._all_nodes = nodes
+        self._section_evidence_index = section_index
+        self._section_evidence_nodes = nodes
 
     def _refresh_docstore_if_changed(self) -> None:
         """Reload BM25/docstore state written by the dedicated ingestion worker."""
@@ -3270,7 +3646,7 @@ class RAGAgent:
             self._load_nodes_from_docstore()
             self._docstore_mtime_ns = current_mtime
 
-    def _build_query_engine(self, top_k: int = TOP_K):
+    def _build_query_engine(self, top_k: int = TOP_K, runtime: RuntimeSnapshot | None = None):
         """Строим гибридный query engine с текущими нодами."""
         vector_retriever = _TracedRetriever(
             self.index.as_retriever(similarity_top_k=max(VECTOR_TOP_K, top_k)),
@@ -3287,6 +3663,7 @@ class RAGAgent:
 
         retriever = QueryFusionRetriever(
             retrievers=retrievers,
+            llm=runtime.llama_index_client if runtime is not None else self.llm,
             similarity_top_k=top_k,
             num_queries=1,          # не генерировать доп. запросы — детерминизм
             mode="reciprocal_rerank",
@@ -3294,7 +3671,7 @@ class RAGAgent:
         )
 
         synthesizer = get_response_synthesizer(
-            llm=self.llm,
+            llm=runtime.llama_index_client if runtime is not None else self.llm,
             response_mode="compact",
             text_qa_template=TEXT_QA_TEMPLATE,
             verbose=False,
@@ -3313,9 +3690,24 @@ class RAGAgent:
 
         print(f"  Парсим {p.name}...")
 
+        from table_context import markdown_tables, protect_table_regions
+        from table_chunking import chunk_documents_with_tables
+
+        with p.open('rb') as source_file:
+            source_identity = hashlib.file_digest(source_file, 'sha256').hexdigest()
         ingested = ingest_document(p)
+        tables = list(getattr(ingested, 'tables', None) or [])
+        if not tables:
+            # Markdown delimiters express headers; a plain pipe row does not.
+            tables = markdown_tables(ingested.text)
+        protected_text, table_slots = protect_table_regions(ingested.text, tables)
         self.last_ingestion_report = {'parsing_backend': ingested.backend, 'warnings': list(ingested.warnings)}
-        text = _cleanup_formula_noise(ingested.text)
+        self.last_ingestion_report['table_schema'] = 'table-grid-v1'
+        self.last_ingestion_report['structured_tables'] = len(tables)
+        self.last_ingestion_report['warnings'].extend(
+            f'table-{record["table_id"]}: {warning}' for record in tables for warning in record.get('warnings', [])
+        )
+        text = _cleanup_formula_noise(protected_text)
         if not text.strip():
             raise ValueError(f"Не удалось извлечь текст из документа: {path}")
         if ingested.warnings:
@@ -3330,7 +3722,10 @@ class RAGAgent:
             chunk_overlap=CHUNK_OVERLAP,
             paragraph_separator="\n\n",
         )
-        nodes = splitter.get_nodes_from_documents(documents)
+        nodes = chunk_documents_with_tables(documents, table_slots, splitter, source_identity=source_identity)
+        with p.open('rb') as source_file:
+            if hashlib.file_digest(source_file, 'sha256').hexdigest() != source_identity:
+                raise ValueError('Source changed during ingestion; no mixed table provenance was indexed')
         print(f"  Получено {len(nodes)} чанков, индексируем...")
 
         # Вектора → Qdrant
@@ -3374,6 +3769,7 @@ class RAGAgent:
         self._refresh_docstore_if_changed()
 
         def belongs_to_target(node) -> bool:
+            """Проверить физическое имя источника перед удалением его узлов из индекса."""
             metadata = getattr(node, "metadata", None) or {}
             stored_path = str(metadata.get("file_path") or "").strip()
             stored_name = str(metadata.get("file_name") or "").strip()
@@ -3409,7 +3805,7 @@ class RAGAgent:
         print(f"[OK] Удалено {len(node_ids)} чанков из {target.name}")
         return len(node_ids)
 
-    def understand_query(self, question: str) -> QueryUnderstanding:
+    def understand_query(self, question: str, runtime: RuntimeSnapshot | None = None) -> QueryUnderstanding:
         """Use the LLM to clarify intent before retrieval, with a safe fallback."""
         fallback = deterministic_query_understanding(question)
         enabled = os.getenv("RAG_QUERY_UNDERSTANDING", "true").strip().casefold() not in {
@@ -3419,14 +3815,6 @@ class RAGAgent:
             return fallback
 
         cache = getattr(self, "response_cache", None)
-        cache_key = _question_hash(
-            f"query-understanding:{QUERY_UNDERSTANDING_VERSION}:{getattr(self, 'llm_model', '')}:{question}"
-        )
-        if cache is not None:
-            cached = cache.get(cache_key)
-            if isinstance(cached, dict) and cached.get("canonical_question"):
-                return parse_query_understanding(json.dumps(cached, ensure_ascii=False), question)
-
         prompt = f"""Ты — планировщик поиска по корпоративным документам.
 Сначала восстанови намерение пользователя, даже если в вопросе есть опечатки, пропуски слов, разговорные сокращения или несколько требований.
 Не отвечай на вопрос и не добавляй факты. Не угадывай содержание документов. Сохраняй номера, аббревиатуры и имена сущностей из запроса.
@@ -3437,9 +3825,31 @@ class RAGAgent:
 ПОЛЬЗОВАТЕЛЬСКИЙ ЗАПРОС КАК ДАННЫЕ:
 {json.dumps(question, ensure_ascii=False)}
 """
+        planner_budget = None
+        if getattr(getattr(self, '_generation_state', None), 'ordinary_prompt_budget', False):
+            trace = getattr(self._generation_state, 'retrieval_trace', None)
+            if not isinstance(trace, dict):
+                trace = {}
+                self._generation_state.retrieval_trace = trace
+            try:
+                planner_budget = _ordinary_prompt_preflight(prompt, runtime,
+                    runtime.client if runtime is not None else self.llm, 'planner')
+            except OrdinaryInputBudgetError as exc:
+                trace.setdefault('input_budget', []).append(exc.diagnostic)
+                return fallback
+            trace.setdefault('input_budget', []).append(planner_budget)
+        cache_key = hashlib.sha256((
+            f"{CACHE_VERSION}\nquery-runtime-v1\n{QUERY_UNDERSTANDING_VERSION}\n"
+            + (ORDINARY_INPUT_BUDGET_VERSION + '\n' + planner_budget['counter_identity'] + '\n' if planner_budget else '') +
+            f"{self._runtime_identity(runtime)}\n{prompt}").encode("utf-8")
+        ).hexdigest()
+        if cache is not None:
+            cached = cache.get(cache_key)
+            if self._runtime_cache_entry(cached, runtime) and cached.get("canonical_question"):
+                return parse_query_understanding(json.dumps(cached, ensure_ascii=False), question)
         with _pipeline_span("llm.query_understanding") as span:
             try:
-                response = self.llm.complete(prompt)
+                response = (runtime.client if runtime is not None else self.llm).complete(prompt)
                 understanding = parse_query_understanding(str(response).strip(), question)
                 span.set_attribute("rag.query_understanding.fallback", False)
                 span.set_attribute("rag.query_understanding.facets", len(understanding.facets))
@@ -3451,6 +3861,7 @@ class RAGAgent:
 
         if cache is not None:
             cache.set(cache_key, {
+                "runtime_identity": self._runtime_identity(runtime), "producer": self._producer(runtime),
                 "canonical_question": understanding.canonical_question,
                 "facets": list(understanding.facets),
                 "retrieval_queries": list(understanding.retrieval_queries),
@@ -3472,10 +3883,17 @@ class RAGAgent:
         source_versions: dict[str, str] | None = None,
         retrieval_focus: str = "auto",
         pipeline_mode: str | None = None,
+        runtime: RuntimeSnapshot | None = None,
+        selection_mode: str | None = None,
     ) -> tuple[str, list[dict], bool]:
-        """
-        Возвращает (answer, sources, from_cache).
-        sources — список dict с ключами file, section, score.
+        """Вернуть (answer, sources, from_cache) для одного изолированного запроса.
+
+        Правила видимости и исходный вопрос передаются до поиска; общий кеш
+        разрешен только после проверки, что использованы общие документы.
+        runtime фиксирует провайдера на весь запрос. sources содержит file,
+        section, text_preview и необязательную числовую оценку score (None,
+        если исходный раздел не имел ранга). Диагностика остается локальной
+        для потока; повторный поиск для заполнения панели не выполняется.
         """
         # Answer caching is intentionally retrieval-first.  A pre-retrieval
         # cache key cannot prove that an answer was based only on globally
@@ -3486,6 +3904,9 @@ class RAGAgent:
         self._generation_state.from_cache = False
         self._generation_state.retrieved_context = []
         self._generation_state.retrieval_trace = {"mode":"legacy"}
+        self._generation_state.ordinary_prompt_budget = False
+        runtime = runtime if runtime is not None else self.capture_runtime()
+        self._generation_state.producer = self._producer(runtime)
         search_question = (retrieval_query or question).strip()
 
         self._refresh_docstore_if_changed()
@@ -3498,17 +3919,34 @@ class RAGAgent:
 
         mode = (pipeline_mode or os.getenv("RAG_CORRECTIVE_PIPELINE", "off")).strip().casefold()
         if mode == "on":
+            if selection_mode is not None:
+                raise ValueError("selection_mode cannot override the corrective pipeline selector")
             return self._ask_corrective(
                 question, search_question, system_prompt or shared_system_prompt,
+                **({"runtime": runtime} if runtime is not None else {}),
                 excluded_sources=excluded_sources, source_aliases=source_aliases,
                 priority_sources=priority_sources, source_domains=source_domains,
                 source_versions=source_versions, retrieval_focus=retrieval_focus,
             )
 
+        # The ordinary Python writer can test coverage independently of the
+        # corrective planner/judge. Capture this once so an environment reload
+        # cannot change retrieval or cache identity halfway through a request.
+        applied_selection, selection_source = _resolve_evidence_selection_mode(
+            selection_mode, use_environment=True)
+        self._generation_state.ordinary_prompt_budget = applied_selection == 'coverage'
+        trace = self._generation_state.retrieval_trace
+        trace.update(selection_mode_requested=applied_selection,
+            selection_mode_source=selection_source, selection_mode="not_applied",
+            selection_applied=False)
+
         # A short follow-up (for example, "а по какой формуле?") has no entity
         # of its own.  Build the PRISM contract from the contextual retrieval
         # query so deterministic formula extraction retains the subject too.
-        understanding = self.understand_query(search_question)
+        try:
+            understanding = self.understand_query(search_question, **({"runtime": runtime} if runtime is not None else {}))
+        finally:
+            self._generation_state.ordinary_prompt_budget = False
         understood_question = understanding.canonical_question
         spec = refine_prism_query(understood_question)
         context = self.retrieve_context(
@@ -3523,6 +3961,11 @@ class RAGAgent:
             source_versions=source_versions,
             retrieval_focus=retrieval_focus,
             subject_question=search_question,
+            selection_mode=applied_selection,
+            retrieval_trace=trace,
+            **({'user_task':UserTask(question,search_question)} if applied_selection == 'coverage'
+               and os.getenv('RAG_PREPACK_SOURCE_READING','off').casefold() in {'true','1','on'} else {}),
+            **({"runtime": runtime} if runtime is not None else {}),
         )
         if is_document_occurrence_question(understood_question):
             context = [
@@ -3533,6 +3976,7 @@ class RAGAgent:
         # Keeping it request-thread-local avoids a second, potentially divergent
         # retrieval pass and cannot cross-contaminate simultaneous chats.
         self._generation_state.retrieved_context = [dict(item) for item in context]
+        negative_scope = _negative_scope_limits(context, trace)
         calculations = extract_formula_lines_from_texts([item["text"] for item in context], understood_question)
         answer = (
             generate_document_occurrence_answer(understood_question, context)
@@ -3561,14 +4005,12 @@ class RAGAgent:
                 shared_system_prompt if cache_enabled else system_prompt,
                 evidence_question=understood_question,
                 cache_enabled=cache_enabled,
+                selection_mode=applied_selection,
+                **({"negative_scope": negative_scope} if negative_scope else {}),
+                **({"runtime": runtime} if runtime is not None else {}),
             )
 
-        sources = [{
-            "file": item["file"],
-            "section": item.get("section_path", ""),
-            "score": item["score"],
-            "text_preview": item["text"][:120],
-        } for item in context]
+        sources = build_answer_sources(context)
 
         return answer, sources, bool(self.last_generation_from_cache)
 
@@ -3584,15 +4026,47 @@ class RAGAgent:
         """Request-local decisions and provenance, never hidden reasoning."""
         return dict(getattr(getattr(self,"_generation_state",None),"retrieval_trace",{}) or {})
 
-    def _ask_corrective(self, question: str, search_question: str, system_prompt: str | None, **scope):
-        from corrective_rag import run_corrective, EvidenceSelection
+    def _document_navigation_for_scope(self, constraint_question: str, **scope):
+        """Build a private native snapshot AFTER the existing USER scope guards.
+
+        Do not use assembled sections: they are a ranking/packing view, not
+        authority to concatenate different revisions for a read tool.
+        """
+        from copy import deepcopy
+        from document_navigation import DocumentNavigationProvider
+        from evidence_selection import term_keys
+        self._refresh_docstore_if_changed()
+        index = getattr(self,'_section_evidence_index',None)
+        if index is None or getattr(self,'_section_evidence_nodes',None) is not self._all_nodes:
+            index = SectionEvidenceIndex(self._all_nodes)
+            self._section_evidence_index = index
+            self._section_evidence_nodes = self._all_nodes
+        native = filter_scoped_evidence(deepcopy(index.body_items),constraint_question,
+            source_aliases=scope.get('source_aliases'),excluded_sources=scope.get('excluded_sources'),
+            source_versions=scope.get('source_versions'),spec=refine_prism_query(constraint_question))
+        native = filter_query_applicability(native,constraint_question)
+        return DocumentNavigationProvider(native,features=term_keys)
+
+    def _ask_corrective(self, question: str, search_question: str, system_prompt: str | None,
+                        runtime: RuntimeSnapshot | None = None, **scope):
+        """Run bounded corrective search using one captured provider and scope.
+
+        Optional planning/reading stages are controlled by independent feature
+        flags. Record evidence and completion diagnostics in request-local state;
+        do not expose this path as a quality guarantee for arbitrary corpora.
+        """
+        from corrective_rag import run_corrective, EvidenceSelection, preference_retention_limits
         completions = []
         # A settings change in another chat must not switch this multi-stage
         # request to a different model/provider midway through its evidence.
-        request_llm = self.llm
-        request_model = str(getattr(request_llm,'model',None) or
-                            getattr(request_llm,'model_name',None) or self.llm_model)
-        read_before_answer = os.getenv('RAG_SOURCE_READING','off').casefold() in {'true','1','on'}
+        request_llm = runtime.client if runtime is not None else self.llm
+        request_model = runtime.spec.model if runtime is not None else str(
+            getattr(request_llm,'model',None) or getattr(request_llm,'model_name',None) or self.llm_model)
+        prepack_source_reading = os.getenv('RAG_PREPACK_SOURCE_READING','off').casefold() in {'true','1','on'}
+        diverse_candidate_admission = os.getenv('RAG_QUERY_DIVERSE_ADMISSION','off').casefold() in {'true','1','on'}
+        document_navigation = os.getenv('RAG_DOCUMENT_NAVIGATION','off').casefold() in {'true','1','on'}
+        read_before_answer = (prepack_source_reading or
+                              os.getenv('RAG_SOURCE_READING','off').casefold() in {'true','1','on'})
         check_answer_scope = os.getenv('RAG_TASK_SCOPE_CHECK','off').casefold() in {'true','1','on'}
         planner_thinking = os.getenv('RAG_PLANNER_THINKING','false').casefold() in {'true','1','on'}
         planner_token_budget = int(os.getenv('RAG_PLANNER_TOKEN_BUDGET','4096'))
@@ -3601,10 +4075,29 @@ class RAGAgent:
                                getattr(request_llm,'base_url',OLLAMA_BASE_URL)).rstrip('/')
 
         def complete(prompt, purpose):
+            """Выполнить этап текущего запроса через захваченный клиент и записать наблюдаемые параметры."""
             started = time.perf_counter()
             event = {"purpose":purpose,"thinking_requested":False,"thinking_used":False}
             try:
-                thinking = purpose != "answer" and planner_thinking
+                thinking = (purpose != "answer" and planner_thinking and
+                            (runtime is None or runtime.spec.provider == "ollama"))
+                if runtime is not None:
+                    event['thinking_requested'] = thinking
+                    # A requested flag is not an observation of the remote
+                    # server's reasoning mode; never label unknown as false.
+                    event['thinking_used'] = None
+                    if purpose != "answer":
+                        stage_response = runtime.complete_stage(prompt, max_tokens=planner_token_budget,
+                            timeout=planner_timeout, thinking=thinking, purpose=purpose)
+                        stage_meta = getattr(stage_response, 'additional_kwargs', {})
+                        if isinstance(stage_meta, dict) and type(stage_meta.get('termination_observed')) is bool:
+                            event['termination_observed'] = stage_meta['termination_observed']
+                            event['termination_status'] = 'stop' if stage_meta['termination_observed'] else 'unknown'
+                        raw = getattr(stage_response, 'raw', None)
+                        if isinstance(raw, dict) and type(raw.get('thinking_enabled')) is bool:
+                            event['thinking_used'] = raw['thinking_enabled']
+                        return str(stage_response).strip()
+                    return str(runtime.client.complete(prompt)).strip()
                 if purpose!='answer' and isinstance(request_llm,Ollama):
                     import requests
                     event['thinking_requested'] = thinking
@@ -3639,12 +4132,21 @@ class RAGAgent:
                 event['elapsed_s'] = round(time.perf_counter()-started,3)
                 completions.append(event)
 
-        def retrieve(original, queries, facets, trace, *, search_focus, constraint_question):
-            return self.retrieve_context(original,TOP_K,retrieval_queries=queries,subject_question=original,
-                selection_mode='coverage',evidence_facets=facets,retrieval_trace=trace,
-                search_focus=search_focus,constraint_question=constraint_question,**scope)
+        request_query_ranks = None
 
-        def select(original, pool, facets, *, search_focus, constraint_question):
+        def retrieve(original, queries, facets, trace, *, search_focus, constraint_question):
+            """Получить кандидатов текущего раунда с независимым учетом рангов запросов."""
+            nonlocal request_query_ranks
+            request_query_ranks = new_query_rank_context(constraint_question)
+            return self.retrieve_context(original,TOP_K,retrieval_queries=queries,subject_question=original,
+                **({'runtime':runtime} if runtime is not None else {}),
+                selection_mode='coverage',evidence_facets=facets,retrieval_trace=trace,
+                search_focus=search_focus,constraint_question=constraint_question,
+                query_rank_context=request_query_ranks,
+                **({'candidate_pool_only':True} if prepack_source_reading or document_navigation else {}),**scope)
+
+        def select(original, pool, facets, *, search_focus, constraint_question, preferred_passages=()):
+            """Собрать видимые доказательства и согласовать ограничения после фильтрации."""
             index = getattr(self,'_section_evidence_index',None)
             if index is None:
                 index = SectionEvidenceIndex(self._all_nodes)
@@ -3653,13 +4155,32 @@ class RAGAgent:
             packed = index.select_v2(original,pool,excluded_sources=scope.get('excluded_sources'),
                 allowed_sources=explicit or (set(scope['source_aliases']) if scope.get('source_aliases') is not None else None),
                 top_k=TOP_K,max_chars=int(os.getenv('RAG_EVIDENCE_MAX_CHARS','36000')),facets=facets,
-                selection_meta=selection_meta,search_focus=search_focus,constraint_question=constraint_question)
+                selection_meta=selection_meta,search_focus=search_focus,constraint_question=constraint_question,
+                query_rank_context=request_query_ranks,
+                **({'preferred_passages':preferred_passages} if preferred_passages else {}))
             from evidence_anchors import reconcile_evidence_families, inventory_limits_after_filter
             scoped = filter_scoped_evidence(packed,constraint_question,source_aliases=scope.get('source_aliases'),
                 excluded_sources=scope.get('excluded_sources'),source_versions=scope.get('source_versions'),
                 spec=refine_prism_query(constraint_question))
             scoped = reconcile_evidence_families(scoped,packed)
-            return EvidenceSelection(scoped,inventory_limits_after_filter(selection_meta,packed,scoped))
+            return EvidenceSelection(scoped,{
+                **inventory_limits_after_filter(selection_meta,packed,scoped),
+                **preference_retention_limits(selection_meta)})
+
+        def admit(user_task, pool, *, max_chars, constraint_question):
+            """Ограничить пакет для чтения без изменения исходных цитат и их идентичности."""
+            from candidate_admission import order_by_query_coverage, order_by_query_frontiers
+            # Reading precedes final packing: offer original/paraphrase result
+            # frontiers before asking the reader to judge semantic relevance.
+            # Cost-aware packing remains unchanged outside this opt-in route.
+            ordering = order_by_query_frontiers if prepack_source_reading else order_by_query_coverage
+            return ordering(pool,max_chars=max_chars,query_rank_context=request_query_ranks)
+
+        def navigate(user_task, plan, candidates, *, max_chars):
+            """Разрешить ограниченное чтение только через навигатор доступных документов."""
+            from source_navigation import navigate_sources
+            provider = self._document_navigation_for_scope(user_task.resolved_user_context,**scope)
+            return navigate_sources(user_task,plan,provider,complete,max_read_chars=max_chars)
 
         excluded = {Path(str(source)).name.casefold() for source in scope.get('excluded_sources') or ()}
         explicit = matching_explicit_sources(search_question,scope.get('source_aliases'))
@@ -3672,21 +4193,26 @@ class RAGAgent:
             max_context_chars=min(int(os.getenv('RAG_EVIDENCE_MAX_CHARS','36000')),
                                   max(2000,(int(request_llm.metadata.context_window)-4096)*2)),
             corpus_hints=corpus_hints,
-            read_before_answer=read_before_answer, check_answer_scope=check_answer_scope)
+            read_before_answer=read_before_answer, check_answer_scope=check_answer_scope,
+            **({'admit':admit} if diverse_candidate_admission else {}),
+            **({'navigate':navigate} if document_navigation else {}),
+            **({'prepack_source_reading':True} if prepack_source_reading else {}))
+        if prepack_source_reading:
+            result.trace['candidate_pool_only'] = True
         result.trace.update(mode='corrective',completions=completions,
-                            model=request_model,provider=getattr(request_llm,'provider','ollama'),
+                            model=request_model,provider=runtime.spec.provider if runtime is not None else getattr(request_llm,'provider','ollama'),
                             corpus_snapshot=getattr(self,'_docstore_mtime_ns',0))
         self._generation_state.retrieved_context = result.context
         self._generation_state.retrieval_trace = result.trace
         self._generation_state.from_cache = False
         labels = {item['evidence_id']:human_source_reference(item) for item in result.context}
         def render_citations(match):
+            """Заменить известные E-ID ссылочными подписями выбранных источников."""
             identifiers = [eid.upper() for eid in re.findall(r'E\d+',match.group(0),re.I)]
             return ' '.join('[Источник: '+labels[eid]+']' for eid in dict.fromkeys(identifiers) if eid in labels)
 
         answer = re.sub(r'\[E\d+(?:\s*[,;]\s*E\d+)*\]',render_citations,result.answer,flags=re.I)
-        sources = [{"file":item['file'],"section":item.get('section_path',''),"score":item.get('score',0),
-                    "text_preview":item['text'][:120]} for item in result.context]
+        sources = build_answer_sources(result.context)
         return answer,sources,False
 
     def _generate_grounded_answer(
@@ -3698,22 +4224,124 @@ class RAGAgent:
         system_prompt: str | None = None,
         evidence_question: str | None = None,
         cache_enabled: bool = False,
+        runtime: RuntimeSnapshot | None = None,
+        selection_mode: str = "legacy",
+        negative_scope: dict | None = None,
     ) -> str:
+        """Generate from selected evidence under the captured publication mode.
+
+        Coverage mode builds an immutable source packet, checks the full input
+        budget and validates publication/cache proof. Legacy mode retains its
+        compatibility behavior. This method formats approved evidence; it must
+        not widen document permissions or silently switch the request's model.
+        """
+        # Callers pass the captured request mode. Direct/hybrid callers retain
+        # legacy semantics and never consult the ordinary-chat environment.
+        selection_mode, _ = _resolve_evidence_selection_mode(selection_mode)
+        packet = None
+        guard_result = None
+        formula_requirements = None
+        if selection_mode == "coverage":
+            request_trace = getattr(self._generation_state, "retrieval_trace", {}) or {}
+            packet = build_source_packet(context, human_source_reference,
+                selection_limits=request_trace.get("selection_limits", {}))
+            context = packet.sources
+            formula_requirements = build_formula_requirements(packet,evidence_question or question,calculations)
+        draft_protocol = None
+        native_rows = ()
+        if packet is not None and os.getenv('RAG_STRUCTURED_WRITER','off').casefold() in {'true','1','on'}:
+            import answer_draft_protocol as draft_protocol
+            from native_source_rows import build_native_rows
+            native_rows = build_native_rows(packet,format_formula_for_katex)
+
+        def decode_writer_draft(value):
+            """Разобрать протокол автора и оформить текст, не выбирая за модель источник утверждения."""
+            value = str(value).strip()
+            if draft_protocol is not None:
+                value = draft_protocol.render(value,{row['evidence_id'] for row in packet.sources},
+                    {row['formula_id']:row['evidence_id'] for row in packet.formulae},
+                    {row.row_id:row for row in native_rows})
+            return (format_grounded_answer(value) if packet is not None
+                    else sanitize_grounded_answer(value, question, calculations))
+
+        def quality_status(status, reasons=(), diagnostics=None):
+            """Записать статус публикации в диагностику только текущего запроса."""
+            if packet is None:
+                return
+            trace = getattr(self._generation_state, "retrieval_trace", None)
+            if not isinstance(trace, dict):
+                trace = {}
+                self._generation_state.retrieval_trace = trace
+            trace["publication_verification"] = {"version": GUARD_VERSION,
+                "packet_sha256": packet.digest, "status": status, "reason_codes": list(reasons)}
+            if diagnostics is not None:
+                trace["publication_verification"]["review_diagnostics"] = dict(diagnostics)
+
+        def deterministic_result(value):
+            """Проверить извлеченный ответ перед публикацией либо вернуть подтвержденные исходные сведения."""
+            if packet is None:
+                return value
+            checked = check_formula_draft(value, packet, evidence_question or question)
+            quality_status("source_extractive" if checked.accepted else "partial", checked.reasons)
+            return checked.answer if checked.accepted else extractive_partial(packet, checked.reasons)
+
+        negative_scope = _negative_scope_limits(context, negative_scope)
         self._generation_state.from_cache = False
+        self._generation_state.producer = self._producer(runtime)
+        request_llm = runtime.client if runtime is not None else getattr(self, "llm", None)
+        request_model = runtime.spec.model if runtime is not None else self._producer(None)["model"]
+        budget_failure = None
+
+        def input_preflight(value, stage):
+            """Проверить полный вход этапа до вызова модели; не обрезать доказательства молча."""
+            nonlocal budget_failure
+            if packet is None:
+                return
+            trace = getattr(self._generation_state, 'retrieval_trace', None)
+            if not isinstance(trace, dict):
+                trace = {}
+                self._generation_state.retrieval_trace = trace
+            try:
+                diagnostic = _ordinary_prompt_preflight(value, runtime, request_llm, stage)
+            except OrdinaryInputBudgetError as exc:
+                budget_failure = exc.diagnostic
+                trace.setdefault('input_budget', []).append(exc.diagnostic)
+                raise
+            trace.setdefault('input_budget', []).append(diagnostic)
+            return diagnostic
+
+        def budget_notice():
+            """Объяснить отказ от генерации при переполнении или неизвестном размере контекста."""
+            if budget_failure and budget_failure['code'] == 'input_budget_exceeded':
+                return ('Полный набор источников и условий не поместился в доступный контекст модели. '
+                        'Чтобы не потерять важные условия, сгенерированный ответ не опубликован. '
+                        'Ниже сохранены исходные сведения с ссылками на документы.')
+            return ('Не удалось безопасно проверить объём контекста модели. '
+                    'Ниже сохранены исходные сведения с ссылками на документы.')
         spec = spec or refine_prism_query(question)
         transcription = generate_image_transcription_answer(question, context)
         if transcription:
-            return transcription
-        if spec.answer_mode == "formulas_only":
-            return generate_formula_only_answer(evidence_question or question, context, calculations, spec)
+            return _with_negative_scope_notice(deterministic_result(transcription), negative_scope)
+        # Coverage answers need the same source/applicability judgement even
+        # when the user's requested format is only a formula. The legacy
+        # template can otherwise return parser notation or a first-matched
+        # special case without ever reaching the writer/publication guard.
+        if spec.answer_mode == "formulas_only" and packet is None:
+            return _with_negative_scope_notice(
+                deterministic_result(generate_formula_only_answer(evidence_question or question, context, calculations, spec)), negative_scope)
         extractive = generate_extractive_value_answer(question, context, calculations)
         if extractive:
-            return extractive
+            return _with_negative_scope_notice(deterministic_result(extractive), negative_scope)
 
         context_text = "\n\n---\n\n".join(
             f"[Источник: {human_source_reference(item)}]\n{item['text']}"
             for item in context
         )
+        source_packet_block = writer_contract(packet) if packet is not None else ""
+        if packet is not None:
+            # Only the model projection is sent, once. The immutable packet
+            # retains exact source bytes for verification and user citations.
+            context_text = "Используй проверяемый пакет источников ниже."
         normalized_question = question.lower()
         is_procedural = bool(re.search(r"\bкак\s+(создать|настроить|добавить|открыть|заполнить|изменить)\b", normalized_question))
         is_calculation_question = not is_procedural and asks_for_calculation(evidence_question or question)
@@ -3723,6 +4351,8 @@ class RAGAgent:
                 f"- {format_formula_for_katex(calculation, display=True) if '=' in calculation else calculation}"
                 for calculation in calculations
             )
+        if packet is not None:
+            calculations_block = ""
         interpretation_block = ""
         if evidence_question and evidence_question.strip() != question.strip():
             interpretation_block = (
@@ -3731,6 +4361,14 @@ class RAGAgent:
                 "Ответь на все части этой интерпретации, но не упоминай исправление опечаток.\n"
             )
         evidence_plan = generation_evidence_prompt(context)
+        if negative_scope:
+            evidence_plan += (
+                "\n\nПОЛНОТА ИСКЛЮЧЕНИЯ ТЕМ НЕ ПОДТВЕРЖДЕНА:\n"
+                + json.dumps(negative_scope, ensure_ascii=False, sort_keys=True)
+                + "\nНе объявляй полное соблюдение исключения. Не излагай исключённую тему как самостоятельный ответ. "
+                "Сохрани смысл связанных условий источника и явно обозначь оставшуюся неопределённость; "
+                "не придумывай оснований для неё."
+            )
         required_sections = overview_sections(evidence_question or question, context)
         if required_sections:
             evidence_plan += "\n\nОБЯЗАТЕЛЬНЫЙ ПЛАН ОБЗОРНОГО ОТВЕТА:\n" + "\n".join(
@@ -3738,10 +4376,11 @@ class RAGAgent:
                 for item in required_sections
             )
             evidence_plan += "\nНе ограничивайся упоминанием названия в общем перечне. Не пропускай ни один пункт плана."
-        prompt = f"""{system_prompt or GROUNDED_SYSTEM_PROMPT}
+        default_system_prompt = COVERAGE_SYSTEM_PROMPT if packet is not None else GROUNDED_SYSTEM_PROMPT
+        prompt = f"""{system_prompt or default_system_prompt}
 
 Ниже приведены данные для ответа. Используй их как единственный фактический контекст: не выдумывай сведения, которых в нём нет. Всегда отвечай на русском языке.
-После каждого самостоятельного факта или группы пунктов ставь ровно одну цитату из соответствующего блока контекста в формате [Источник: имя файла — точный раздел или пункт]. Не заменяй точный раздел названием документа и не повторяй одну и ту же цитату подряд.
+{'Проставляй ссылки по правилам E-ID из проверяемого пакета источников ниже.' if packet is not None else 'После каждого самостоятельного факта или группы пунктов ставь ровно одну цитату из соответствующего блока контекста в формате [Источник: имя файла — точный раздел или пункт]. Не заменяй точный раздел названием документа и не повторяй одну и ту же цитату подряд.'}
 Если вопрос о расчете, объясни порядок и используй все относящиеся к нему документы. Каждую формулу выводи отдельным блоком только в корректном LaTeX между $$ и $$; никогда не помещай формулу в обратные кавычки и не показывай служебную запись вида S(...), W(...), T(...).
 Сначала изложи основное правило или определение из раздела, непосредственно соответствующего вопросу. Частные случаи и исключения описывай после него с явным указанием условий; не подменяй ими общее правило. Для обзорного вопроса охвати представленные подразделы, а не только первый найденный фрагмент. В сравнении раскрой каждую сторону отдельно. Различай цену за единицу и итоговую стоимость, виды услуг и составляющие цены. Если запрошен нормативный источник, не заменяй его методикой системы.
 Цитируй только факты, которые подтверждаются текстом фрагмента. Название файла само по себе ничего не доказывает. Не заявляй отсутствие сведений во всём документе на основании неполного фрагмента. Метки IMAGE_UNREAD означают недоступное содержимое рисунка: не выдумывай его формулу. IMAGE_OCR содержит распознанный текст изображения и может искажать индексы и математические знаки; точную формулу по нему не заявляй без подтверждения текстом или MATH из документа.
@@ -3756,61 +4395,88 @@ class RAGAgent:
 
 {interpretation_block}
 
+{source_packet_block}
+
 ВОПРОС:
 {question}
 
 ОТВЕТ:
 """
+        if draft_protocol is not None:
+            prompt += draft_protocol.contract([row['evidence_id'] for row in packet.sources],native_rows)
+        writer_budget = None
+        if packet is not None:
+            try:
+                writer_budget = input_preflight(prompt, 'writer')
+            except OrdinaryInputBudgetError:
+                quality_status('partial', (budget_failure['code'],), {'input_budget': budget_failure})
+                return _with_negative_scope_notice(budget_notice() + '\n\n' +
+                    extractive_partial(packet, (budget_failure['code'],)), negative_scope)
         # A dedicated worker can atomically replace the docstore while web
         # workers stay alive.  Include its snapshot marker so a global answer
         # never survives a corpus update merely because its old prompt happens
         # to look identical.
         corpus_snapshot = getattr(self, "_docstore_mtime_ns", 0)
-        generation_key = _question_hash(
-            f"generation\n{corpus_snapshot}\n{self.llm_model}\n{prompt}"
-        )
+        generation_key = hashlib.sha256((
+            f"{CACHE_VERSION}\ngeneration-selector-v1\n{selection_mode}\n{corpus_snapshot}\n"
+            + (f"{GUARD_VERSION}\n{ORDINARY_INPUT_BUDGET_VERSION}\n{writer_budget['counter_identity']}\n{packet.digest}\n{formula_requirements.digest}\n" if packet is not None else "")
+            +
+            f"{self._runtime_identity(runtime)}\n{prompt}").encode("utf-8")
+        ).hexdigest()
         cached = None
+        cache_hit = False
         if cache_enabled:
             with _pipeline_span("cache.lookup") as span:
                 cached = self.response_cache.get(generation_key)
-                span.set_attribute("rag.cache.hit", bool(cached))
-        if isinstance(cached, dict) and isinstance(cached.get("answer"), str):
+                cache_hit = (self._runtime_cache_entry(cached, runtime) and isinstance(cached.get("answer"), str)
+                    and (packet is None or valid_cache_proof(cached.get("ordinary_guard"),
+                        packet, question, str(cached["answer"]),requirements=formula_requirements)))
+                span.set_attribute("rag.cache.hit", cache_hit)
+        if cache_hit:
             self._generation_state.from_cache = True
+            self._generation_state.producer = dict(cached["producer"])
             with _pipeline_span("cache.hit"):
                 pass
-            answer = sanitize_grounded_answer(str(cached["answer"]), question, calculations)
-            answer = ensure_requested_formula_coverage(
-                answer,
-                evidence_question or question,
-                calculations,
-                context,
-            )
-            return answer
+            answer = str(cached["answer"])
+            if packet is None:
+                answer = sanitize_grounded_answer(answer, question, calculations)
+                answer = ensure_requested_formula_coverage(
+                    answer, evidence_question or question, calculations, context)
+            quality_status("verified_cache")
+            return _with_negative_scope_notice(answer, negative_scope)
         with _pipeline_span(
             "llm.generate",
             attributes={
                 "gen_ai.operation.name": "generate_content",
-                "gen_ai.request.model": self.llm_model,
+                "gen_ai.request.model": request_model,
                 "rag.context.count": len(context),
             },
         ) as span:
-            response = self.llm.complete(prompt)
-            answer = sanitize_grounded_answer(str(response).strip(), question, calculations)
-            answer = ensure_requested_formula_coverage(
-                answer,
-                evidence_question or question,
-                calculations,
-                context,
-            )
+            if request_llm is None:
+                raise RuntimeError("Generation client is unavailable")
+            response = request_llm.complete(prompt)
+            try:
+                answer = decode_writer_draft(response)
+            except (ValueError, TypeError):
+                if draft_protocol is None:
+                    raise
+                quality_status('partial', ('writer_protocol_invalid',))
+                return _with_negative_scope_notice(extractive_partial(packet, ('writer_protocol_invalid',)),negative_scope)
+            if packet is None:
+                answer = ensure_requested_formula_coverage(
+                    answer, evidence_question or question, calculations, context)
             if not answer:
+                if packet is not None:
+                    quality_status("partial", ("empty_writer_draft",))
+                    return _with_negative_scope_notice(extractive_partial(packet, ("empty_writer_draft",)), negative_scope)
                 raise RuntimeError("LLM returned an empty answer")
             missing = missing_overview_sections(answer, required_sections)
-            if missing:
+            if missing and packet is None:
                 repair_context = "\n\n".join(
                     f"### {item['section_title']}\n[Источник: {human_source_reference(item)}]\n{item['text']}"
                     for item in missing
                 )
-                repair = self.llm.complete(
+                repair = request_llm.complete(
                     "На русском напиши только недостающие разделы обзорного ответа. "
                     "Каждый раздел начни точным заголовком ### из источника; объясни его содержание "
                     "и условия, а не только название. Используй только приведенный текст. "
@@ -3830,14 +4496,60 @@ class RAGAgent:
                         for item in missing
                     )
             span.set_attribute("rag.response.chars", len(answer))
-        if cache_enabled:
-            self.response_cache.set(generation_key, {"answer": answer})
+        if packet is not None:
+            def review_draft(review_prompt):
+                """Запросить структурированную проверку черновика с отдельным ограничением входа и вывода."""
+                from review_protocol import compact_review_prompt, decode_review_response
+                wire_prompt = compact_review_prompt(review_prompt)
+                input_preflight(wire_prompt, 'critic')
+                if runtime is not None:
+                    result = runtime.complete_stage(wire_prompt, max_tokens=4096, timeout=120,
+                        thinking=False, purpose="evidence-review")
+                else:
+                    result = request_llm.complete(wire_prompt)
+                if isinstance(result, dict):
+                    return result
+                try:
+                    return decode_review_response(str(result))
+                except json.JSONDecodeError:
+                    # Preserve the existing JSON failure classification and
+                    # redaction in the publication guard.
+                    return str(result)
+
+            def repair_draft(repair_prompt):
+                """Выполнить ограниченную правку черновика с тем же пакетом и протоколом источников."""
+                if draft_protocol is not None:
+                    repair_prompt += draft_protocol.contract([row['evidence_id'] for row in packet.sources],native_rows)
+                input_preflight(repair_prompt, 'repair')
+                value = request_llm.complete(repair_prompt)
+                return decode_writer_draft(value)
+
+            guard_result = publish_draft(answer, packet, question,
+                reviewer=review_draft, repairer=repair_draft,requirements=formula_requirements)
+            answer = guard_result.answer
+            quality_status("verified" if guard_result.accepted else "partial", guard_result.reasons,guard_result.diagnostics)
+            if budget_failure:
+                answer = budget_notice() + '\n\n' + answer
+                quality_status('partial', (*guard_result.reasons, budget_failure['code']),
+                    {'input_budget': budget_failure})
+        answer = _with_negative_scope_notice(answer, negative_scope)
+        if cache_enabled and (packet is None or (guard_result is not None and guard_result.accepted and not budget_failure)):
+            self.response_cache.set(generation_key, {"answer": answer,
+                "runtime_identity": self._runtime_identity(runtime), "producer": self._producer(runtime),
+                **({"ordinary_guard": cache_proof(packet, question, answer, guard_result,requirements=formula_requirements)} if packet is not None else {})})
         return answer
 
-    def debug_retrieval(self, question: str, top_k: int = 10):
+    def debug_retrieval(self, question: str, top_k: int = 10, selection_mode: str | None = None):
         """Показать найденные чанки без вызова LLM."""
-        results = self.retrieve_context(question, top_k)
-        print(f"DEBUG retrieval top-{len(results)} для «{question}»:")
+        selection_mode, selection_source = _resolve_evidence_selection_mode(
+            selection_mode, use_environment=True)
+        if not hasattr(self, "_generation_state"):
+            self._generation_state = threading.local()
+        trace = {"mode": "legacy", "selection_mode_source": selection_source}
+        self._generation_state.retrieval_trace = trace
+        results = self.retrieve_context(question, top_k,
+            selection_mode=selection_mode, retrieval_trace=trace)
+        print(f"DEBUG retrieval top-{len(results)} selection={trace.get('selection_mode')} для «{question}»:")
         for i, item in enumerate(results, 1):
             preview = item["text"][:700].replace("\n", " ")
             print(f"\n{i}. {item['file']}  score={item['score']:.4f}")
@@ -3958,6 +4670,7 @@ class RAGAgent:
                     **{key: value for key, value in meta.items() if key in {
                         "section_path", "section_title", "parent_section", "status", "chunk_type",
                     } and value},
+                    **_native_identity_metadata(meta),
                 }
                 best = item
                 break
@@ -3973,7 +4686,7 @@ class RAGAgent:
 
         terms = section_query_terms(question)
         seeds: list[dict] = []
-        seen: set[str] = set()
+        seen: set[object] = set()
         for number in section_numbers:
             matches: list[tuple[float, dict]] = []
             number_pattern = re.compile(rf"(?<!\d){re.escape(number)}(?:\.|\b)(?!\d)")
@@ -3995,6 +4708,7 @@ class RAGAgent:
                         "status",
                         "chunk_type",
                     } and v},
+                    **_native_identity_metadata(meta),
                 }
                 if chunk_meta.get("status") == "deleted":
                     continue
@@ -4020,7 +4734,7 @@ class RAGAgent:
                 matches.append((score, item))
 
             for _, item in sorted(matches, key=lambda pair: pair[0], reverse=True):
-                key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
+                key = _retrieval_record_identity(item)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -4053,6 +4767,7 @@ class RAGAgent:
                         "status",
                         "chunk_type",
                     } and v},
+                    **_native_identity_metadata(meta),
                 }
                 if chunk_meta.get("status") == "deleted" or chunk_meta.get("chunk_type") in {"cost", "rate", "history"}:
                     continue
@@ -4362,6 +5077,7 @@ class RAGAgent:
                 **{k: v for k, v in meta.items() if k in {
                     "section_path", "section_title", "parent_section", "status", "chunk_type",
                 } and v},
+                **_native_identity_metadata(meta),
             }
             if chunk_meta.get("status") == "deleted":
                 continue
@@ -4382,13 +5098,18 @@ class RAGAgent:
             matches.append(result)
         return [item for _, item in sorted(matches, key=lambda pair: pair[0], reverse=True)[:3]]
 
-    def _regulation_concept_seed_results(self, question: str) -> list[dict]:
-        """Return only the governing clause for recurring regulation concepts.
+    def _regulation_concept_seed_results(
+        self, question: str, *, constraint_question: str | None = None,
+        source_aliases: dict[str, str] | None = None,
+        excluded_sources: set[str] | None = None,
+        source_versions: dict[str, str] | None = None,
+    ) -> list[dict]:
+        """Rank native governing clauses within the authorized source scope.
 
         These anchors are intentionally based on the document's own headings
-        and terms, not on generated answers.  They prevent a later cost/rate
-        clause from outranking the base rule merely because it repeats the
-        same abbreviation.
+        and terms, not a preferred filename. Apply USER-origin eligibility
+        before the bounded seed quota; a hidden or inapplicable row must not
+        displace an available governing clause from another document.
         """
         normalized = question.lower().replace("ё", "е")
         required: tuple[str, ...] = ()
@@ -4410,8 +5131,7 @@ class RAGAgent:
         if not required:
             return []
 
-        matches: list[tuple[float, dict]] = []
-        primary_matches: list[tuple[float, dict]] = []
+        matches: list[dict] = []
         for node in self._all_nodes:
             meta = node.metadata or {}
             text = node.text or ""
@@ -4426,6 +5146,7 @@ class RAGAgent:
                 key: value for key, value in meta.items()
                 if key in {"section_path", "section_title", "parent_section", "status", "chunk_type"} and value
             }}
+            chunk_meta.update(_native_identity_metadata(meta))
             if chunk_meta.get("status") == "deleted":
                 continue
             score = 2.0 + sum(0.35 for phrase in preferred if phrase in lower)
@@ -4433,18 +5154,20 @@ class RAGAgent:
             # never the governing rule for an "учет ОЦЗ" question.
             if "оперативн" in required and ("расчетные показатели стоимости" in lower or "ставка" in lower):
                 score -= 0.80
-            result = (score, {
+            matches.append({
                 "file": meta.get("file_name", meta.get("file_path", "?")),
                 "score": round(score, 4),
                 "text": text,
                 "matched_queries": ["regulation-concept-exact"],
                 **chunk_meta,
             })
-            matches.append(result)
-            if str(meta.get("file_name", "")).lower().endswith("_r12_rag.md"):
-                primary_matches.append(result)
-        candidates = primary_matches or matches
-        return [item for _, item in sorted(candidates, key=lambda pair: pair[0], reverse=True)[:result_limit]]
+        authoritative = constraint_question if constraint_question is not None else question
+        candidates = filter_scoped_evidence(
+            matches, authoritative, source_aliases=source_aliases,
+            excluded_sources=excluded_sources, source_versions=source_versions,
+            spec=refine_prism_query(authoritative))
+        candidates = filter_query_applicability(candidates, authoritative)
+        return sorted(candidates, key=lambda item: float(item.get('score', 0.0)), reverse=True)[:result_limit]
 
     def _scoped_lexical_seed_results(
         self,
@@ -4486,6 +5209,7 @@ class RAGAgent:
                     if key in {"section_path", "section_title", "parent_section", "status", "chunk_type"}
                     and value
                 },
+                **_native_identity_metadata(meta),
             }
             if chunk_meta.get("status") == "deleted":
                 continue
@@ -4554,6 +5278,7 @@ class RAGAgent:
                     if key in {"section_path", "section_title", "parent_section", "status", "chunk_type"}
                     and value
                 },
+                **_native_identity_metadata(meta),
             }
             if chunk_meta.get("status") == "deleted":
                 continue
@@ -4608,11 +5333,27 @@ class RAGAgent:
         retrieval_trace: dict | None = None,
         search_focus: SearchFocus | None = None,
         constraint_question: str | None = None,
+        candidate_pool_only: bool = False,
+        query_rank_context=None,
+        runtime: RuntimeSnapshot | None = None,
+        user_task: UserTask | None = None,
     ) -> list[dict]:
         """Return chunks after query planning unless a validated plan is supplied."""
+        # None intentionally means legacy here: Rust/hybrid/direct callers
+        # must not inherit an opt-in meant for the ordinary Python chat.
+        selection_mode, selection_source = _resolve_evidence_selection_mode(selection_mode)
+        if retrieval_trace is not None:
+            retrieval_trace.setdefault("selection_mode_source", selection_source)
+            retrieval_trace.update(selection_mode_requested=selection_mode,
+                selection_mode="not_applied", selection_applied=False)
+            retrieval_trace.pop("selection_bypass_reason", None)
+            retrieval_trace.pop("selection_limits", None)
+            retrieval_trace.pop("source_reading", None)
+            retrieval_trace.pop("negative_scope_unresolved", None)
+            retrieval_trace.pop("negative_scope_atomic_conflict_incomplete", None)
         original_question = question
         if retrieval_queries is None:
-            understanding = self.understand_query(question)
+            understanding = self.understand_query(question, **({'runtime':runtime} if runtime is not None else {}))
             question = understanding.canonical_question
             retrieval_queries = understanding.retrieval_queries
         # Query understanding may rewrite a list request into a declarative
@@ -4624,6 +5365,8 @@ class RAGAgent:
         # document, point, category or exclusion on the user's behalf.  The
         # resolved user context is immutable authority in corrective mode.
         scope_question = constraint_question if constraint_question is not None else selection_question
+        rank_context = (query_rank_context if isinstance(query_rank_context, QueryRankContext)
+                        and query_rank_context.question == scope_question else new_query_rank_context(scope_question))
         occurrence_question = (
             scope_question
             if constraint_question is not None or is_document_occurrence_question(original_question)
@@ -4644,46 +5387,70 @@ class RAGAgent:
         domain_routing = route_query(question, retrieval_focus)
         explicit_sources = matching_explicit_sources(scope_question, source_aliases)
         candidate_k = max(top_k * (12 if excluded_sources else 5), 100 if excluded_sources else 40)
-        qe = self._build_query_engine(candidate_k)
-        merged: dict[str, dict] = {}
-        for seed_question in dict.fromkeys((selection_question, question)):
-            for item in section_index.body_seeds(seed_question, limit=max(top_k * 3, 24),
-                                                 mode='coverage' if selection_mode=='coverage' else 'legacy',
-                                                 excluded_sources=excluded_sources,
-                                                 allowed_sources=explicit_sources or (set(source_aliases) if source_aliases is not None else None),
-                                                 **focus_options):
-                key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
-                merged[key] = item
+        qe = self._build_query_engine(candidate_k, **({'runtime':runtime} if runtime is not None else {}))
+        merged: dict[object, dict] = {}
+        probe_body_items: dict[object, dict] = {}
+        body_limit = max(top_k * 3, 24)
+        body_options = {
+            'mode': 'coverage' if selection_mode=='coverage' else 'legacy',
+            'excluded_sources': excluded_sources,
+            'allowed_sources': explicit_sources or (set(source_aliases) if source_aliases is not None else None),
+        }
+        original_body_queries = tuple(dict.fromkeys((selection_question, question)))
+        for seed_question in original_body_queries:
+            body_items = section_index.body_seeds(seed_question, limit=body_limit, **body_options, **focus_options)
+            rank_context.record(seed_question, body_items)
+            for item in body_items:
+                key = _retrieval_record_identity(item)
+                merged[key] = {**item, 'matched_queries': list(item.get('matched_queries', ()))}
+        # Typed focus already supplies independent subject/alias profiles.
+        # Without it, existing planner queries can find separate aspects that
+        # do not coexist in one node. They remain soft candidates: every call
+        # keeps the same USER-origin scope, and final packing still sees the
+        # original task. Recovery gets only its current call's query list.
+        if search_focus is None:
+            probes = _body_probe_queries(retrieval_queries, original_body_queries)
+            groups = [section_index.body_seeds(probe, limit=body_limit,
+                                              constraint_question=scope_question, **body_options)
+                      for probe in probes]
+            for probe, body_items in zip(probes, groups):
+                rank_context.record(probe, body_items)
+            for item in _round_robin_body_probes(groups, body_limit, set(merged)):
+                key = _retrieval_record_identity(item)
+                merged[key] = {**item, 'matched_queries': list(item.get('matched_queries', ()))}
+                probe_body_items[key] = item
         for item in self._procedural_seed_results(question):
-            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
-            merged[key] = item
+            key = _retrieval_record_identity(item)
+            merged[key] = {**item, 'matched_queries': list(item.get('matched_queries', ()))}
         for item in self._exact_section_seed_results(question):
-            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
-            merged[key] = item
+            key = _retrieval_record_identity(item)
+            merged[key] = {**item, 'matched_queries': list(item.get('matched_queries', ()))}
         for item in self._lexical_section_seed_results(question):
-            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
-            merged[key] = item
+            key = _retrieval_record_identity(item)
+            merged[key] = {**item, 'matched_queries': list(item.get('matched_queries', ()))}
         for item in self._section_seed_results(question):
-            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
-            merged[key] = item
+            key = _retrieval_record_identity(item)
+            merged[key] = {**item, 'matched_queries': list(item.get('matched_queries', ()))}
         for item in self._exact_entity_seed_results(question):
-            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
-            merged[key] = item
+            key = _retrieval_record_identity(item)
+            merged[key] = {**item, 'matched_queries': list(item.get('matched_queries', ()))}
         for item in self._formula_clause_seed_results(question):
-            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
-            merged[key] = item
-        concept_seeds = self._regulation_concept_seed_results(question)
+            key = _retrieval_record_identity(item)
+            merged[key] = {**item, 'matched_queries': list(item.get('matched_queries', ()))}
+        concept_seeds = self._regulation_concept_seed_results(
+            question, constraint_question=scope_question, source_aliases=source_aliases,
+            excluded_sources=excluded_sources, source_versions=source_versions)
         for item in concept_seeds:
-            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
-            merged[key] = item
+            key = _retrieval_record_identity(item)
+            merged[key] = {**item, 'matched_queries': list(item.get('matched_queries', ()))}
         for item in self._document_occurrence_seed_results(occurrence_question):
-            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
-            merged[key] = item
+            key = _retrieval_record_identity(item)
+            merged[key] = {**item, 'matched_queries': list(item.get('matched_queries', ()))}
         # Run exact category seeding last so broad lexical/section seeds cannot
         # overwrite its stronger score and provenance for the same chunk.
         for item in self._price_category_seed_results(question):
-            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
-            merged[key] = item
+            key = _retrieval_record_identity(item)
+            merged[key] = {**item, 'matched_queries': list(item.get('matched_queries', ()))}
         domain_queries = [
             f"{question} {'РРЭ' if domain == 'rre' else 'ОРЭМ'}"
             for domain in domain_routing.active_domains
@@ -4725,8 +5492,8 @@ class RAGAgent:
             explicit=bool(explicit_sources),
             limit=max(top_k * 3, 24),
         ):
-            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
-            merged[key] = item
+            key = _retrieval_record_identity(item)
+            merged[key] = {**item, 'matched_queries': list(item.get('matched_queries', ()))}
         domain_seed_query = "\n".join((question, *(retrieval_queries or ())))
         for item in self._domain_lexical_seed_results(
             domain_seed_query,
@@ -4734,22 +5501,25 @@ class RAGAgent:
             source_domains,
             limit=max(top_k * 3, 24),
         ):
-            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
+            key = _retrieval_record_identity(item)
             current = merged.get(key)
             if current is None:
-                merged[key] = item
+                merged[key] = {**item, 'matched_queries': list(item.get('matched_queries', ()))}
             else:
                 current.setdefault("matched_queries", []).extend(item["matched_queries"])
                 current["score"] = max(float(current.get("score", 0.0)), float(item["score"]))
         for query in query_plan:
             nodes = qe.retriever.retrieve(QueryBundle(query_str=query))
+            rank_rows = []
             for item in nodes:
                 meta = item.node.metadata or {}
                 text = item.node.text or ""
                 file_name = meta.get("file_name", meta.get("file_path", "?"))
-                key = hashlib.sha256(f"{file_name}\n{text[:700]}".encode("utf-8")).hexdigest()
                 score = float(item.score or 0)
                 chunk_meta = effective_chunk_metadata(text, meta)
+                native_record = {'file': file_name, 'text': text, **chunk_meta}
+                key = _retrieval_record_identity(native_record)
+                rank_rows.append(native_record)
                 current = merged.get(key)
                 if current is None:
                     merged[key] = {
@@ -4764,14 +5534,21 @@ class RAGAgent:
                 if score > float(current.get("score", 0.0)):
                     current["score"] = round(score, 4)
                     current.update(chunk_meta)
+            rank_context.record(query, rank_rows)
         for item in formula_sibling_results(self._all_nodes, merged, question):
-            key = hashlib.sha256(f"{item['file']}\n{item['text'][:700]}".encode("utf-8")).hexdigest()
+            key = _retrieval_record_identity(item)
             current = merged.get(key)
             if current is None:
-                merged[key] = item
+                merged[key] = {**item, 'matched_queries': list(item.get('matched_queries', ()))}
             else:
                 current.setdefault("matched_queries", []).extend(item["matched_queries"])
                 current["score"] = max(float(current.get("score", 0.0)), float(item["score"]))
+        # Other native seed channels may replace the same candidate. Retain
+        # an extra body's lexical provenance without changing their priority,
+        # and never graft it onto merely prefix-matching evidence.
+        for key, body_item in probe_body_items.items():
+            if key in merged:
+                merged[key] = _preserve_body_probe_metadata(body_item, merged[key])
         excluded = {Path(str(source)).name.casefold() for source in (excluded_sources or set())}
         results = [
             item for item in merged.values()
@@ -4790,7 +5567,9 @@ class RAGAgent:
                     "score":item.get('score'),"matched_queries":item.get('matched_queries',[])} for item in ranked[:40]])
             if focus_options:
                 retrieval_trace['constraint_question'] = scope_question
-        if is_document_occurrence_question(scope_question):
+        if is_document_occurrence_question(scope_question) and not candidate_pool_only:
+            if retrieval_trace is not None:
+                retrieval_trace["selection_bypass_reason"] = "document_occurrence"
             # A document-occurrence query asks for a positive set, not for the
             # best explanatory chunks. The general domain router deliberately
             # caps its candidate pool; on a large regulation that cap can be
@@ -4837,13 +5616,31 @@ class RAGAgent:
             source_domains,
             domain_routing,
             top_k,
-            preserve_candidates=selection_mode=='coverage',
+            preserve_candidates=selection_mode=='coverage' or candidate_pool_only or rank_context.allocator().active,
         )
         ranked = apply_document_version_preference(
             ranked,
             source_versions,
             explicit_sources=explicit_sources,
         )
+        ranked = filter_query_applicability(ranked, scope_question)
+        eligible_ranked_pool = filter_scoped_evidence(
+            ranked,scope_question,source_aliases=source_aliases,excluded_sources=excluded_sources,
+            source_versions=source_versions,spec=refine_prism_query(scope_question))
+        if candidate_pool_only:
+            # The opt-in reader sees native candidates before any local
+            # top-k/PRISM/section packing. Its hints never authorize sources;
+            # repeat USER-origin scope and version checks at this boundary.
+            candidates = filter_scoped_evidence(
+                ranked,scope_question,source_aliases=source_aliases,
+                excluded_sources=excluded_sources,source_versions=source_versions,
+                spec=refine_prism_query(scope_question))
+            candidates = filter_query_applicability(candidates, scope_question)
+            if retrieval_trace is not None:
+                retrieval_trace.update(candidate_pool_only=True,
+                    selection_mode='candidate_pool_only',candidate_pool_count=len(candidates),
+                    selection_bypass_reason='candidate_pool_only')
+            return candidates
         if not explicit_sources and selection_mode!='coverage':
             ranked = reserve_topic_source_coverage(ranked, selection_question, top_k)
         if priority_sources and not explicit_sources:
@@ -4893,27 +5690,75 @@ class RAGAgent:
                 selected = operation_evidence
         # Legacy PRISM/top-k heuristics may choose an ordering, but must not
         # erase the wider pool before the new coverage selector sees it.
-        evidence_pool = ranked if selection_mode=='coverage' else [*selected, *(item for item in ranked if item not in selected)]
+        rank_active = rank_context.allocator(set().union(
+            *(rank_context.origins(item) for item in eligible_ranked_pool))).active
+        evidence_pool = (eligible_ranked_pool if rank_active else
+                         ranked if selection_mode=='coverage' else
+                         [*selected, *(item for item in ranked if item not in selected)])
         selector = section_index.select_v2 if selection_mode=='coverage' else section_index.select
-        selector_options = {"facets":evidence_facets, **focus_options} if selection_mode=='coverage' else {}
+        selection_meta = {}  # Request-local, including atomic packets omitted before returning rows.
+        selector_options = ({"facets":evidence_facets, **focus_options} if selection_mode=='coverage' else
+                            {"constraint_question":scope_question}
+                            if constraint_question is not None or rank_active else {})
+        selection_meta = {}
+        if selection_mode == 'coverage':
+            selector_options['selection_meta'] = selection_meta
+        if rank_active:
+            selector_options['query_rank_context'] = rank_context
+        evidence_budget = min(
+            int(os.environ.get('RAG_EVIDENCE_MAX_CHARS','36000')),
+            max(2000,(int((runtime.client if runtime is not None else self.llm).metadata.context_window)-4096)*2)
+            if runtime is not None or getattr(self,'llm',None) is not None else 36000)
+        prepack_reading = None
+        if (selection_mode == 'coverage'
+                and os.getenv('RAG_PREPACK_SOURCE_READING','off').casefold() in {'true','1','on'}):
+            from prepack_reading import read_candidate_frontiers
+            request_task = user_task or UserTask(selection_question,scope_question)
+            if request_task.resolved_user_context != scope_question:
+                raise ValueError('Reader task must match the immutable retrieval scope')
+            reader_client = runtime.client if runtime is not None else self.llm
+            def complete_reading(prompt,purpose):
+                """Вызвать только разрешенный этап чтения кандидатов после проверки его входного бюджета."""
+                if purpose != 'source-reading':
+                    raise ValueError('Unexpected candidate-reading stage')
+                _ordinary_prompt_preflight(prompt,runtime,reader_client,'source-reading')
+                if runtime is not None:
+                    return str(runtime.complete_stage(prompt,max_tokens=4096,timeout=120,
+                                                      thinking=False,purpose=purpose))
+                return str(reader_client.complete(prompt))
+            prepack_reading = read_candidate_frontiers(request_task,eligible_ranked_pool,
+                rank_context=rank_context,max_chars=evidence_budget,
+                complete=complete_reading)
+            evidence_pool = prepack_reading.pool
+            if prepack_reading.preferences:
+                selector_options['preferred_passages'] = prepack_reading.preferences
         packed = selector(
             selection_question, evidence_pool, excluded_sources=excluded_sources,
             allowed_sources=explicit_sources or (set(source_aliases) if source_aliases is not None else None), top_k=top_k,
-            max_chars=min(
-                int(os.environ.get("RAG_EVIDENCE_MAX_CHARS", "36000")),
-                max(2000, (int(self.llm.metadata.context_window) - 4096) * 2)
-                if getattr(self, "llm", None) is not None else 36000,
-            ),
+            max_chars=evidence_budget,
             **selector_options,
         )
+        if retrieval_trace is not None:
+            retrieval_trace.update(selection_mode=selection_mode, selection_applied=True)
+            if prepack_reading is not None:
+                from corrective_rag import _retained_preference_counts
+                retrieval_trace['source_reading'] = {**prepack_reading.diagnostics,
+                    **_retained_preference_counts(prepack_reading.preferences,packed)}
+            if selection_mode == 'coverage':
+                retrieval_trace['selection_limits'] = {key:value for key, value in selection_meta.items()
+                    if key in {'family_coverage_incomplete', 'family_coverage_incomplete_reason',
+                        'scoped_cohort_incomplete', 'definition_closure_incomplete',
+                        'inventory_enumeration_incomplete'}}
         final = filter_scoped_evidence(packed,scope_question,source_aliases=source_aliases,
             excluded_sources=excluded_sources,source_versions=source_versions,spec=spec)
         if retrieval_trace is not None:
+            retrieval_trace.update(_negative_scope_limits(final, selection_meta))
             retrieval_trace['selected'] = [{"file":item.get('file'),"section":item.get('section_path'),
                 "selection_reason":item.get('selection_reason'),"evidence_role":item.get('evidence_role')} for item in final]
         return final
 
     def clear_cache(self):
+        """Явно очистить общий кеш ответов из административного CLI; не вызывается при смене чата."""
         self.response_cache.clear()
         print("[OK] Кэш очищен")
 
@@ -4937,6 +5782,7 @@ class RAGAgent:
 
 # ─── CLI ──────────────────────────────────────────────────────
 def main():
+    """Запустить интерактивный диагностический CLI; веб-сервис использует отдельную ASGI-точку входа."""
     print("=== RAG Agent (Qwen 2.5 + Qdrant + LlamaIndex) ===")
     print("Команды:")
     print("  :load <путь>     — загрузить документ (DOCX, PDF, MD, TXT)")

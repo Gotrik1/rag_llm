@@ -6,6 +6,7 @@ import sys
 
 
 def main() -> int:
+    """Remove one document from the agent's indexes and emit a JSON worker result; file removal belongs to the worker."""
     if len(sys.argv) != 2:
         print(json.dumps({"error": "path argument is required"}))
         return 2

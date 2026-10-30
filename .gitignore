@@ -20,3 +20,24 @@ __pycache__/
 .ingestion_cache/
 .fastembed_cache/
 
+# Generated QA/runtime state and private deployment material stay out of the
+# canonical source graph and Git. Existing tracked files remain tracked.
+.venv312/
+.pytest_cache/
+output/
+tmp/
+artifacts/
+.data/
+.playwright-cli/
+deploy/secrets/*
+!deploy/secrets/*.example
+
+# Local reports and an unrelated workstation wiki are not release source.
+/*.docx
+/deploy/dev-wiki/
+
+# Only example environment files belong in version control.
+.env*
+!.env.example
+!**/.env.example
+
